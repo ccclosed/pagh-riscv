@@ -10,14 +10,38 @@
 #![no_std]
 #![no_main]
 
+// `alloc` is not in the 2018+ prelude, and the kernel does not link liballoc's
+// sibling `std`: the collection types are usable only because the crate now has a
+// global allocator (see `ALLOCATOR` below) and the frame pool behind it.
+extern crate alloc;
+
 mod arch;
 mod console;
 mod drivers;
 mod fdt;
+mod memory;
 mod shell;
 mod sync;
 
 use core::panic::PanicInfo;
+
+/// The global allocator: the heap that `alloc::vec::Vec` and friends get their
+/// memory from, wired to the frame pool by `memory::heap`.
+///
+/// It lives here, in the crate root, because a `#[global_allocator]` is a claim
+/// about the whole binary — not a property of the heap module. Nothing calls it yet
+/// except the `selftest` command, which is the point: the allocator is exercised by
+/// a test that can be repeated, not by the boot path.
+#[global_allocator]
+static ALLOCATOR: memory::heap::Heap = memory::heap::Heap::new();
+
+/// `(bytes in use, bytes mapped from the frame allocator, chunks held)`.
+///
+/// The shell asks the kernel for its allocator's numbers; the alternative — a
+/// second handle to the same state — would let the two disagree.
+pub fn heap_stats() -> (usize, usize, usize) {
+    ALLOCATOR.stats()
+}
 
 /// The kernel entry point called from `_start`.
 ///
@@ -53,11 +77,34 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
         memory.1,
         (memory.1 - memory.0) / (1024 * 1024)
     );
-    crate::kprintln!(
-        "timebase    {} Hz",
-        tree.timebase_frequency().unwrap_or(0)
-    );
+    crate::kprintln!("timebase    {} Hz", tree.timebase_frequency().unwrap_or(0));
     crate::kprintln!("console     NS16550 @ {:#x}", drivers::uart::BASE);
+
+    // The frame allocator needs the two things the boot path already has: the
+    // `/memory` range, and the list of physical ranges the kernel must never hand
+    // out. It has to be up before the first allocation — which, now that `alloc`
+    // exists, includes any `Vec` a driver or a shell command builds later.
+    let reserved = [
+        // Everything below `__kernel_end`: OpenSBI's runtime, the kernel image
+        // and its `.bss` (the boot stack and the frame bitmap live there too).
+        (0, memory::kernel_end()),
+        // The boot stack, named explicitly: a linker script that ever moves it
+        // out of `.bss` must not silently hand it to the allocator.
+        memory::boot_stack(),
+        // Firmware's device tree blob, whose size is in its own header.
+        memory::fdt_span(dtb),
+    ];
+    memory::init(memory, &reserved);
+    let (free_frames, total_frames) = memory::stats();
+    let (heap_used, _, heap_chunks) = heap_stats();
+    crate::kprintln!(
+        "pmm         {}/{} frames free ({} MiB tracked), heap {} KiB in {} chunk(s)",
+        free_frames,
+        total_frames,
+        total_frames * memory::FRAME_SIZE / (1024 * 1024),
+        heap_used / 1024,
+        heap_chunks
+    );
 
     // Traps before anything that can trap: a bad address in the shell must
     // report itself instead of resetting the machine silently.

@@ -156,20 +156,48 @@ impl Fdt {
         Some(())
     }
 
+    /// The root's `#address-cells`/`#size-cells`, defaulting to the DT spec's 2/1.
+    ///
+    /// These live on the *parent* node of a `reg` property, and for `/memory` the
+    /// parent is the root. Reading them is what lets [`Self::memory`] tell a
+    /// layout it understands from one it would misread.
+    fn root_cell_counts(&self) -> (u32, u32) {
+        let (mut addr, mut size) = (2u32, 1u32);
+        self.walk(|path, name, value| {
+            if path != "/" && !path.is_empty() {
+                return false;
+            }
+            match name {
+                "#address-cells" if value.len() >= 4 => addr = be_u32(&value[0..4]),
+                "#size-cells" if value.len() >= 4 => size = be_u32(&value[0..4]),
+                _ => {}
+            }
+            false
+        });
+        (addr, size)
+    }
+
     /// The first `/memory` node's `reg` as `(base, end)`, if the tree has one.
     ///
     /// `reg` is a sequence of `(address, size)` pairs whose width comes from the
-    /// parent's `#address-cells`/`#size-cells`. QEMU `virt` uses 2+2 cells, which
-    /// is the common case; a tree that says otherwise is refused rather than
-    /// misread, because a wrong memory range corrupts everything downstream.
+    /// parent's `#address-cells`/`#size-cells` — the root's, for `/memory`. This
+    /// reader implements the 2+2 layout that 64-bit machines use (QEMU `virt`
+    /// included) and **refuses anything else**: a tree that declares a different
+    /// layout is skipped, because a misread memory range corrupts every allocator
+    /// decision downstream, and a silently wrong range is worse than none.
     pub fn memory(&self) -> Option<(usize, usize)> {
+        let (addr_cells, size_cells) = self.root_cell_counts();
+        if addr_cells != 2 || size_cells != 2 {
+            return None;
+        }
         let mut result = None;
         self.walk(|path, name, value| {
             if !path.starts_with("/memory") || name != "reg" || value.len() < 16 {
                 return false;
             }
             let base = ((be_u32(&value[0..4]) as u64) << 32 | be_u32(&value[4..8]) as u64) as usize;
-            let size = ((be_u32(&value[8..12]) as u64) << 32 | be_u32(&value[12..16]) as u64) as usize;
+            let size =
+                ((be_u32(&value[8..12]) as u64) << 32 | be_u32(&value[12..16]) as u64) as usize;
             result = Some((base, base + size));
             true
         });

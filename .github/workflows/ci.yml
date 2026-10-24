@@ -1,0 +1,93 @@
+name: ci
+
+# Four gates, one job each.  Every command below is also in AGENTS.md; keep the
+# two in sync — the agent guide is what a contributor reads before opening a PR,
+# and a gate that only exists here is a gate nobody runs locally.
+#
+# The toolchain is not hard-coded: each job reads the pin out of
+# rust-toolchain.toml, so bumping the nightly is a one-line change in that file.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          echo "rust-toolchain.toml pins: $channel"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  build:
+    name: build (${{ matrix.profile }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [debug, release]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          echo "rust-toolchain.toml pins: $channel"
+          rustup toolchain install "$channel" --profile minimal \
+            --component rust-src --component llvm-tools \
+            --target riscv64gc-unknown-none-elf
+      - name: Build the kernel
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.profile }}" = release ]; then
+            cargo build --release --locked
+          else
+            cargo build --locked
+          fi
+      - name: Upload the kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: pagh-riscv64-${{ matrix.profile }}
+          path: target/riscv64gc-unknown-none-elf/${{ matrix.profile }}/pagh
+          if-no-files-found: error
+
+  smoke:
+    name: QEMU boot + shell smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          echo "rust-toolchain.toml pins: $channel"
+          rustup toolchain install "$channel" --profile minimal \
+            --target riscv64gc-unknown-none-elf
+      - name: Install QEMU
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-misc
+          qemu-system-riscv64 --version
+      - name: Build the debug kernel
+        run: cargo build --locked
+      - name: Boot it and drive the shell (serial console)
+        run: python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh
+      - name: Boot it with ramfb (the screen path)
+        run: python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb

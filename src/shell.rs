@@ -2,9 +2,11 @@
 //!
 //! This is the kernel's first user-visible surface and the one every later
 //! subsystem is tested through, so it stays deliberately dull: read a byte, echo
-//! it, act on Enter. There is no history, no completion and no framebuffer yet —
-//! what matters now is that a human (or `tools/run.py`) can talk to the machine
-//! and get an answer it can grep.
+//! it, act on Enter. There is no history and no completion yet — what matters now
+//! is that a human (or `tools/run.py`) can talk to the machine and get an answer
+//! it can grep. The answer goes to `console`, which since M4 is the UART *and* the
+//! ramfb text screen (see `src/console.rs`), so the same line is readable on the
+//! serial log and on the screen.
 
 use crate::arch::riscv64::csr;
 use crate::drivers::uart;
@@ -143,25 +145,62 @@ fn execute(line: &str, tree: &Fdt) {
             crate::kprintln!("commands:");
             crate::kprintln!("  help          this list");
             crate::kprintln!("  mem           physical memory reported by the device tree");
+            crate::kprintln!("  selftest      run the in-QEMU memory self-tests");
             crate::kprintln!("  time          the `time` CSR (timebase ticks) and its frequency");
             crate::kprintln!("  hart          the hart this kernel is running on");
             crate::kprintln!("  echo <text>   print the text back");
             crate::kprintln!("  clear         clear the screen (ANSI)");
-            crate::kprintln!("  halt          stop the machine (QEMU exits with -no-reboot)");
+            crate::kprintln!("  halt          power the machine off (SBI SRST)");
         }
-        "mem" => match tree.memory() {
-            Some((base, end)) => crate::kprintln!(
-                "memory {:#x}..{:#x} ({} MiB)",
-                base,
-                end,
-                (end - base) / (1024 * 1024)
-            ),
-            None => crate::kprintln!("mem: the device tree has no /memory node"),
-        },
+        "mem" => {
+            // The device tree's claim and the allocator's view are printed
+            // together on purpose: when the two disagree, which one is wrong is
+            // exactly the question, and the answer is in the pair of lines.
+            match tree.memory() {
+                Some((base, end)) => crate::kprintln!(
+                    "memory {:#x}..{:#x} ({} MiB)",
+                    base,
+                    end,
+                    (end - base) / (1024 * 1024)
+                ),
+                None => crate::kprintln!("mem: the device tree has no /memory node"),
+            }
+            let (free, total) = crate::memory::stats();
+            let (pool_start, pool_end) = crate::memory::pool_range();
+            crate::kprintln!(
+                "pmm    {} free of {} frames ({} MiB), pool {:#x}..{:#x}",
+                free,
+                total,
+                total * crate::memory::FRAME_SIZE / (1024 * 1024),
+                pool_start,
+                pool_end
+            );
+            let (used, mapped, chunks) = crate::heap_stats();
+            crate::kprintln!(
+                "heap   {} B used, {} B mapped from the pool in {} chunk(s) of {} KiB",
+                used,
+                mapped,
+                chunks,
+                crate::memory::heap::CHUNK_SIZE / 1024
+            );
+        }
+        // The memory suite: frames, frame contents, the heap. It is written to be
+        // non-destructive and idempotent on purpose, so running it twice in one
+        // boot is a real check instead of a state mutation — the free-frame ledger
+        // printed at the end of each run must read the same both times
+        // (`src/memory/selftest.rs`).
+        "selftest" => {
+            crate::memory::selftest::run();
+        }
         "time" => {
             let hz = tree.timebase_frequency().unwrap_or(0);
             let ticks = csr::read_time();
-            crate::kprintln!("time {} ticks (~{} s at {} Hz)", ticks, ticks / hz.max(1) as usize, hz);
+            crate::kprintln!(
+                "time {} ticks (~{} s at {} Hz)",
+                ticks,
+                ticks / hz.max(1) as usize,
+                hz
+            );
         }
         "hart" => crate::kprintln!("hart {}", crate::arch::riscv64::hart_id()),
         "echo" => {
@@ -180,8 +219,11 @@ fn execute(line: &str, tree: &Fdt) {
         }
         "clear" => crate::kprint!("\x1b[2J\x1b[H"),
         "halt" => {
-            crate::kprintln!("halt: stopping the machine");
-            crate::arch::riscv64::park_forever()
+            // Ask firmware to power the machine off (SBI SRST). Parking the hart
+            // instead would leave QEMU alive: a `wfi`-ing machine is still a
+            // machine, and the help text promised otherwise.
+            crate::kprintln!("halt: powering off");
+            crate::arch::riscv64::sbi::shutdown()
         }
         other => {
             crate::kprintln!("{}: unknown command (try 'help')", other);

@@ -20,6 +20,13 @@ _start:
     /* Rust's ABI wants 16-byte alignment; the linker script aligns the top. */
     andi    sp, sp, -16
 
+    /* Remember the hart id where Rust can read it. `mhartid` is an M-mode CSR:
+       reading it from S-mode is an illegal instruction (verified — the `hart`
+       command used to kill the machine), so the id is captured here, while it is
+       still in `a0`, and the kernel reads this static from then on. */
+    la      t0, BOOT_HART_ID
+    sd      a0, 0(t0)
+
     /* a0 = hart id, a1 = device tree address: exactly `kmain`'s arguments. */
     call    kmain
 
@@ -32,8 +39,10 @@ _start:
 "#
 );
 
-// The stack lives in Rust (`main::BOOT_STACK`) so that its size and alignment
-// are stated once; the symbol below is what the assembly above loads.
+// The boot stack is defined here, in the same file that loads it: `_start` sets
+// `sp` to `__stack_top`, so the size and the symbol have to be stated next to
+// each other or one of them drifts. 64 KiB is generous for a boot path that
+// allocates nothing, and the `.align 4` (16 bytes) keeps the ABI's requirement.
 global_asm!(
     r#"
     .section .bss
@@ -45,3 +54,12 @@ __stack_bottom:
 __stack_top:
 "#
 );
+
+/// The hart id OpenSBI booted us on, written by `_start` (see the assembly
+/// above) before any Rust code runs.
+///
+/// It is a plain `static mut` rather than a lock-protected cell because it is
+/// written exactly once, before the kernel has more than one context to race
+/// with, and never again.
+#[no_mangle]
+pub static mut BOOT_HART_ID: usize = 0;
