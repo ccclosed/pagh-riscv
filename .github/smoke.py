@@ -94,12 +94,18 @@ COMMANDS = b"mem\nhart\ntime\necho smoke ok\nnosuchcmd\nhelp\nhalt\n"
 BANNER = "Type 'help' for the command list."
 HALT = "halt: powering off"
 QEMU = os.environ.get("QEMU", "qemu-system-riscv64")
+# Firmware: QEMU's `-bios default` looks for the OpenSBI image it was built
+# against, which some distributions install somewhere else. PAGH_BIOS names the
+# file explicitly when it is; CI sets it when it finds one.
+BIOS = os.environ.get("PAGH_BIOS", "").strip()
 
 
 def boot(kernel, ramfb=False, timeout=120.0):
     """Boot `kernel`, drive the shell, return (reached_halt, powered_off, exit_code, log)."""
     cmd = [
-        QEMU, "-machine", "virt", "-m", "256M", "-kernel", kernel,
+        QEMU, "-machine", "virt", "-m", "256M",
+        "-bios", BIOS if BIOS else "default",
+        "-kernel", kernel,
         "-display", "none", "-monitor", "none", "-serial", "stdio", "-no-reboot",
     ]
     if ramfb:

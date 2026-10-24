@@ -36,7 +36,10 @@ else
 fi
 
 MEMORY=${MEMORY:-256M}
-BIOS=${BIOS:-}
+# BIOS: a firmware image. Empty means QEMU's own `default` (its built-in OpenSBI
+# search path); PAGH_BIOS is the fallback the CI workflow sets when a runner image
+# keeps the file somewhere QEMU does not look.
+BIOS=${BIOS:-${PAGH_BIOS:-}}
 BIOS_ARGS=()
 if [[ -n "$BIOS" ]]; then
   BIOS_ARGS=(-bios "$BIOS")

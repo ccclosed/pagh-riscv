@@ -83,8 +83,27 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-misc
+          # The target lives in different packages across runner images
+          # (qemu-system-misc on some, a split qemu-system-riscv on others), and a
+          # missing binary used to fail here with exit 127 and no explanation.
+          for pkg in qemu-system-misc qemu-system-riscv qemu-system qemu-system-data; do
+            sudo apt-get install -y --no-install-recommends "$pkg" || true
+          done
+          command -v qemu-system-riscv64 || {
+            echo "qemu-system-riscv64 is still missing; packages that mention it:"
+            apt-cache search qemu-system | head -20
+            exit 1
+          }
           qemu-system-riscv64 --version
+          # Firmware: prefer the image QEMU ships with, fall back to the OpenSBI
+          # file distributions install for it.
+          for fw in /usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin \
+                    /usr/lib/riscv64-linux-gnu/opensbi/generic/fw_dynamic.bin; do
+            if [ -f "$fw" ]; then
+              echo "PAGH_BIOS=$fw" >> "$GITHUB_ENV"
+              break
+            fi
+          done
       - name: Build the debug kernel
         run: cargo build --locked
       - name: Boot it and drive the shell (serial console)
