@@ -30,7 +30,7 @@
 | DTB читается: память и timebase | `src/main.rs:65-81`, `src/fdt.rs:160-191` | `memory 0x80000000..0x90000000 (256 MiB)`, `timebase 10000000 Hz` |
 | Ошибка DTB фатальна и громкая | `src/main.rs:67-71` | текст `fdt: refusing to guess the machine layout` |
 | Вектор ловушек установлен | `src/main.rs:109-111`, `src/arch/riscv64/traps.rs:151-155` | кадр и диспетчер — `docs/architecture.md`, раздел 4 |
-| Шелл: команды и редактор строки | `src/shell.rs:19-59, 144-230` | `.github/smoke.py`: `mem`, `hart`, `time`, `echo`, неизвестная команда, `help`, `halt` |
+| Шелл: команды и редактор строки | `src/shell.rs:21-59, 140-250` | `.github/smoke.py`: `mem`, `hart`, `time`, `echo`, неизвестная команда, `help`, `halt` |
 | `halt` действительно выключает машину | `src/shell.rs:221-227`, `src/arch/riscv64/sbi.rs:24-38` | QEMU завершается с кодом 0 (проверка в `smoke.py`) |
 | Нет паники в обработчике ловушек | `src/arch/riscv64/traps.rs:4-8, 195-201` | исключение печатает `[EXC] … halting` и паркует hart |
 | CI зелёный | `.github/workflows/ci.yml` | `fmt`, debug/release build, smoke в двух режимах (serial и `--ramfb`) |

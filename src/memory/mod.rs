@@ -1,17 +1,27 @@
-//! Physical memory: the frame allocator, the kernel heap and their self-tests.
+//! Physical memory: the frame allocator, the Sv39 map, the kernel heap and their
+//! self-tests.
 //!
-//! There is no paging in this milestone. The kernel runs on the mapping OpenSBI
-//! leaves behind — bare S-mode, `satp` untouched — so a physical address *is* a
-//! pointer, and the whole job of this module is to hand out physical addresses
-//! nothing else is using. Sv39 comes next; frames stay 4 KiB and stay physical
-//! when it does, so the vmm will sit on top of this rather than replace it.
+//! Three layers, in the order boot builds them, because each is the next one's
+//! precondition:
+//!
+//! 1. [`pmm`] hands out 4 KiB physical frames, built from the device tree's
+//!    `/memory` range with the kernel image, the boot stack and the device tree
+//!    reserved.
+//! 2. [`paging`] builds the kernel's Sv39 identity map out of those frames and
+//!    switches `satp` to it. It runs second because it *spends* frames, and it
+//!    must run before anything reaches memory through a frame address: the heap
+//!    hands out physical addresses as pointers, which is only sound because RAM
+//!    is mapped at its physical address.
+//! 3. [`heap`] is the `GlobalAlloc` behind `alloc::vec::Vec`/`String`, growing in
+//!    chunks taken from the PMM when a request does not fit.
 //!
 //! Boot-order contract: [`init`] runs after the device tree has been parsed (it
-//! needs `/memory` to know what RAM exists) and before the first allocation.
-//! Nothing has to enforce that yet — the pool is empty until `init` runs, so an
-//! early allocation fails loudly instead of handing out the kernel's own image.
+//! needs `/memory` to know what RAM exists) and before the first allocation. The
+//! pool is empty until `init` runs, so an early allocation fails loudly instead
+//! of handing out the kernel's own image.
 
 pub mod heap;
+pub mod paging;
 pub mod pmm;
 pub mod selftest;
 
@@ -84,4 +94,28 @@ pub fn stats() -> (usize, usize) {
 /// Frame-aligned `(start, end)` of the range the pool was built from.
 pub fn pool_range() -> (usize, usize) {
     pmm::pool_range()
+}
+
+/// One boot line describing the address space, printed right after
+/// [`paging::init`].
+///
+/// The shell's `mem` command prints its own version of the same numbers, shaped
+/// to that command's column: the facts come from [`paging::snapshot`], the layout
+/// belongs to the caller. The boot line exists so the serial log — the record the
+/// E2E gates grep — states that the CPU is translating through a map this kernel
+/// built, and which one.
+pub fn report_paging() {
+    match paging::snapshot() {
+        Some(state) => crate::kprintln!(
+            "sv39        {}, satp={:#x}, identity {:#x}..{:#x} (RWX below {:#x}, RW above), {} pages, {} device",
+            if paging::active() { "on" } else { "off" },
+            state.satp,
+            state.identity.0,
+            state.identity.1,
+            state.executable_below,
+            state.mappings,
+            state.device_pages
+        ),
+        None => crate::kprintln!("sv39        no address space (paging has not been built)"),
+    }
 }

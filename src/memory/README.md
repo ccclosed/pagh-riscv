@@ -121,7 +121,9 @@ above would not appear; the run would die inside the allocator instead.
 
 ## Not implemented
 
-* **Paging.** No VMM, no Sv39, `satp` untouched: the kernel runs on the mapping OpenSBI
+* **Paging.** Sv39 is on, but the map is the kernel's alone: identity, 4 KiB pages,
+  no user bit, `satp.ASID = 0` (`src/memory/paging.rs`). Before that landing `satp`
+  was untouched and the kernel ran on the mapping OpenSBI
   leaves behind, so physical addresses are dereferenced directly. Everything here is
   already in the shape the VMM will need (4 KiB frames, physical addresses), but there is
   no virtual→physical translation, no per-process address space and no guard pages.

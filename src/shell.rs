@@ -144,7 +144,9 @@ fn execute(line: &str, tree: &Fdt) {
         "help" => {
             crate::kprintln!("commands:");
             crate::kprintln!("  help          this list");
-            crate::kprintln!("  mem           physical memory reported by the device tree");
+            crate::kprintln!(
+                "  mem           device tree range, frame pool, heap and the page table"
+            );
             crate::kprintln!("  selftest      run the in-QEMU memory self-tests");
             crate::kprintln!("  time          the `time` CSR (timebase ticks) and its frequency");
             crate::kprintln!("  hart          the hart this kernel is running on");
@@ -183,6 +185,27 @@ fn execute(line: &str, tree: &Fdt) {
                 chunks,
                 crate::memory::heap::CHUNK_SIZE / 1024
             );
+            // The address space is the third number that can disagree with the
+            // other two: a frame the PMM calls free is only usable if RAM is
+            // mapped, and `satp` says whether the CPU is using this map at all.
+            match crate::memory::paging::snapshot() {
+                Some(state) => crate::kprintln!(
+                    "sv39   {} satp={:#x}, root {:#x}, identity {:#x}..{:#x} (RWX below {:#x}, RW above), {} pages, {} device",
+                    if crate::memory::paging::active() {
+                        "on "
+                    } else {
+                        "off"
+                    },
+                    state.satp,
+                    state.root,
+                    state.identity.0,
+                    state.identity.1,
+                    state.executable_below,
+                    state.mappings,
+                    state.device_pages
+                ),
+                None => crate::kprintln!("sv39   no address space (paging has not been built)"),
+            }
         }
         // The memory suite: frames, frame contents, the heap. It is written to be
         // non-destructive and idempotent on purpose, so running it twice in one

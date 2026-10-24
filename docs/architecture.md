@@ -101,7 +101,7 @@ OpenSBI при передаче управления сообщает (лог ж
   (`src/main.rs:116-130`). `panic = "abort"` в обоих профилях (`Cargo.toml:10-16`):
   размотки нет, паника — это смерть машины, и лог — единственная улика.
 * `halt` в шелле печатает `halt: powering off` и уходит в SBI SRST
-  (`src/shell.rs:221-227`); QEMU действительно завершается с кодом 0 (проверено
+  (`src/shell.rs:244-249`); QEMU действительно завершается с кодом 0 (проверено
   драйвером `.github/smoke.py`).
 
 Стек — 64 KiB в `.bss` (`src/arch/riscv64/boot.rs:44-54`), символы
@@ -242,7 +242,7 @@ stvec ──► trap_entry:
 | внутри `.bss` | битовая карта PMM — 128 KiB (окно 4 GiB, 1 бит на кадр) | `src/memory/pmm.rs:36-42` |
 | внутри `.bss` | `SHADOW` и `SCANOUT` — по 4 МиБ (1280×800×4 байта) | `src/drivers/framebuffer.rs:79, 138, 145` |
 | `~0x80a2_0000` | `__kernel_end` (выровнен на 4 KiB) | `linker.ld:33-34`, `nm` |
-| `0x8000_0000 … 0x9000_0000` | RAM, 256 MiB; пул PMM — 65536 кадров, 62939 свободны на старте (2597 кадров ≈ 10.1 MiB заняты ядром, стеком и DTB) | `run.sh:38`, лог ядра |
+| `0x8000_0000 … 0x9000_0000` | RAM, 256 MiB; пул PMM — 65536 кадров, 62934 свободны на старте (2602 кадра ≈ 10.2 MiB заняты ядром, стеком и DTB), ещё 132 кадра забирает карта страниц при её построении | `run.sh:38`, лог ядра |
 | `~0x8fe0_0000` | блоб DTB (QEMU кладёт его к верхушке RAM); зарезервирован целиком, по `totalsize` | `device tree 0x8fe00000` в логе, `src/memory/mod.rs:57-69` |
 | `0x1000_0000` | UART NS16550 | `src/drivers/uart.rs:20` |
 | `0x1010_0000` | `fw_cfg` (транспорт для `etc/ramfb`) | `src/drivers/fw_cfg.rs`, `pub const BASE` |
@@ -255,12 +255,15 @@ stvec ──► trap_entry:
 на том, что до `init` таблица нулевая — то есть «ничего не аллоцируемо», без
 отдельного флага `initialized`.
 
-Страниц нет: `satp` не записывается (`write_satp` в `csr.rs:44` не вызывается),
-поэтому ядро работает на физических адресах в трансляции, оставленной прошивкой
-(identity). Это же позволяет отдавать устройству `ramfb` адрес теневой поверхности
-как физический (`src/drivers/ramfb.rs`), а `fw_cfg` DMA — адрес структуры передачи;
-в шапке `src/drivers/fw_cfg.rs` это названо прямо: «в день, когда Sv39 встанет
-между ядром и RAM, эта строка должна стать трансляцией».
+Sv39 включён: `memory::paging::init` строит identity-карту и пишет `satp`
+(`src/memory/paging.rs`, активация — `mmu::activate`). Identity означает
+«виртуальный адрес = физический», поэтому адрес теневой поверхности `ramfb`
+(`src/drivers/ramfb.rs`) и структуры передачи `fw_cfg` по-прежнему можно отдавать
+устройству как физический: указатель в ядре — это и есть физический адрес. Границы
+карты: `[RAM base, __kernel_end)` — RWX (ядро исполняется оттуда), выше — RW без X
+(ни один кадр, который может выдать аллокатор, не исполняем), плюс страница UART
+вне RAM. Окно `fw_cfg` (`0x1010_0000`) в карту не входит: консоль трогает его
+только при инициализации, до включения трансляции (`src/drivers/fw_cfg.rs`).
 
 ---
 
@@ -292,9 +295,11 @@ API: `alloc_frame()` (`pmm.rs:144`), `alloc_frames_contiguous(count)`
 одним спинлоком ядра; сегодня это защита «на будущее» — Rust исполняется только на
 hart 0.
 
-Живой лог: `pmm         62939/65536 frames free (256 MiB tracked), heap 0 KiB in
-0 chunk(s)` — 65536 кадров это 256 MiB, 2597 зарезервированы (образ ядра, стек,
-битовая карта, блоб DTB).
+Живой лог: `pmm         62934/65536 frames free (256 MiB tracked), heap 0 KiB in
+0 chunk(s)`, затем `sv39        on, satp=0x8000000000080a28, identity
+0x80000000..0x90000000 (RWX below 0x80a28000, RW above), 65537 pages, 1 device` —
+65536 кадров это 256 MiB, 2602 зарезервированы (образ ядра, стек, битовая карта,
+блоб DTB), а после map — ещё 132 на таблицы.
 
 ### 7.2 Куча — 64 KiB-чанки из пула кадров
 
@@ -318,7 +323,7 @@ hart 0.
 
 ### 7.3 Selftest памяти
 
-Команда `selftest` (`src/shell.rs:190-192`) запускает `src/memory/selftest.rs`:
+Команда `selftest` (`src/shell.rs:215-217`) запускает `src/memory/selftest.rs`:
 четыре проверки, каждая печатает `SELFTEST <имя> PASS|FAIL`, в конце
 `SELFTEST SUMMARY: n/m passed` и ledger гигиены
 `[selftest] PMM hygiene: free frames X -> Y` (`selftest.rs:44-64`). Проверки
@@ -329,7 +334,7 @@ hart 0.
 
 ```text
 pagh:rv64> selftest
-[selftest] free frames before: 62939 of 65536
+[selftest] free frames before: 62802 of 65536
 SELFTEST frames-roundtrip PASS
 SELFTEST frame-pattern PASS
 [selftest] heap: 8256 B in use, 65536 B mapped, 1 chunk(s)
@@ -337,8 +342,8 @@ SELFTEST heap-vec PASS
 heap: double free of 0x80a73090 ignored
 heap: refusing to free 0x802302b8: not a heap block
 SELFTEST heap-defenses PASS
-SELFTEST SUMMARY: 4/4 passed
-[selftest] PMM hygiene: free frames 62939 -> 62939
+SELFTEST SUMMARY: 6/6 passed
+[selftest] PMM hygiene: free frames 62802 -> 62802
 ```
 
 ---
@@ -378,7 +383,7 @@ SELFTEST SUMMARY: 4/4 passed
 поэтому байты, отправленные в UART до инициализации, теряются, и тестовый драйвер
 ждёт баннер, а не пишет команды сразу.
 
-**Шелл** (`src/shell.rs:19-59`): промпт `pagh:rv64> `, буфер 128 байт (`shell.rs:15`),
+**Шелл** (`src/shell.rs:21-59`): промпт `pagh:rv64> `, буфер 128 байт (`shell.rs:15`),
 длинная строка отвергается целиком, backspace (`0x7f`/`0x08`) стирает символ и в
 буфере, и на терминале, печатаемые байты `0x20..0x7f` эхо-ятся, прочие управляющие
 игнорируются. Истории, автодополнения и стрелок нет (`shell.rs:5-7`).
@@ -392,7 +397,7 @@ SELFTEST SUMMARY: 4/4 passed
 | `hart` | id hart'а из `BOOT_HART_ID` | `shell.rs:205` |
 | `echo <text>` | печать слов через один пробел | `shell.rs:206-219` |
 | `clear` | ANSI `ESC[2J ESC[H` (чистит и экран, и терминал) | `shell.rs:220` |
-| `halt` | SBI SRST, машина выключается | `shell.rs:221-227` |
+| `halt` | SBI SRST, машина выключается | `shell.rs:244-249` |
 | что угодно ещё | `<x>: unknown command (try 'help')` | `shell.rs:228-230` |
 
 Строки баннера, промпта, `pmm`/`framebuffer` и `halt: powering off` — это
@@ -428,18 +433,16 @@ SELFTEST SUMMARY: 4/4 passed
 
 Состояние на момент написания; раздел перепроверяется перед коммитом.
 
-* **Страниц нет.** `satp` не пишется (`write_satp` в `csr.rs:44` не вызывается),
-  адрес — физический. В `src/arch/riscv64/mmu.rs` (объявлен в
-  `src/arch/riscv64/mod.rs:11`) лежат примитивы Sv39 — флаги PTE, `PageTable`,
-  `vpn`, `satp_for`, `activate`, `sfence`, — но **их никто не вызывает**: таблиц
-  страниц в boot-пути нет, трансляция не включается. Это следующий шаг M2.
+* **Страниц для чужих адресных пространств нет.** Sv39 включён (раздел 6), но карта одна и только для ядра: identity, страницы 4 KiB, без суперстраниц, без user-бита, `satp.ASID = 0`. `map`/`unmap`/`translate`/`flags` — `src/memory/paging.rs`; `unmap` возвращает пустые промежуточные таблицы в PMM. Отдельного VMM, mprotect, разделяемых страниц и user-адресных пространств нет.
+  Историческая справка: до этого лендинга `satp` не писался и адрес был физическим
+  «по совпадению»; теперь это следствие identity-карты, а не отсутствия трансляции.
 * **Таймера и источников прерываний нет**: `sie` не пишется, `mtimecmp`/SBI TIME не
   вызываются; обработчик прерываний — заготовка (раздел 4.3).
 * **PLIC не разведён**: ветка external interrupt только печатает (`traps.rs:177-180`).
 * **Нет блочного устройства, ФС, VFS, задач, syscall'ов, userland, сети** — нет ни
   файлов, ни модулей.
 * **Нет SMP**: работает один hart.
-* **Нет host-тестов**: есть in-QEMU selftests памяти (4 проверки) и QEMU-smoke в двух
+* **Нет host-тестов**: есть in-QEMU selftests памяти (6 проверок: кадры, содержимое кадра, Sv39 map/unmap, Sv39 translate + W^X, куча, защиты кучи) и QEMU-smoke в двух
   режимах; чистая логика (`fdt.rs`) тестами не покрыта.
 * **Инструментов сборки нет**: `run.sh` — единственный лаунчер; в `tools/` только
   шрифт и запуск/скриншот.

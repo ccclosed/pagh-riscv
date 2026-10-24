@@ -19,6 +19,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
 
+use crate::arch::riscv64::mmu::{self, Flags};
+use crate::memory::paging::{self, MapError};
 use crate::memory::pmm;
 use crate::memory::FRAME_SIZE;
 
@@ -41,6 +43,25 @@ const VEC_STRIDE: u64 = 0x9e37_79b9_7f4a_7c15;
 const PATTERN: u8 = 0xa5;
 const PATTERN_WORD: u64 = 0xa5a5_a5a5_a5a5_a5a5;
 
+/// Virtual address the Sv39 routine maps a frame at. It sits inside Sv39's lower
+/// half (which ends at 2^38) and far above RAM, so nothing else in the kernel can
+/// be using it, and it is unmapped until that routine maps it.
+const TEST_VA: usize = 0x3f_c000_0000;
+
+/// A virtual address in a different middle-level subtree, mapped by nothing: the
+/// `NotMapped` case, and the address whose `unmap` must be refused.
+const UNMAPPED_VA: usize = 0x3f_c020_0000;
+
+/// Words the Sv39 routine writes through its new mapping: 512 B of one page.
+/// The whole frame is not the point here — `frame_pattern` already proves a frame
+/// is real memory; this routine proves the *translation* is.
+const MAPPED_WORDS: usize = 64;
+
+/// The word pattern written through the mapping and read back through both
+/// names. Any odd constant works; this one is the golden-ratio word the x86 tree
+/// uses, and it is named because three places must agree on it.
+const MAP_PATTERN: u64 = 0x9e37_79b9_7f4a_7c15;
+
 /// Run every routine.
 ///
 /// Nothing is asserted or panicked: the caller is the shell, whose job is to keep
@@ -50,9 +71,11 @@ pub fn run() -> usize {
     let (before, total) = pmm::stats();
     crate::kprintln!("[selftest] free frames before: {} of {}", before, total);
 
-    let checks: [(&str, fn() -> bool); 4] = [
+    let checks: [(&str, fn() -> bool); 6] = [
         ("frames-roundtrip", frames_roundtrip),
         ("frame-pattern", frame_pattern),
+        ("sv39-map-roundtrip", sv39_map_roundtrip),
+        ("sv39-translate", sv39_translate),
         ("heap-vec", heap_vec),
         ("heap-defenses", heap_defenses),
     ];
@@ -140,10 +163,12 @@ fn frames_roundtrip() -> bool {
 /// A frame is real memory: write a whole frame through a raw pointer and read it
 /// back, then probe the first and last word.
 ///
-/// Volatile accesses on purpose. The kernel runs bare S-mode with `satp` still
-/// zero, so a frame's physical address is a dereferenceable address; but a
-/// non-volatile store to memory nothing else reads may be optimised away, and a
-/// test that passes without touching RAM proves nothing.
+/// Volatile accesses on purpose. A frame's physical address is a dereferenceable
+/// address *because* the kernel identity-maps RAM — above `__kernel_end` as
+/// read/write, see `memory::paging` — so the pointer below is exactly the address
+/// the CPU translates to itself; but a non-volatile store to memory nothing else
+/// reads may be optimised away, and a test that passes without touching RAM
+/// proves nothing.
 fn frame_pattern() -> bool {
     let Some(frame) = pmm::alloc_frame() else {
         crate::kprintln!("[selftest] no free frame for the pattern test");
@@ -152,9 +177,10 @@ fn frame_pattern() -> bool {
     let mut ok = true;
     let mut mismatched = 0usize;
 
-    // SAFETY: `frame` came from the frame allocator, so no other code owns it; it is
-    // a whole 4 KiB, and the kernel may write physical memory directly at this point
-    // in the boot (no MMU configuration exists to violate).
+    // SAFETY: `frame` came from the frame allocator, so no other code owns it. It
+    // is a whole 4 KiB, and it lies above `__kernel_end`, where the identity map
+    // is read/write precisely so a frame address is a usable pointer; this routine
+    // writes it and reads it back, nothing else.
     unsafe {
         let bytes = frame as *mut u8;
         for i in 0..FRAME_SIZE {
@@ -364,6 +390,188 @@ fn heap_defenses() -> bool {
                 "[selftest] the heap kept {} B ({} B mapped) after both blocks were freed",
                 used,
                 mapped
+            );
+            ok = false;
+        }
+    }
+    ok
+}
+
+/// Map a fresh frame at an unused virtual address, reach that memory *through* the
+/// new mapping, and take the map apart again.
+///
+/// The order of the checks is the diagnosis: the translation is verified before a
+/// byte is written (a wrong physical address would otherwise present itself as a
+/// bad pattern), the same words are then read back through both names, and the
+/// routine ends by requiring the free-frame count to be exactly what it was —
+/// which is also the check that `unmap` handed the intermediate tables back
+/// instead of leaving one frame behind per mapping.
+fn sv39_map_roundtrip() -> bool {
+    let (before, _) = pmm::stats();
+    let Some(frame) = pmm::alloc_frame() else {
+        crate::kprintln!("[selftest] no free frame for the Sv39 round trip");
+        return false;
+    };
+    let mut ok = true;
+
+    if !paging::active() {
+        crate::kprintln!("[selftest] satp does not select Sv39: the map is not in use");
+        pmm::free_frame(frame);
+        return false;
+    }
+
+    if let Err(error) = paging::map(TEST_VA, frame, Flags::kernel_rw()) {
+        crate::kprintln!("[selftest] map({TEST_VA:#x}, {frame:#x}) failed: {error}");
+        pmm::free_frame(frame);
+        return false;
+    }
+    match paging::translate(TEST_VA) {
+        Some(pa) if pa == frame => {}
+        other => {
+            crate::kprintln!("[selftest] {TEST_VA:#x} translates to {other:?}, not {frame:#x}");
+            ok = false;
+        }
+    }
+
+    // Refusals, because a map that overwrites is worse than one that fails: a
+    // second map of a live page must not silently replace the first (whoever
+    // mapped it would lose the memory), an unaligned address is not a page, and
+    // unmapping an address nothing mapped is not a success.
+    if !matches!(
+        paging::map(TEST_VA, frame, Flags::kernel_rw()),
+        Err(MapError::AlreadyMapped(_))
+    ) {
+        crate::kprintln!("[selftest] a second map of {TEST_VA:#x} was not refused");
+        ok = false;
+    }
+    if !matches!(
+        paging::map(TEST_VA + 1, frame, Flags::kernel_rw()),
+        Err(MapError::Misaligned(_))
+    ) {
+        crate::kprintln!(
+            "[selftest] a misaligned map of {:#x} was not refused",
+            TEST_VA + 1
+        );
+        ok = false;
+    }
+    if !matches!(paging::unmap(UNMAPPED_VA), Err(MapError::NotMapped(_))) {
+        crate::kprintln!("[selftest] unmap({UNMAPPED_VA:#x}) of an unmapped page did not fail");
+        ok = false;
+    }
+
+    // The same words through both names: the virtual address proves the walk, the
+    // physical address proves the mapping points at *this* frame rather than at a
+    // second one that happens to hold the same pattern.
+    // SAFETY: `TEST_VA` was just mapped to `frame` read/write above, and `frame` is
+    // owned by this routine (it came from the PMM and is freed below), so both
+    // pointers are valid for the [`MAPPED_WORDS`] words written and read here —
+    // well inside the one mapped page. Volatile because the point is the memory,
+    // not the values: a compiler that saw no reader could drop the store.
+    unsafe {
+        let through_va = TEST_VA as *mut u64;
+        let through_pa = frame as *const u64;
+        for i in 0..MAPPED_WORDS {
+            through_va.add(i).write_volatile(MAP_PATTERN ^ i as u64);
+        }
+        for i in 0..MAPPED_WORDS {
+            let expected = MAP_PATTERN ^ i as u64;
+            if through_va.add(i).read_volatile() != expected {
+                crate::kprintln!("[selftest] word {i} of {TEST_VA:#x} did not read back");
+                ok = false;
+                break;
+            }
+            if through_pa.add(i).read_volatile() != expected {
+                crate::kprintln!(
+                    "[selftest] word {i} of frame {frame:#x} differs from {TEST_VA:#x}"
+                );
+                ok = false;
+                break;
+            }
+        }
+    }
+
+    match paging::unmap(TEST_VA) {
+        Ok(pa) if pa == frame => {}
+        other => {
+            crate::kprintln!("[selftest] unmap({TEST_VA:#x}) returned {other:?}, not {frame:#x}");
+            ok = false;
+        }
+    }
+    if paging::translate(TEST_VA).is_some() {
+        crate::kprintln!("[selftest] {TEST_VA:#x} still translates after unmap");
+        ok = false;
+    }
+
+    pmm::free_frame(frame);
+    let (after, _) = pmm::stats();
+    if after != before {
+        crate::kprintln!(
+            "[selftest] the Sv39 round trip ends with {} free frames, {} before it started",
+            after,
+            before
+        );
+        ok = false;
+    }
+    ok
+}
+
+/// The identity map, checked where the rest of the kernel depends on it: a kernel
+/// address translates to itself, the console's page is mapped even though it is
+/// outside RAM, and an address nothing mapped answers `None` rather than a
+/// plausible wrong address.
+fn sv39_translate() -> bool {
+    let mut ok = true;
+
+    // A kernel address: the last page of the image, which the CPU is executing and
+    // printing from right now.
+    let kernel_va = crate::memory::kernel_end() - FRAME_SIZE;
+    match paging::translate(kernel_va) {
+        Some(pa) if pa == kernel_va => {}
+        other => {
+            crate::kprintln!("[selftest] kernel address {kernel_va:#x} translates to {other:?}");
+            ok = false;
+        }
+    }
+
+    // MMIO: outside RAM, so it is mapped only because `paging::init` was told about
+    // the device window — the check that the console survived the switch.
+    let uart = crate::drivers::uart::BASE;
+    match paging::translate(uart) {
+        Some(pa) if pa == uart => {}
+        other => {
+            crate::kprintln!("[selftest] the console page {uart:#x} translates to {other:?}");
+            ok = false;
+        }
+    }
+
+    // Unmapped: an address in Sv39's lower half that nothing claims. `None` is the
+    // only honest answer; a translation here would mean the walk invented one.
+    if let Some(pa) = paging::translate(UNMAPPED_VA) {
+        crate::kprintln!("[selftest] unmapped {UNMAPPED_VA:#x} translates to {pa:#x}");
+        ok = false;
+    }
+
+    // W^X, machine-checked instead of asserted in a comment: the image — which the
+    // CPU is executing from — is writable *and* executable, while the first frame
+    // above `__kernel_end`, the kind the allocator hands out, is writable and
+    // **not** executable.
+    match paging::flags(kernel_va) {
+        Some(bits) if bits.bits() & mmu::PTE_X != 0 && bits.bits() & mmu::PTE_W != 0 => {}
+        other => {
+            crate::kprintln!(
+                "[selftest] the kernel image page {kernel_va:#x} is not RWX: {:x?}",
+                other.map(|f| f.bits())
+            );
+            ok = false;
+        }
+    }
+    let allocatable = crate::memory::kernel_end();
+    match paging::flags(allocatable) {
+        Some(bits) if bits.bits() & mmu::PTE_W != 0 && bits.bits() & mmu::PTE_X == 0 => {}
+        other => {
+            crate::kprintln!(
+                "[selftest] the allocatable page {allocatable:#x} is not RW without X: {:x?}",
+                other.map(|f| f.bits())
             );
             ok = false;
         }

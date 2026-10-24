@@ -69,7 +69,7 @@ EXPECTED = [
     "pagh:rv64> help",
     "commands:",
     "  help          this list",
-    "  mem           physical memory reported by the device tree",
+    "  mem           device tree range, frame pool, heap and the page table",
     "  time          the `time` CSR (timebase ticks) and its frequency",
     "  hart          the hart this kernel is running on",
     "  echo <text>   print the text back",

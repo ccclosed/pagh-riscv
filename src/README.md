@@ -18,7 +18,7 @@
 | `arch/riscv64/csr.rs` | типизированный доступ к супервизорным CSR |
 | `arch/riscv64/sbi.rs` | `ecall` в M-mode: SRST (выключение) |
 | `arch/riscv64/traps.rs` | `stvec`, `trap_entry`, кадр на 264 байта, диспетчер |
-| `arch/riscv64/mmu.rs` | примитивы Sv39: флаги PTE, `PageTable`, `vpn`, `satp_for`, `activate`, `sfence`; **пока никем не вызывается** (`satp` не пишется) |
+| `arch/riscv64/mmu.rs` | примитивы Sv39: флаги PTE, `PageTable`, `vpn`, `satp_for`, `activate`, `sfence` — вызывает `memory::paging` |
 | `fdt.rs` | минимальный читатель flattened device tree |
 | `memory/mod.rs` | фасад памяти: `init`, `stats`, `kernel_end`, `boot_stack`, `fdt_span` |
 | `memory/pmm.rs` | битовая карта физических кадров 4 KiB (окно 4 GiB) |
@@ -61,8 +61,8 @@
 
 ## Чего в `src/` нет
 
-Ни одного из модулей x86-версии, кроме перечисленных выше: нет `vmm`/Sv39
-(`satp` не пишется), `fs/`, `vfs/`, `task/`, `net/`, `pkg/`, `security/`, `debug/`,
+Ни одного из модулей x86-версии, кроме перечисленных выше: нет `vmm` (Sv39 включён,
+но карта одна и только для ядра), `fs/`, `vfs/`, `task/`, `net/`, `pkg/`, `security/`, `debug/`,
 `log.rs`, `provision.rs`, `selftest_lx.rs` (Linux-compat). Нет host-tests: тесты,
 которые есть, живут внутри ядра — `memory/selftest.rs` (команда `selftest`).
 Подробный список — `README.md` → «Чего нет».

@@ -227,11 +227,11 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
 
 | Gap | Consequence for your change |
 |---|---|
-| No paging (`satp` never written); a physical address is a pointer | DMA-style addresses (`fw_cfg`, ramfb) must be revisited when Sv39 lands |
+| Sv39 is on with an **identity** map, so a physical address is still a pointer | any address handed to a device (`fw_cfg`, ramfb) relies on that identity; a non-identity or per-process map breaks it silently |
 | No timer, no `sie` bits, no PLIC | anything time-based or interrupt-driven is a new milestone, not a tweak |
 | No page-fault recovery | a bad access halts the machine; expect `[EXC] … halting` |
 | Screenshot pixels are not gated in CI yet (`--check-font` returns a non-zero code) | wiring it into the smoke job is an open task, not a reason to trust a shot by eye |
 | No host tests; state coverage is `selftest` only | you own the verification: extend the smoke driver or add a `SELFTEST` routine |
 | 6 compiler warnings remain (5 unused CSR helpers, `trap_entry as usize`) | do not add more; warning-cleanup PRs are welcome |
 | No `LICENSE` file although `Cargo.toml` says MIT | do not add a license your work does not own |
-| `src/arch/riscv64/mmu.rs` holds the Sv39 primitives but nothing calls them, and `satp` is never written | paging is not wired: do not assume a translation exists; a physical address is a pointer |
+| `src/memory/paging.rs` owns the only page table; `src/arch/riscv64/mmu.rs` is encoding only | do not map over the kernel image or drop the identity map while a device holds a physical address |

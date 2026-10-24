@@ -106,6 +106,21 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
         heap_chunks
     );
 
+    // The address space, before anything can trip over it. It is built from the
+    // frames above (page tables are PMM frames) and switched on here, so that
+    // every phase after this one runs on a map the kernel chose: RAM identity-
+    // mapped — RWX below `__kernel_end`, RW above it, which is where W^X holds,
+    // because no frame the allocator can hand out is executable — plus the
+    // console UART's page, which sits outside RAM and would otherwise fault the
+    // first `kprintln!` after the switch (`src/memory/paging.rs`).
+    let devices = [(drivers::uart::BASE, 0x100)];
+    if let Err(e) = memory::paging::init(memory, memory::kernel_end(), &devices) {
+        crate::kprintln!("paging: {e}");
+        crate::kprintln!("paging: refusing to run on an address space that is not there");
+        arch::riscv64::park_forever()
+    }
+    memory::report_paging();
+
     // Traps before anything that can trap: a bad address in the shell must
     // report itself instead of resetting the machine silently.
     arch::riscv64::traps::init();

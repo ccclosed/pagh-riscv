@@ -25,8 +25,8 @@ physical frames from a bitmap pool, serves `alloc` from a kernel heap that grows
 64 KiB chunks, brings up a ramfb screen with an 8×18 coverage font next to the serial
 console, installs a trap vector that names its cause instead of resetting silently,
 and drops into an interactive serial shell with an in-kernel self-test. **These parts
-are verified on a live boot**; paging (Sv39), the timer, block devices, tasks and
-syscalls are *not implemented* and are listed plainly in
+are verified on a live boot**; the timer, block devices, tasks and syscalls are
+*not implemented* and are listed plainly in
 [Чего нет](#чего-нет). The documentation is deliberately checkable: every claim in
 [`docs/architecture.md`](docs/architecture.md) cites the file and line it comes from,
 and the CI smoke test asserts the exact boot log this README shows.
@@ -74,14 +74,15 @@ device tree 0x8fe00000
 memory      0x80000000..0x90000000 (256 MiB)
 timebase    10000000 Hz
 console     NS16550 @ 0x10000000
-pmm         62939/65536 frames free (256 MiB tracked), heap 0 KiB in 0 chunk(s)
+pmm         62934/65536 frames free (256 MiB tracked), heap 0 KiB in 0 chunk(s)
 
 Type 'help' for the command list.
 
 pagh:rv64> mem
 memory 0x80000000..0x90000000 (256 MiB)
-pmm    62939 free of 65536 frames (256 MiB), pool 0x80000000..0x90000000
+pmm    62802 free of 65536 frames (256 MiB), pool 0x80000000..0x90000000
 heap   0 B used, 0 B mapped from the pool in 0 chunk(s) of 64 KiB
+sv39   on  satp=0x8000000000080a28, root 0x80a28000, identity 0x80000000..0x90000000 (RWX below 0x80a28000, RW above), 65537 pages, 1 device
 pagh:rv64> hart
 hart 0
 pagh:rv64> time
@@ -93,7 +94,7 @@ nosuchcmd: unknown command (try 'help')
 pagh:rv64> help
 commands:
   help          this list
-  mem           physical memory reported by the device tree
+  mem           device tree range, frame pool, heap and the page table
   selftest      run the in-QEMU memory self-tests
   time          the `time` CSR (timebase ticks) and its frequency
   hart          the hart this kernel is running on
@@ -109,16 +110,18 @@ halt: powering off
 
 ```text
 pagh:rv64> selftest
-[selftest] free frames before: 62939 of 65536
+[selftest] free frames before: 62802 of 65536
 SELFTEST frames-roundtrip PASS
 SELFTEST frame-pattern PASS
+SELFTEST sv39-map-roundtrip PASS
+SELFTEST sv39-translate PASS
 [selftest] heap: 8256 B in use, 65536 B mapped, 1 chunk(s)
 SELFTEST heap-vec PASS
 heap: double free of 0x80a73090 ignored
 heap: refusing to free 0x802302b8: not a heap block
 SELFTEST heap-defenses PASS
-SELFTEST SUMMARY: 4/4 passed
-[selftest] PMM hygiene: free frames 62939 -> 62939
+SELFTEST SUMMARY: 6/6 passed
+[selftest] PMM hygiene: free frames 62802 -> 62802
 ```
 
 Числа кадров зависят от размера ядра и от `-m`; проверяется не они, а то, что
@@ -141,7 +144,7 @@ SELFTEST SUMMARY: 4/4 passed
 | Шелл | готово | редактор строки (128 байт, backspace) + 8 команд | `src/shell.rs` |
 | Физическая память (PMM) | готово | битовая карта 4 KiB-кадров окна 4 GiB, `set = свободен`, выделение одиночное и непрерывным блоком | `src/memory/pmm.rs` |
 | Куча ядра, `alloc` | готово | `#[global_allocator]` поверх PMM-кадров: чанки по 64 KiB, free-list, целиком свободный чанк возвращается в PMM; `Vec` проверен `selftest` | `src/memory/{heap,selftest}.rs` |
-| Страницы (Sv39) | **нет** | `satp` не пишется: ядро работает на трансляции, оставленной прошивкой; примитивы Sv39 лежат в `src/arch/riscv64/mmu.rs`, но никем не вызываются | M2 (остаток) |
+| Страницы (Sv39) | готово (ядро) | identity-карта 4 KiB-страниц, `satp` включён: `[RAM base, __kernel_end)` RWX, выше — RW **без X**, страница UART RW; таблицы берутся из PMM, пустые возвращаются при `unmap`. Пользовательских адресных пространств нет | `src/memory/paging.rs`, `src/arch/riscv64/mmu.rs` |
 | Таймер | **нет** | `time` CSR читается, но таймер не программируется, `sie` = 0 | — |
 | Прерывания / PLIC | **нет** | ветки в диспетчере есть, источников нет: `[EXC] external interrupt (PLIC not routed yet)` | `src/arch/riscv64/traps.rs` |
 | Блочное устройство, ext2, VFS | **нет** | — | M5, план |
@@ -244,7 +247,7 @@ backspace работает, всё остальное — команды:
 туда можно только через SBI (`ecall`) — именно так работает `halt`. M-mode CSR
 из S-mode недоступны физически: `csrr …, mhartid` — это illegal instruction, и
 ядро узнало это на своём опыте (см. `docs/architecture.md`, раздел 2). `satp`
-не используется, страниц нет, U-mode нет.
+включает Sv39 с identity-картой (страницы 4 KiB, без user-бита); U-mode нет.
 
 **Устройства.** Единственное описание машины — device tree: ядро читает из него
 память и частоту timebase, отказываясь угадывать при ошибке разбора. Адреса UART
@@ -287,8 +290,10 @@ backspace работает, всё остальное — команды:
 Этот список — часть документации, а не извинение. Если подсистемы здесь нет,
 значит её нет в коде.
 
-* **Нет страниц.** `satp` не записывается, ядро работает на физических адресах в
-  трансляции, оставленной прошивкой; VMM/Sv39 — следующий шаг M2. Куча и `alloc`
+* **Нет пользовательских адресных пространств.** Sv39 включён, но карта одна и
+  только для ядра: identity, 4 KiB-страницы, без суперстраниц, без user-бита,
+  `satp.ASID = 0`; `map`/`unmap`/`translate` есть, VMM/mprotect/разделяемых
+  страниц нет. Куча и `alloc`
   уже есть: `#[global_allocator]` поверх PMM-кадров (`src/memory/heap.rs`), так что
   `Vec`, `String` и `Box` доступны и проверены `selftest`; буферы шелла пока
   фиксированные. `Cargo.toml` не содержит ни одной зависимости.
@@ -332,7 +337,8 @@ src/arch/riscv64/boot.rs       _start: стек, парковка hart'ов, в�
 src/arch/riscv64/csr.rs        типизированный доступ к CSR
 src/arch/riscv64/traps.rs      trap_entry, кадр на 264 байта, диспетчер
 src/arch/riscv64/sbi.rs        ecall в M-mode (SRST)
-src/arch/riscv64/mmu.rs        примитивы Sv39 (PTE, PageTable, satp, sfence); не вызываются
+src/arch/riscv64/mmu.rs        примитивы Sv39 (PTE, PageTable, satp, sfence)
+src/memory/paging.rs           identity-карта ядра, map/unmap/translate, satp
 src/fdt.rs                     минимальный читатель flattened device tree
 src/memory/{mod,pmm}.rs        пул физических кадров (битовая карта 4 KiB)
 src/memory/heap.rs             куча: free-list поверх чанков по 64 KiB

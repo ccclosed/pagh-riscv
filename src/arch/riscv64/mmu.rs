@@ -252,6 +252,15 @@ pub const fn pte_is_leaf(pte: u64) -> bool {
     pte & PTE_V != 0 && pte & (PTE_R | PTE_W | PTE_X) != 0
 }
 
+/// The flags half of an entry: everything except the physical address in it.
+///
+/// What a caller asking "how is this mapped" wants. Masking the PPN off here
+/// means a caller never has to know the field layout to answer that question, and
+/// cannot mistake an address bit for a permission bit.
+pub const fn pte_permissions(pte: u64) -> u64 {
+    pte & !(PTE_PPN_MASK << PTE_PPN_SHIFT)
+}
+
 /// True when `va` is a canonical Sv39 address.
 ///
 /// Sv39 defines 39 bits of address, so bits 63..39 must repeat bit 38: the
@@ -337,6 +346,11 @@ const _: () = {
     assert!(pte_is_valid(leaf));
     assert!(pte_is_leaf(leaf));
     assert!(leaf & PTE_X != 0 && leaf & PTE_W != 0);
+    // The permission half is exactly the policy bits, with the address masked
+    // off: this is what `memory::paging::flags` reports and what its W^X check
+    // compares against, so a shift in the PPN field cannot masquerade as a
+    // permission bit.
+    assert!(pte_permissions(leaf) == Flags::kernel_rwx().bits());
 
     // A table pointer is valid but not a leaf: that distinction is exactly
     // "descend" versus "this is memory".
