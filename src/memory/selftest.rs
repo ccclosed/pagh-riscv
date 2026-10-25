@@ -227,6 +227,11 @@ fn frame_pattern() -> bool {
 /// says so instead of the ledger merely drifting between runs.
 fn heap_vec() -> bool {
     let mut ok = true;
+    // A driver or a mounted filesystem owns heap state for the rest of the boot;
+    // "empty" is therefore the wrong invariant. What must hold is that *this*
+    // routine returns the heap to the numbers it found — that is what keeps the
+    // frame ledger even between passes.
+    let (base_used, base_mapped, base_chunks) = crate::heap_stats();
     let mut values: Vec<u64> = Vec::new();
     for i in 0..VEC_LEN {
         values.push((i as u64).wrapping_mul(VEC_STRIDE));
@@ -293,11 +298,14 @@ fn heap_vec() -> bool {
     drop(text);
 
     let (used, mapped, _) = crate::heap_stats();
-    if used != 0 || mapped != 0 {
+    if used != base_used || mapped != base_mapped {
         crate::kprintln!(
-            "[selftest] the heap still holds {} B ({} B mapped) after the Vec was dropped",
+            "[selftest] the heap did not return to its baseline: {} B used / {} B mapped now, {} B / {} B before ({} chunk(s) at start)",
             used,
-            mapped
+            mapped,
+            base_used,
+            base_mapped,
+            base_chunks
         );
         ok = false;
     }
@@ -322,6 +330,9 @@ fn heap_vec() -> bool {
 /// would take the other path (a pointer outside every owned chunk).
 fn heap_defenses() -> bool {
     let mut ok = true;
+    // See `heap_vec`: compare against the state this routine found, not against
+    // zero, so a driver's or filesystem's persistent heap does not read as a leak.
+    let (base_used, base_mapped, _) = crate::heap_stats();
     let block_layout = Layout::from_size_align(64, 8).unwrap();
     let keeper_layout = Layout::from_size_align(128, 8).unwrap();
 
@@ -385,11 +396,13 @@ fn heap_defenses() -> bool {
 
         crate::ALLOCATOR.dealloc(keeper, keeper_layout);
         let (used, mapped, _) = crate::heap_stats();
-        if used != 0 || mapped != 0 {
+        if used != base_used || mapped != base_mapped {
             crate::kprintln!(
-                "[selftest] the heap kept {} B ({} B mapped) after both blocks were freed",
+                "[selftest] the heap kept {} B ({} B mapped) after both blocks were freed; baseline was {} B ({} B mapped)",
                 used,
-                mapped
+                mapped,
+                base_used,
+                base_mapped
             );
             ok = false;
         }
