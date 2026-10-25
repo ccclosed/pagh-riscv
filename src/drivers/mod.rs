@@ -9,6 +9,7 @@
 //! parsed, and both fail loudly rather than silently when the address is wrong
 //! (no output; a rejected signature).
 
+pub mod block;
 pub mod framebuffer;
 pub mod fw_cfg;
 pub mod ramfb;
