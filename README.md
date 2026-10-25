@@ -10,7 +10,7 @@
   <img alt="Target: riscv64gc-unknown-none-elf" src="https://img.shields.io/badge/target-riscv64gc--unknown--none--elf-blue.svg">
   <img alt="no_std" src="https://img.shields.io/badge/%23!%5Bno__std%5D-yes-informational.svg">
   <img alt="Boot: OpenSBI S-mode" src="https://img.shields.io/badge/boot-OpenSBI%20S--mode-purple.svg">
-  <img alt="Milestone: M1 done, M2/M4 in progress" src="https://img.shields.io/badge/milestone-M1%20done-brightgreen.svg">
+  <img alt="Milestone: M1-M2, M4 done" src="https://img.shields.io/badge/milestone-M1%E2%80%93M2%2C%20M4%20done-brightgreen.svg">
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green.svg">
 </p>
 
@@ -274,7 +274,7 @@ backspace работает, всё остальное — команды:
 | # | Майлстоун | Статус |
 |---|---|---|
 | M1 | Загрузка под OpenSBI, DTB, ловушки, UART-консоль и шелл | **готов** |
-| M2 | Физический аллокатор кадров, Sv39, куча ядра, `alloc` | в работе: PMM, куча и `alloc` готовы (проверены `selftest`), Sv39 — нет |
+| M2 | Физический аллокатор кадров, Sv39, куча ядра, `alloc` | **готов** (identity Sv39 с W^X, куча и `alloc`; page-fault ловушки — задел M6) |
 | M3 | Таймер через SBI, PLIC, консоль на прерываниях | план |
 | M4 | ramfb + шрифт покрытия Fira Code, съёмка скриншотов | **готов** (экран, шрифт и снимок проверены) |
 | M5 | virtio-mmio блочное устройство, ext2, VFS | план |
