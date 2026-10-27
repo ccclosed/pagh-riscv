@@ -10,7 +10,7 @@
   <img alt="Target: riscv64gc-unknown-none-elf" src="https://img.shields.io/badge/target-riscv64gc--unknown--none--elf-blue.svg">
   <img alt="no_std" src="https://img.shields.io/badge/%23!%5Bno__std%5D-yes-informational.svg">
   <img alt="Boot: OpenSBI S-mode" src="https://img.shields.io/badge/boot-OpenSBI%20S--mode-purple.svg">
-  <img alt="Milestone: M1-M2, M4-M5 done" src="https://img.shields.io/badge/milestone-M1%E2%80%93M2%2C%20M4%E2%80%93M5%20done-brightgreen.svg">
+  <img alt="Milestone: M1-M5, M6a done" src="https://img.shields.io/badge/milestone-M1%E2%80%93M5%2C%20M6a%20done-brightgreen.svg">
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green.svg">
 </p>
 
@@ -157,9 +157,10 @@ SELFTEST SUMMARY: 6/6 passed
 | Блочное устройство | готово | virtio-mmio (modern virtio 1.x, version 2), polled: окна транспорта находятся через DTB, read/write/flush, опрос завершения с ограничением и FAILED после таймаута; `-global virtio-mmio.force-legacy=false` обязателен (иначе QEMU даёт legacy-транспорт) | `src/drivers/block.rs`, `src/drivers/virtio_mmio.rs` |
 | Файловая система (ext2) | готово | чтение/запись файлов (direct + single/double indirect), truncate, каталоги, create/unlink/mkdir/rmdir/rename, симлинки; совместимо с образом хостового `mkfs.ext2 -t ext2`; форматируется только пустое устройство (MBR/GPT/чужие данные — отказ с причиной); журнала/WAL нет | `src/fs/ext2/`, `src/fs/format_policy.rs` |
 | VFS | готово | `VfsNode`, синтетический корень, монтирование в `/mnt`, два примитива разрешения путей (`lookup_path` без последней симлинки / `walk` с переходом и бюджетом) | `src/vfs/mod.rs` |
-| Задачи, syscalls, userland | **нет** | — | M6, план |
+| Планировщик, потоки ядра (M6a) | готово | контекстный switch (callee-saved ABI), до 8 потоков, round-robin, квант 8 тиков, стек 16 KiB + guard из PMM, вытеснение тиком таймера из trap-контекста, `tasks`/`spawn`/`yield`; exit возвращает кадры | `src/arch/riscv64/switch.rs`, `src/task/` |
+| User mode, syscalls, ELF (M6b) | **нет** | — | M6b, план: U-бит в карте, `sret` в U-mode, `ecall`-диспетчер, ELF-загрузчик |
 | Сеть, пакеты, apt | **нет** | есть в [x86-репозитории](https://github.com/ccclosed/Pagh-OS), сюда не портируется | — |
-| Тесты | частично | host-тестов нет; in-QEMU `selftest` — 7 проверок памяти + 3 блочного слоя + 11 ext2/VFS + 4 прерываний/таймера (идемпотентность по ledger'у свободных кадров), QEMU-smoke в четырёх режимах (serial, ramfb, диск-fresh, диск-existing) и проверка пикселей `tools/font_check.py` | `src/memory/selftest.rs`, `src/drivers/selftest.rs`, `src/fs/selftest.rs`, `src/arch/riscv64/selftest.rs`, `.github/smoke.py`, `tools/` |
+| Тесты | частично | host-тестов нет; in-QEMU `selftest` — 7 памяти + 3 блочного слоя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика (идемпотентность по ledger'у свободных кадров), QEMU-smoke в четырёх режимах (serial, ramfb, диск-fresh, диск-existing) и проверка пикселей `tools/font_check.py` | `src/memory/selftest.rs`, `src/drivers/selftest.rs`, `src/fs/selftest.rs`, `src/arch/riscv64/selftest.rs`, `src/task/selftest.rs`, `.github/smoke.py`, `tools/` |
 | CI | готово | `fmt`, debug/release build, QEMU-smoke (serial, ramfb, и приёмка M5: пустой диск → формат/монтирование/запись, повторная загрузка того же образа читает файл) | `.github/workflows/ci.yml` |
 
 ---
@@ -235,6 +236,9 @@ backspace работает, всё остальное — команды:
 | `echo <text>` | печатает текст (слова через один пробел) |
 | `clear` | очистка экрана ANSI-последовательностью (чистит и экран, и терминал) |
 | `sleep <secs>` | ждать столько секунд тиков (`wfi`, не спин) |
+| `tasks` | потоки ядра: id, имя, состояние, переключения, работа, стек |
+| `spawn [n]` | запустить n демо-потоков (по умолчанию 3; 0 — остановить) |
+| `yield [n]` | прогнать n тиков планировщика и показать число переключений |
 | `halt` | выключение машины через SBI SRST |
 
 Истории, автодополнения и стрелок нет — это следующий уровень шелла, а не
@@ -300,7 +304,7 @@ backspace работает, всё остальное — команды:
 | M3 | Таймер через SBI, PLIC, консоль на прерываниях | план |
 | M4 | ramfb + шрифт покрытия Fira Code, съёмка скриншотов | **готов** (экран, шрифт и снимок проверены) |
 | M5 | virtio-mmio блочное устройство, ext2, VFS | **готов** (virtio-mmio, ext2 rw + формат пустого диска, VFS, шелл-команды; журнала нет) |
-| M6 | Задачи, syscalls, Linux-compat-слой из x86-ветки | план |
+| M6 | Задачи, syscalls, Linux-compat-слой из x86-ветки | M6a (планировщик и потоки) — **готов**; M6b (user mode, syscalls, ELF) — план |
 
 Что считается «сделано» для каждого майлстоуна и что в него не входит —
 [`docs/roadmap.md`](docs/roadmap.md).
@@ -347,7 +351,7 @@ backspace работает, всё остальное — команды:
 безопасно; как только появится первый источник прерываний, критическую секцию
 нужно обернуть в `csr::without_interrupts`, иначе обработчик, печатающий в
 консоль, встанет на локе, который держит прерванный контекст. Разбор —
-`docs/architecture.md`, раздел 11.1.
+`docs/architecture.md`, раздел 12.1.
 
 ---
 

@@ -12,6 +12,7 @@ pub mod mmu;
 pub mod plic;
 pub mod sbi;
 pub mod selftest;
+pub mod switch;
 pub mod timer;
 pub mod traps;
 

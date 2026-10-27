@@ -23,6 +23,7 @@ mod fs;
 mod memory;
 mod shell;
 mod sync;
+mod task;
 mod vfs;
 
 use alloc::sync::Arc;
@@ -213,6 +214,30 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
             "plic        no PLIC/UART interrupt in the device tree — external interrupts off, uart rx stays polled"
         ),
     }
+
+    // The scheduler: after the frame pool (thread stacks are PMM frames) and
+    // after the trap vector (the timer drives its clock from a trap). The boot
+    // thread becomes slot 0 and the shell runs on it, so the shell does not have
+    // to be a spawned thread for kernel threads to run under it.
+    task::init();
+    // The one line the M3 seam asks for: every timer tick now runs the scheduler
+    // in trap context. `tick_from_timer` marks the hardware clock attached, so
+    // the shell's software pump becomes a no-op.
+    if arch::riscv64::timer::running() {
+        arch::riscv64::timer::set_tick_handler(Some(task::scheduler::tick_from_timer));
+    }
+    crate::kprintln!(
+        "task        {} slots, {} KiB stack + {} KiB guard, quantum {} ticks, {} clock",
+        task::MAX_TASKS,
+        task::STACK_SIZE / 1024,
+        task::GUARD_SIZE / 1024,
+        task::QUANTUM_TICKS,
+        if arch::riscv64::timer::running() {
+            "timer"
+        } else {
+            "software"
+        }
+    );
 
     // The block driver next: it probes every transport window, so it needs the
     // map (a read through an unmapped window would fault) and the trap handler

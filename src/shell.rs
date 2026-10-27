@@ -77,6 +77,11 @@ pub fn run(tree: Fdt) -> ! {
             // Idle wait, not a poll: the UART interrupt wakes this `wfi` and the
             // timer guarantees a periodic wake-up even if a byte is lost to the
             // ring-check/`wfi` window (`uart::wait_byte`).
+            //
+            // The scheduler's software clock is advanced here for machines (or
+            // builds) without a timer interrupt; with M3's timer attached this is
+            // a no-op and the tick arrives through `trap_entry` instead.
+            crate::task::scheduler::pump();
             let byte = uart::wait_byte();
             match byte {
                 b'\r' | b'\n' => {
@@ -210,9 +215,12 @@ fn execute(line: &str, tree: &Fdt, state: &mut State) {
                 "  disk          block device: name, capacity and a sector-0 read check"
             );
             crate::kprintln!(
-                "  selftest      run the in-QEMU memory, block and filesystem self-tests"
+                "  selftest      run the in-QEMU self-tests (memory, block, fs, timer, tasks)"
             );
             crate::kprintln!("  sleep <secs>  wait for that many seconds of timer ticks");
+            crate::kprintln!("  tasks         list kernel threads: id, name, state, work, stack");
+            crate::kprintln!("  spawn [n]     start n demo kernel threads (default 3, 0 stops)");
+            crate::kprintln!("  yield [n]     run n scheduler ticks and report the switches");
             crate::kprintln!("  time          the `time` CSR (timebase ticks) and its frequency");
             crate::kprintln!("  hart          the hart this kernel is running on");
             crate::kprintln!("  echo <text>   print the text back");
@@ -316,6 +324,65 @@ fn execute(line: &str, tree: &Fdt, state: &mut State) {
             crate::drivers::selftest::run();
             crate::fs::selftest::run();
             crate::arch::riscv64::selftest::run();
+            crate::task::selftest::run();
+        }
+        "tasks" => list_tasks(),
+        "spawn" => {
+            // `spawn` with no argument is the demo the milestone asks for: a few
+            // threads that bump their own counters until the next spawn replaces
+            // the cohort. The count is capped by the table, not by trust.
+            let count = args
+                .next()
+                .and_then(|arg| arg.parse::<usize>().ok())
+                .unwrap_or(3);
+            if count > crate::task::MAX_TASKS - 2 {
+                crate::kprintln!(
+                    "spawn: at most {} kernel threads fit in the table",
+                    crate::task::MAX_TASKS - 2
+                );
+                return;
+            }
+            let started = crate::task::spawn_demo(count);
+            if count == 0 {
+                crate::kprintln!("spawn: demo threads cancelled");
+            } else if started == count {
+                crate::kprintln!(
+                    "spawn: {} demo thread(s) running; `tasks` lists them, `sleep` lets them run",
+                    started
+                );
+            } else {
+                crate::kprintln!(
+                    "spawn: started {} of {} thread(s) — the table or the frame pool is full",
+                    started,
+                    count
+                );
+            }
+        }
+        "yield" => {
+            // Deterministic evidence of switching: run `n` scheduler ticks (the
+            // same function the timer interrupt calls) and print what happened.
+            let ticks = args
+                .next()
+                .and_then(|arg| arg.parse::<usize>().ok())
+                .unwrap_or(64)
+                .min(100_000);
+            let before = crate::task::stats();
+            for _ in 0..ticks {
+                crate::task::tick();
+            }
+            let after = crate::task::stats();
+            crate::kprintln!(
+                "yield: {} tick(s) -> {} switch(es), {} runnable, current task {} ({})",
+                ticks,
+                after.switches.wrapping_sub(before.switches),
+                after.ready_tasks,
+                after.current_id,
+                if after.hardware_clock {
+                    "timer clock"
+                } else {
+                    "software clock"
+                }
+            );
         }
         "time" => {
             // Two clocks, and printing both is the point: the `time` CSR is the
@@ -910,6 +977,57 @@ fn cmd_ramdisk<'a>(mut args: impl Iterator<Item = &'a str>, state: &mut State) {
         Err(e) => {
             let _ = e;
             crate::kprintln!("ramdisk: mounting at /mnt failed");
+        }
+    }
+}
+
+/// The `tasks` command: one line per thread, from a snapshot taken under the
+/// scheduler lock.
+///
+/// This listing is the milestone's evidence — state, work counter and switch
+/// count of every thread — so it prints names and states as stable strings the
+/// serial log can be grepped for. The snapshot is a copy: printing does not hold
+/// the scheduler lock, and every number on one line comes from the same instant.
+fn list_tasks() {
+    let mut infos = [crate::task::TaskInfo::zeroed(); crate::task::MAX_TASKS];
+    let count = crate::task::snapshot(&mut infos);
+    let stats = crate::task::stats();
+    crate::kprintln!(
+        "tasks: {} live of {} slots, {} ready, {} ticks, {} switches, {} reaps, {} clock",
+        stats.live_tasks,
+        crate::task::MAX_TASKS,
+        stats.ready_tasks,
+        stats.ticks,
+        stats.switches,
+        stats.reaps,
+        if stats.hardware_clock {
+            "timer"
+        } else {
+            "software"
+        }
+    );
+    crate::kprintln!("  id  name       state     switches   work  stack");
+    for info in &infos[..count] {
+        if info.stack_bytes() == 0 {
+            // The boot thread runs on the linker's stack, not on PMM frames.
+            crate::kprintln!(
+                "  {:<3} {:<10} {:<8} {:>8}  {:>4}  boot",
+                info.id,
+                info.name.as_str(),
+                info.state.name(),
+                info.switches,
+                info.counter
+            );
+        } else {
+            crate::kprintln!(
+                "  {:<3} {:<10} {:<8} {:>8}  {:>4}  {} KiB",
+                info.id,
+                info.name.as_str(),
+                info.state.name(),
+                info.switches,
+                info.counter,
+                info.stack_bytes() / 1024
+            );
         }
     }
 }

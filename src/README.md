@@ -42,6 +42,10 @@
 | `vfs/mod.rs` | `VfsNode`, ошибки, синтетический корень, таблица монтирований, `lookup_path`/`walk` |
 | `console.rs` | `kprint!`/`kprintln!`: один текст — два стока (UART и экран) |
 | `shell.rs` | цикл консоли, редактор строки, команды |
+| `arch/riscv64/switch.rs` | второй ABI ядра: `TaskContext` (ra/sp/s0–s11) и `task_switch` |
+| `task/mod.rs` | фасад планировщика |
+| `task/scheduler.rs` | таблица потоков, ready-queue, квант, стеки из PMM, `tick`/`yield`/`exit`/`reap`, вытеснение таймером |
+| `task/selftest.rs` | пять проверок планировщика для `selftest` |
 | `sync.rs` | один нереентерабельный спинлок |
 
 Подкаталоги документируют себя сами: [`arch/README.md`](arch/README.md),
@@ -80,7 +84,8 @@
 
 Ни одного из модулей x86-версии, кроме перечисленных выше: нет `vmm` (Sv39 включён,
 но карта одна и только для ядра), `task/`, `net/`, `pkg/`, `security/`, `debug/`,
-`log.rs`, `provision.rs`, `selftest_lx.rs` (Linux-compat). Нет host-tests: тесты,
+`log.rs`, `provision.rs`, `selftest_lx.rs` (Linux-compat). User mode/syscalls/ELF —
+M6b, их тоже нет. Нет host-tests: тесты,
 которые есть, живут внутри ядра — `memory/selftest.rs` и `fs/selftest.rs`
 (команда `selftest`). Подробный список — `README.md` → «Чего нет».
 
@@ -92,7 +97,7 @@
 | release | `cargo build --locked --release` | `target/riscv64gc-unknown-none-elf/release/pagh` |
 | smoke (serial) | `python3 .github/smoke.py <kernel>` | exit 0 + серийный лог |
 | smoke (+экран) | `python3 .github/smoke.py <kernel> --ramfb` | то же, с `-device ramfb` |
-| память в госте | команда `selftest` | `SELFTEST SUMMARY: 7/7`, `(block) 3/3`, `ext2 summary: 11/11`, `(arch) 4/4` |
+| память в госте | команда `selftest` | `SELFTEST SUMMARY: 7/7`, `(block) 3/3`, `ext2 summary: 11/11`, `(arch) 4/4`, `(task) 5/5` |
 | диск в госте | `qemu-img create` + `-device virtio-blk-device` + `-global virtio-mmio.force-legacy=false` | пустой образ форматируется, `/mnt` монтируется, файл переживает перезагрузку |
 
 Оба профиля: `panic = "abort"` (`Cargo.toml:10-14`), release дополнительно
