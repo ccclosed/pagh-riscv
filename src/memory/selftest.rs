@@ -71,13 +71,14 @@ pub fn run() -> usize {
     let (before, total) = pmm::stats();
     crate::kprintln!("[selftest] free frames before: {} of {}", before, total);
 
-    let checks: [(&str, fn() -> bool); 6] = [
+    let checks: [(&str, fn() -> bool); 7] = [
         ("frames-roundtrip", frames_roundtrip),
         ("frame-pattern", frame_pattern),
         ("sv39-map-roundtrip", sv39_map_roundtrip),
         ("sv39-translate", sv39_translate),
         ("heap-vec", heap_vec),
         ("heap-defenses", heap_defenses),
+        ("heap-chunks", heap_chunks),
     ];
     let mut passed = 0usize;
     for (name, check) in checks {
@@ -332,7 +333,7 @@ fn heap_defenses() -> bool {
     let mut ok = true;
     // See `heap_vec`: compare against the state this routine found, not against
     // zero, so a driver's or filesystem's persistent heap does not read as a leak.
-    let (base_used, base_mapped, _) = crate::heap_stats();
+    let (base_used, base_mapped, base_chunks) = crate::heap_stats();
     let block_layout = Layout::from_size_align(64, 8).unwrap();
     let keeper_layout = Layout::from_size_align(128, 8).unwrap();
 
@@ -353,7 +354,7 @@ fn heap_defenses() -> bool {
             }
             return false;
         }
-        let (allocated, mapped_allocated, _) = crate::heap_stats();
+        let (allocated, mapped_allocated, chunks_allocated) = crate::heap_stats();
 
         crate::ALLOCATOR.dealloc(block, block_layout);
         let (used, mapped, _) = crate::heap_stats();
@@ -371,7 +372,10 @@ fn heap_defenses() -> bool {
         // The double free: same pointer, same layout, twice.
         crate::ALLOCATOR.dealloc(block, block_layout);
         let (used, mapped, chunks) = crate::heap_stats();
-        if used != allocated - block_layout.size() || mapped != mapped_allocated || chunks != 1 {
+        if used != allocated - block_layout.size()
+            || mapped != mapped_allocated
+            || chunks != chunks_allocated
+        {
             crate::kprintln!(
                 "[selftest] the double free moved the heap: {} B used, {} B mapped, {} chunk(s)",
                 used,
@@ -406,6 +410,71 @@ fn heap_defenses() -> bool {
             );
             ok = false;
         }
+    }
+    ok
+}
+
+/// Chunks must come back to the frame allocator once their whole span is free —
+/// including when two chunks happen to be physically adjacent.
+///
+/// The free list is a list of addresses, so "the block after this one" can belong
+/// to a *different* chunk: the frame allocator hands out contiguous runs, and two
+/// chunks taken one after the other are usually neighbours. Merging such blocks
+/// produces one free block larger than a chunk, and the whole-chunk test in
+/// `release_free_chunks` then never matches — the frames stay allocated forever
+/// while the heap reports zero bytes in use. The ext2 suite found exactly that
+/// (three chunks mapped, nothing used); this routine keeps it found.
+fn heap_chunks() -> bool {
+    let mut ok = true;
+    let (base_used, base_mapped, base_chunks) = crate::heap_stats();
+
+    // One chunk each: 60 KiB fits inside a 64 KiB chunk but leaves no room for a
+    // second one, so three live blocks force three chunks. (`try_reserve_exact`
+    // keeps an out-of-memory failure a test result instead of a panic.)
+    const BIG: usize = 60 * 1024;
+    let mut held: Vec<Vec<u8>> = Vec::new();
+    for i in 0..3u8 {
+        let mut block: Vec<u8> = Vec::new();
+        if block.try_reserve_exact(BIG).is_err() {
+            crate::kprintln!("[selftest] the heap refused a {BIG}-byte allocation");
+            ok = false;
+            break;
+        }
+        block.resize(BIG, i);
+        held.push(block);
+    }
+    let (_, mapped_mid, chunks_mid) = crate::heap_stats();
+    if mapped_mid < base_mapped + 3 * crate::memory::heap::CHUNK_SIZE
+        || chunks_mid < base_chunks + 3
+    {
+        crate::kprintln!(
+            "[selftest] three large blocks did not grow the heap as expected: {} B mapped, {} chunk(s)",
+            mapped_mid,
+            chunks_mid
+        );
+        ok = false;
+    }
+    // Contents check: the allocator must not have aliased the three blocks.
+    for (i, block) in held.iter().enumerate() {
+        if block.iter().any(|byte| *byte != i as u8) {
+            crate::kprintln!("[selftest] block {i} was aliased by another allocation");
+            ok = false;
+        }
+    }
+
+    drop(held);
+    let (used_after, mapped_after, chunks_after) = crate::heap_stats();
+    if (used_after, mapped_after, chunks_after) != (base_used, base_mapped, base_chunks) {
+        crate::kprintln!(
+            "[selftest] the heap kept {} B / {} B mapped / {} chunk(s) after the blocks were dropped (baseline {} B / {} B / {})",
+            used_after,
+            mapped_after,
+            chunks_after,
+            base_used,
+            base_mapped,
+            base_chunks
+        );
+        ok = false;
     }
     ok
 }

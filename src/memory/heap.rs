@@ -15,6 +15,12 @@
 //! the pool exactly as it found it. This is what makes `selftest` twice in one boot
 //! print the same two ledgers.
 //!
+//! Free blocks never merge **across** a chunk boundary, even when the two chunks
+//! happen to be physically adjacent. A merged span would be larger than one
+//! chunk, and the "whole chunk is free" test could not see it — the frames would
+//! be unreachable while the heap reported them as free. The ext2 selftest found
+//! exactly this: three chunks stayed mapped with zero bytes in use.
+//!
 //! Deliberate limits, named in `src/memory/README.md`:
 //! * a request aligned to more than 16 bytes is refused (null), not rounded — every
 //!   block is 16-byte aligned, so 16 is the strongest promise the layout can keep,
@@ -108,9 +114,23 @@ impl State {
 
     /// True when `addr` lies inside one of the chunks the heap owns.
     fn owns(&self, addr: usize) -> bool {
+        self.chunk_of(addr).is_some()
+    }
+
+    /// The base of the chunk that contains `addr`, if any.
+    ///
+    /// Adjacency is not ownership: two chunks handed out by the frame allocator
+    /// can sit next to each other in physical memory, and the free list is a list
+    /// of *addresses*. Coalescing across a chunk boundary would produce one free
+    /// block spanning two separately-owned chunks, which
+    /// [`State::release_free_chunks`] can no longer recognise as a whole chunk —
+    /// so both chunks would stay mapped (and their frames unreachable) even with
+    /// every byte free. Every merge decision therefore asks this first.
+    fn chunk_of(&self, addr: usize) -> Option<usize> {
         self.chunks[..self.chunk_count]
             .iter()
-            .any(|&base| addr >= base && addr < base + CHUNK_SIZE)
+            .copied()
+            .find(|&base| addr >= base && addr < base + CHUNK_SIZE)
     }
 
     /// Map one more chunk and put it on the free list.
@@ -165,7 +185,8 @@ impl State {
         }
 
         let mut size = size;
-        if cur != 0 && addr + size == cur {
+        let chunk = self.chunk_of(addr);
+        if cur != 0 && addr + size == cur && self.chunk_of(cur) == chunk {
             // SAFETY: `cur` is a live free block that starts exactly where this one
             // ends; merging two free neighbours is the invariant this function keeps.
             size += unsafe { (*(cur as *const Header)).size };
@@ -175,7 +196,7 @@ impl State {
             // SAFETY: `prev` is a live free block; its size is read to ask whether it
             // ends exactly where the new block starts.
             let prev_size = unsafe { (*(prev as *const Header)).size };
-            if prev + prev_size == addr {
+            if prev + prev_size == addr && self.chunk_of(prev) == chunk {
                 // SAFETY: growing `prev` over the new block is sound because both
                 // are free and adjacent; the new block's header is simply absorbed.
                 unsafe { (*(prev as *mut Header)).size += size };

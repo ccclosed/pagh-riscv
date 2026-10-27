@@ -19,10 +19,13 @@ mod arch;
 mod console;
 mod drivers;
 mod fdt;
+mod fs;
 mod memory;
 mod shell;
 mod sync;
+mod vfs;
 
+use alloc::sync::Arc;
 use core::panic::PanicInfo;
 
 /// The global allocator: the heap that `alloc::vec::Vec` and friends get their
@@ -147,14 +150,112 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     // report itself instead of resetting the machine silently.
     arch::riscv64::traps::init();
 
-    // The block driver last: it probes every transport window, so it needs the
+    // The block driver first: it probes every transport window, so it needs the
     // map (a read through an unmapped window would fault) and the trap handler
     // above (a broken window must report itself, not reset the machine). Absence
     // is logged, not fatal: a headless CI boot has no disk attached, and the
     // kernel is still a kernel without one.
     drivers::virtio_mmio::init(&tree);
 
+    // The VFS root (a synthetic, kernel-owned directory) and then the mounted
+    // filesystem. Phase order matters: the driver above has registered its
+    // device, the heap is up (mounting allocates), and the shell's file commands
+    // assume `/mnt` is either mounted or cleanly reported as absent. With no
+    // block device this logs one line and continues — CI boots without a disk.
+    vfs::init();
+    init_fs();
+
     shell::run(tree);
+}
+
+/// Phase M5: format a blank block device (only a blank one) and mount it at
+/// `/mnt`.
+///
+/// The decision sequence is the safety property, not an implementation detail:
+///
+/// 1. no block device → one clear log line, shell keeps working;
+/// 2. a mountable ext2 image → mount it, never write anything first;
+/// 3. a failed mount → ask [`fs::format_policy`] what the device looks like. Only
+///    a **blank** device is formatted (a partition table, foreign data or a
+///    damaged ext2 superblock is refused by name), and the log says so;
+/// 4. format then mount again; a failure at either step leaves `/mnt` unmounted
+///    and the machine running.
+fn init_fs() {
+    use crate::fs::ext2::Ext2Fs;
+    use crate::fs::format_policy;
+
+    let Some(dev) = drivers::block::get() else {
+        crate::kprintln!("fs          no block device (/mnt not mounted)");
+        return;
+    };
+    let sectors = dev.sector_count();
+    crate::kprintln!(
+        "fs          {} ({} sectors, {} KiB)",
+        dev.name(),
+        sectors,
+        sectors.saturating_mul(512) / 1024
+    );
+
+    let root = match Ext2Fs::mount(Arc::clone(&dev)) {
+        Ok(root) => root,
+        Err(first_error) => {
+            let has_superblock = Ext2Fs::has_valid_superblock(&*dev);
+            let layout = format_policy::probe_device(&*dev);
+            match format_policy::format_allowed(layout, has_superblock) {
+                Ok(()) => {
+                    crate::kprintln!("fs          {} is blank — formatting ext2", dev.name());
+                    if let Err(e) = Ext2Fs::format(Arc::clone(&dev)) {
+                        crate::kprintln!(
+                            "fs          format failed: {}; /mnt not mounted",
+                            e.as_str()
+                        );
+                        return;
+                    }
+                    match Ext2Fs::mount(Arc::clone(&dev)) {
+                        Ok(root) => root,
+                        Err(e) => {
+                            crate::kprintln!(
+                                "fs          mount after format failed: {}; /mnt not mounted",
+                                e.as_str()
+                            );
+                            return;
+                        }
+                    }
+                }
+                Err(refusal) => {
+                    crate::kprintln!(
+                        "fs          mount failed ({}); refusing to format {}: {}",
+                        first_error.as_str(),
+                        dev.name(),
+                        refusal.reason()
+                    );
+                    crate::kprintln!(
+                        "fs          {} left untouched (/mnt not mounted)",
+                        dev.name()
+                    );
+                    return;
+                }
+            }
+        }
+    };
+
+    match vfs::mount_at("/mnt", root) {
+        Ok(()) => match vfs::lookup_path("/mnt") {
+            Ok(node) => match node.fs_stat() {
+                Some(stat) => crate::kprintln!(
+                    "fs          ext2 on /mnt, {} B blocks, {}/{} blocks free, {}/{} inodes free",
+                    stat.block_size,
+                    stat.blocks_free,
+                    stat.blocks_total,
+                    stat.inodes_free,
+                    stat.inodes_total
+                ),
+                None => crate::kprintln!("fs          mounted at /mnt"),
+            },
+            Err(_) => crate::kprintln!("fs          mounted at /mnt"),
+        },
+        Err(e) => crate::kprintln!("fs          mount_at(/mnt) failed: {}", e.as_str()),
+    }
 }
 
 #[panic_handler]

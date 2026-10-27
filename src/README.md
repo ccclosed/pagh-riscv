@@ -23,18 +23,27 @@
 | `memory/mod.rs` | фасад памяти: `init`, `stats`, `kernel_end`, `boot_stack`, `fdt_span` |
 | `memory/pmm.rs` | битовая карта физических кадров 4 KiB (окно 4 GiB) |
 | `memory/heap.rs` | free-list внутри 64 KiB-чанков, `GlobalAlloc` |
-| `memory/selftest.rs` | четыре неразрушающие проверки памяти для команды `selftest` |
+| `memory/selftest.rs` | семь неразрушающих проверок памяти (PMM, Sv39, куча, чанки) для `selftest` |
 | `drivers/mod.rs` | фасад драйверов |
 | `drivers/uart.rs` | NS16550: polled-консоль |
 | `drivers/fw_cfg.rs` | QEMU fw_cfg: селектор/данные + DMA |
 | `drivers/ramfb.rs` | конфигурация устройства ramfb |
 | `drivers/framebuffer.rs` | текстовый экран: тень, шрифт покрытия, статус-бар |
+| `drivers/block.rs` | шов блочного слоя: трейт `BlockDevice`, один слот реестра, RAM-диск `MemBlock` |
+| `drivers/virtio_mmio.rs` | virtio-blk на mmio-транспорте (modern, version 2), polled; окна — из DTB |
+| `drivers/selftest.rs` | проверки блочного слоя (RAM round-trip + read-only реального диска) |
+| `fs/mod.rs` | фасад ФС: ext2, политика формата, in-QEMU тесты |
+| `fs/ext2/` | ext2: суперблок/группы/inode/dirent/alloc/symlink, mount, read/write, rename, mkfs |
+| `fs/format_policy.rs` | единственное решение, которое может стереть данные: пусто ли устройство |
+| `fs/selftest.rs` | 11 неразрушающих проверок ext2/VFS на RAM-устройстве |
+| `vfs/mod.rs` | `VfsNode`, ошибки, синтетический корень, таблица монтирований, `lookup_path`/`walk` |
 | `console.rs` | `kprint!`/`kprintln!`: один текст — два стока (UART и экран) |
 | `shell.rs` | цикл консоли, редактор строки, команды |
 | `sync.rs` | один нереентерабельный спинлок |
 
 Подкаталоги документируют себя сами: [`arch/README.md`](arch/README.md),
-[`drivers/README.md`](drivers/README.md), [`memory/README.md`](memory/README.md).
+[`drivers/README.md`](drivers/README.md), [`memory/README.md`](memory/README.md),
+[`fs/README.md`](fs/README.md), [`vfs/README.md`](vfs/README.md).
 Устройство `src/memory/**` (PMM, куча, selftest, пределы, чего нет) — в README
 подсистемы; `docs/architecture.md` (разделы 6–7) добавляет к нему то, что нужно
 знать при чтении boot-пути: карту памяти и порядок фаз.
@@ -52,8 +61,11 @@
 | 7 | разбор DTB, ошибка фатальна | `main.rs:65-72`, `fdt.rs:64-98` | описание машины нельзя угадывать |
 | 8 | память, timebase и адрес консоли — в лог | `main.rs:73-81` | — |
 | 9 | PMM: пул кадров минус образ ядра, стек и DTB; печать статистики | `main.rs:83-107`, `memory/mod.rs:75-77` | `alloc` уже существует — аллокатор должен быть готов до первой аллокации |
-| 10 | `traps::init()`: `stvec` + `sstatus.SIE` | `main.rs:109-111`, `arch/riscv64/traps.rs:151-155` | ловушки раньше того, что может сбойнуть |
-| 11 | `shell::run(tree)`, не возвращается | `main.rs:113`, `shell.rs:19-59` | возвращаться некуда: планировщика нет |
+| 10 | `paging::init`: identity-карта Sv39 (RAM + страница UART + окна virtio-mmio), `satp` | `main.rs` | все фазы после неё работают на карте, которую выбрало ядро |
+| 11 | `traps::init()`: `stvec` + `sstatus.SIE` | `main.rs`, `arch/riscv64/traps.rs` | ловушки раньше того, что может сбойнуть |
+| 12 | `virtio_mmio::init(&tree)`: перебор окон из DTB, регистрация диска (нет диска — строка в лог) | `main.rs`, `drivers/virtio_mmio.rs` | нужна карта (MMIO) и ловушки (сломанное окно) |
+| 13 | `vfs::init()` + `init_fs()`: смонтировать `/mnt`, пустое устройство — отформатировать | `main.rs::init_fs` | куча уже есть (монтирование аллоцирует); без диска — строка и дальше |
+| 14 | `shell::run(tree)`, не возвращается | `main.rs`, `shell.rs` | возвращаться некуда: планировщика нет (M6) |
 
 Исходы вне фаз: `panic_handler` печатает `[PANIC]` и паркует hart
 (`main.rs:116-130`); `halt` в шелле уходит в SBI SRST и выключает машину
@@ -62,10 +74,10 @@
 ## Чего в `src/` нет
 
 Ни одного из модулей x86-версии, кроме перечисленных выше: нет `vmm` (Sv39 включён,
-но карта одна и только для ядра), `fs/`, `vfs/`, `task/`, `net/`, `pkg/`, `security/`, `debug/`,
+но карта одна и только для ядра), `task/`, `net/`, `pkg/`, `security/`, `debug/`,
 `log.rs`, `provision.rs`, `selftest_lx.rs` (Linux-compat). Нет host-tests: тесты,
-которые есть, живут внутри ядра — `memory/selftest.rs` (команда `selftest`).
-Подробный список — `README.md` → «Чего нет».
+которые есть, живут внутри ядра — `memory/selftest.rs` и `fs/selftest.rs`
+(команда `selftest`). Подробный список — `README.md` → «Чего нет».
 
 ## Сборка и проверки
 
@@ -75,7 +87,8 @@
 | release | `cargo build --locked --release` | `target/riscv64gc-unknown-none-elf/release/pagh` |
 | smoke (serial) | `python3 .github/smoke.py <kernel>` | exit 0 + серийный лог |
 | smoke (+экран) | `python3 .github/smoke.py <kernel> --ramfb` | то же, с `-device ramfb` |
-| память в госте | команда `selftest` | `SELFTEST SUMMARY: 4/4 passed` |
+| память в госте | команда `selftest` | `SELFTEST SUMMARY: 7/7 passed` + `SELFTEST ext2 summary: 11/11 passed` |
+| диск в госте | `qemu-img create` + `-device virtio-blk-device` + `-global virtio-mmio.force-legacy=false` | пустой образ форматируется, `/mnt` монтируется, файл переживает перезагрузку |
 
 Оба профиля: `panic = "abort"` (`Cargo.toml:10-14`), release дополнительно
 `opt-level = "s"`, `lto = true` (`Cargo.toml:15-16`). Panic — это смерть машины:
