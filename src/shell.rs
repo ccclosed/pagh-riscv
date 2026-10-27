@@ -9,12 +9,16 @@
 //! serial log and on the screen.
 
 use crate::arch::riscv64::csr;
+use crate::drivers::block::{self, SECTOR_SIZE};
 use crate::drivers::uart;
 use crate::fdt::Fdt;
 
 /// Longest accepted input line. Longer lines are refused, not truncated: a
 /// silently shortened command is worse than a rejected one.
 const LINE_CAPACITY: usize = 128;
+
+/// 512-byte sectors in one MiB, for the human-readable capacity in `disk`.
+const SECTORS_PER_MIB: u64 = (1024 * 1024) / SECTOR_SIZE as u64;
 
 /// Run the console until `halt` is typed. Never returns: the kernel has nothing
 /// else to schedule yet, so leaving the shell would leave the hart idle forever.
@@ -147,6 +151,9 @@ fn execute(line: &str, tree: &Fdt) {
             crate::kprintln!(
                 "  mem           device tree range, frame pool, heap and the page table"
             );
+            crate::kprintln!(
+                "  disk          block device: name, capacity and a sector-0 read check"
+            );
             crate::kprintln!("  selftest      run the in-QEMU memory self-tests");
             crate::kprintln!("  time          the `time` CSR (timebase ticks) and its frequency");
             crate::kprintln!("  hart          the hart this kernel is running on");
@@ -207,13 +214,37 @@ fn execute(line: &str, tree: &Fdt) {
                 None => crate::kprintln!("sv39   no address space (paging has not been built)"),
             }
         }
+        // The block seam's one visible surface: what device the boot path found,
+        // how big it is, and a live read proving the driver still answers. Sector
+        // 0 is read (never written) because a device that cannot read it is not a
+        // disk, and the read is non-destructive. No device is a normal state on a
+        // headless boot, so it is a line, not an error.
+        "disk" => match block::get() {
+            Some(device) => {
+                let sectors = device.sector_count();
+                let mut sector = [0u8; SECTOR_SIZE];
+                let readable = device.read_block(0, &mut sector).is_ok();
+                crate::kprintln!(
+                    "disk: {} {} sectors ({} MiB), sector 0 {}",
+                    device.name(),
+                    sectors,
+                    sectors / SECTORS_PER_MIB,
+                    if readable { "readable" } else { "NOT readable" }
+                );
+            }
+            None => crate::kprintln!("disk: no block device"),
+        },
         // The memory suite: frames, frame contents, the heap. It is written to be
         // non-destructive and idempotent on purpose, so running it twice in one
         // boot is a real check instead of a state mutation — the free-frame ledger
         // printed at the end of each run must read the same both times
-        // (`src/memory/selftest.rs`).
+        // (`src/memory/selftest.rs`). The block suite follows it and has the same
+        // contract (`src/drivers/selftest.rs`): the disk is only read, the write
+        // path is proven on the RAM `MemBlock`, and both runs must end where they
+        // started.
         "selftest" => {
             crate::memory::selftest::run();
+            crate::drivers::selftest::run();
         }
         "time" => {
             let hz = tree.timebase_frequency().unwrap_or(0);

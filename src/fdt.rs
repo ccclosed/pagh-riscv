@@ -54,6 +54,77 @@ fn be_u32(bytes: &[u8]) -> u32 {
     u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
+/// A big-endian 64-bit field, assembled from two 32-bit reads.
+///
+/// `bytes` must be at least eight long; callers check the property length first.
+fn be_u64(bytes: &[u8]) -> u64 {
+    ((be_u32(&bytes[0..4]) as u64) << 32) | be_u32(&bytes[4..8]) as u64
+}
+
+/// One `virtio,mmio` transport window, as the device tree declares it.
+///
+/// The virtio-mmio binding puts the whole register file in one node's `reg`;
+/// QEMU `virt` declares eight of them, one per transport slot. `base` is a
+/// physical address — the kernel identity-maps RAM, and MMIO is addressed
+/// physically — which is what makes it usable as the driver's MMIO base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioMmio {
+    /// Register window base (physical address).
+    pub base: usize,
+    /// Window length in bytes; the virtio-mmio register file is 0x1000.
+    pub length: usize,
+}
+
+impl VirtioMmio {
+    /// A zeroed placeholder, so a caller can build a fixed-size array without
+    /// wrapping every slot in an `Option`.
+    pub const NONE: Self = VirtioMmio { base: 0, length: 0 };
+}
+
+/// Transport windows one tree may report: QEMU `virt` declares exactly eight.
+pub const MAX_VIRTIO_MMIO: usize = 8;
+
+/// Deepest node path the [`Fdt::virtio_mmio`] walk tracks the layout of.
+///
+/// `/soc/virtio_mmio@10001000` is depth 2; the extra room is for a tree that
+/// nests its transports one level deeper. Nodes below this are ignored rather
+/// than interpreted with a guessed parent layout.
+const MAX_VIRTIO_DEPTH: usize = 8;
+
+/// Depth of a node path: the root is 0, `/soc` is 1, `/soc/x@1` is 2.
+fn node_depth(path: &str) -> usize {
+    if path == "/" {
+        0
+    } else {
+        path.bytes().filter(|byte| *byte == b'/').count()
+    }
+}
+
+/// Whether a device-tree string list contains `wanted` as a whole entry.
+///
+/// `compatible` is a list of NUL-terminated strings; a substring match would let
+/// `"foo,virtio,mmio"` (or a longer name) answer for the binding it is not.
+fn compatible_list_has(value: &[u8], wanted: &str) -> bool {
+    value
+        .split(|byte| *byte == 0)
+        .any(|entry| entry == wanted.as_bytes())
+}
+
+/// One structural event from [`Fdt::walk_events`].
+///
+/// `Enter`/`Leave` bracket a node, so a visitor can keep per-node state (the
+/// cell layout its children's `reg` properties are read with) without the walker
+/// exposing node offsets. `Leave` arrives before the path is popped, so `path`
+/// still names the node that ends.
+enum Event<'a> {
+    /// A node began.
+    Enter(&'a str),
+    /// One property of the current node.
+    Property(&'a str, &'a str, &'a [u8]),
+    /// The current node ends.
+    Leave(&'a str),
+}
+
 impl Fdt {
     /// Parse the header at `address`.
     ///
@@ -117,6 +188,20 @@ impl Fdt {
     /// Walk the structure block, calling `visit(path, name, value)` for every
     /// property and stopping when the visitor returns `true`.
     fn walk(&self, mut visit: impl FnMut(&str, &str, &[u8]) -> bool) -> Option<()> {
+        self.walk_events(|event| match event {
+            Event::Property(path, name, value) => visit(path, name, value),
+            Event::Enter(_) | Event::Leave(_) => false,
+        })
+    }
+
+    /// Walk the structure block as a stream of node/property events.
+    ///
+    /// The tokens, the path bookkeeping and the "a malformed block returns
+    /// `None`" policy are the same as [`Self::walk`] describes; the extra
+    /// `Enter`/`Leave` events exist for readers that need per-node state — the
+    /// `virtio_mmio` enumeration below has to know the *parent's* cell layout
+    /// when it meets a child's `reg`.
+    fn walk_events(&self, mut visit: impl FnMut(Event<'_>) -> bool) -> Option<()> {
         let block = &self.blob[self.struct_off..self.struct_off + self.struct_len];
         let mut path = alloc_path::Path::new();
         let mut pos = 0usize;
@@ -128,9 +213,17 @@ impl Fdt {
                     let end = block[pos..].iter().position(|b| *b == 0)? + pos;
                     let name = str::from_utf8(&block[pos..end]).ok()?;
                     path.push(name);
+                    if visit(Event::Enter(path.as_str())) {
+                        return Some(());
+                    }
                     pos = (end + 1 + 3) & !3; // names are padded to 4 bytes
                 }
-                TOKEN_END_NODE => path.pop(),
+                TOKEN_END_NODE => {
+                    if visit(Event::Leave(path.as_str())) {
+                        return Some(());
+                    }
+                    path.pop();
+                }
                 TOKEN_PROP => {
                     if pos + 8 > block.len() {
                         return None;
@@ -143,7 +236,7 @@ impl Fdt {
                     }
                     let value = &block[pos..pos + len];
                     let name = self.property_name(name_off)?;
-                    if visit(path.as_str(), name, value) {
+                    if visit(Event::Property(path.as_str(), name, value)) {
                         return Some(());
                     }
                     pos = (pos + len + 3) & !3;
@@ -216,6 +309,87 @@ impl Fdt {
             }
         });
         result
+    }
+
+    /// The `virtio,mmio` transport windows, in device-tree order.
+    ///
+    /// Fills `out` and returns how many entries were written. The match is on
+    /// `compatible = "virtio,mmio"`, not on the node name — a transport is a
+    /// transport wherever a tree puts it — and a node with a matching
+    /// `compatible` but no usable `reg` is skipped rather than guessed at.
+    ///
+    /// `reg` is interpreted with the **parent's** `#address-cells`/`#size-cells`,
+    /// which one walk tracks per depth (the defaults are the DT spec's 2/1). Only
+    /// the 2+2 layout (`address, size` as two 64-bit cells each) is read: a tree
+    /// that declares another layout is skipped, because a misread register window
+    /// sends the driver to the wrong MMIO address — the same refusal
+    /// [`Self::memory`] makes for the same reason.
+    ///
+    /// More transports than `out` holds truncate the list to `out.len()`; nodes
+    /// deeper than [`MAX_VIRTIO_DEPTH`] are ignored rather than read with a
+    /// guessed parent layout (QEMU `virt` declares them at depth 2).
+    pub fn virtio_mmio(&self, out: &mut [VirtioMmio]) -> usize {
+        let mut count = 0usize;
+        // Per depth: the node's own cell layout (for its children's `reg`), the
+        // `reg` value of the node at this depth, and whether its `compatible`
+        // listed the virtio-mmio binding. Each node resets its slot on Enter, so
+        // a node that declares nothing is read with the spec's 2/1 defaults.
+        let mut cells = [(2u32, 1u32); MAX_VIRTIO_DEPTH];
+        let mut reg = [VirtioMmio::NONE; MAX_VIRTIO_DEPTH];
+        let mut is_virtio = [false; MAX_VIRTIO_DEPTH];
+        self.walk_events(|event| match event {
+            Event::Enter(path) => {
+                let depth = node_depth(path);
+                if depth < MAX_VIRTIO_DEPTH {
+                    cells[depth] = (2, 1);
+                    reg[depth] = VirtioMmio::NONE;
+                    is_virtio[depth] = false;
+                }
+                false
+            }
+            Event::Property(path, name, value) => {
+                let depth = node_depth(path);
+                if depth >= MAX_VIRTIO_DEPTH {
+                    return false;
+                }
+                match name {
+                    "#address-cells" if value.len() >= 4 => {
+                        cells[depth].0 = be_u32(&value[0..4]);
+                    }
+                    "#size-cells" if value.len() >= 4 => {
+                        cells[depth].1 = be_u32(&value[0..4]);
+                    }
+                    "compatible" => {
+                        is_virtio[depth] |= compatible_list_has(value, "virtio,mmio");
+                    }
+                    // A child's `reg` describes it in the *parent's* cells, which
+                    // is exactly what the slot one level up holds.
+                    "reg" if depth > 0 => {
+                        let (address_cells, size_cells) = cells[depth - 1];
+                        if address_cells == 2 && size_cells == 2 && value.len() >= 16 {
+                            reg[depth] = VirtioMmio {
+                                base: be_u64(&value[0..8]) as usize,
+                                length: be_u64(&value[8..16]) as usize,
+                            };
+                        }
+                    }
+                    _ => {}
+                }
+                false
+            }
+            Event::Leave(path) => {
+                let depth = node_depth(path);
+                if depth < MAX_VIRTIO_DEPTH && is_virtio[depth] && reg[depth].length != 0 {
+                    if count == out.len() {
+                        return true; // the caller's array is full
+                    }
+                    out[count] = reg[depth];
+                    count += 1;
+                }
+                false
+            }
+        });
+        count
     }
 }
 

@@ -80,6 +80,28 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     crate::kprintln!("timebase    {} Hz", tree.timebase_frequency().unwrap_or(0));
     crate::kprintln!("console     NS16550 @ {:#x}", drivers::uart::BASE);
 
+    // The virtio-mmio transports this machine declares. The block driver probes
+    // windows after paging is on, so each one has to be part of the address space
+    // first; enumerating once here keeps the number and the addresses a
+    // device-tree fact instead of a constant (QEMU `virt` reports eight), and it
+    // is the same list the driver will probe.
+    let mut virtio_mmio = [fdt::VirtioMmio::NONE; fdt::MAX_VIRTIO_MMIO];
+    let virtio_mmio_count = tree.virtio_mmio(&mut virtio_mmio);
+    // Every MMIO window the kernel touches after the switch: the console UART,
+    // which prints through it, and each transport window the tree just named. A
+    // window the map does not cover is not an unmapped device — it is a trap on
+    // the first register read — so the list comes from the device tree rather
+    // than from `0x1000_1000`; a machine without virtio adds nothing.
+    let mut device_windows = [(0usize, 0usize); 1 + fdt::MAX_VIRTIO_MMIO];
+    device_windows[0] = (drivers::uart::BASE, 0x100);
+    for (entry, window) in device_windows[1..]
+        .iter_mut()
+        .zip(&virtio_mmio[..virtio_mmio_count])
+    {
+        *entry = (window.base, window.length);
+    }
+    let devices = &device_windows[..1 + virtio_mmio_count];
+
     // The frame allocator needs the two things the boot path already has: the
     // `/memory` range, and the list of physical ranges the kernel must never hand
     // out. It has to be up before the first allocation — which, now that `alloc`
@@ -111,10 +133,10 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     // every phase after this one runs on a map the kernel chose: RAM identity-
     // mapped — RWX below `__kernel_end`, RW above it, which is where W^X holds,
     // because no frame the allocator can hand out is executable — plus the
-    // console UART's page, which sits outside RAM and would otherwise fault the
-    // first `kprintln!` after the switch (`src/memory/paging.rs`).
-    let devices = [(drivers::uart::BASE, 0x100)];
-    if let Err(e) = memory::paging::init(memory, memory::kernel_end(), &devices) {
+    // console UART's page and the virtio-mmio windows, which sit outside RAM and
+    // would otherwise fault the first `kprintln!`/register read after the switch
+    // (`src/memory/paging.rs`).
+    if let Err(e) = memory::paging::init(memory, memory::kernel_end(), devices) {
         crate::kprintln!("paging: {e}");
         crate::kprintln!("paging: refusing to run on an address space that is not there");
         arch::riscv64::park_forever()
@@ -124,6 +146,13 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     // Traps before anything that can trap: a bad address in the shell must
     // report itself instead of resetting the machine silently.
     arch::riscv64::traps::init();
+
+    // The block driver last: it probes every transport window, so it needs the
+    // map (a read through an unmapped window would fault) and the trap handler
+    // above (a broken window must report itself, not reset the machine). Absence
+    // is logged, not fatal: a headless CI boot has no disk attached, and the
+    // kernel is still a kernel without one.
+    drivers::virtio_mmio::init(&tree);
 
     shell::run(tree);
 }
