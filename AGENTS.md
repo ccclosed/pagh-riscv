@@ -50,7 +50,7 @@ unknown argument is rejected, not ignored. Two in-guest checks that are not part
 
 ```sh
 # at the `pagh:rv64>` prompt
-selftest                                        # in-QEMU suites: 7 memory + 3 block + 11 ext2/VFS + hygiene ledger
+selftest                                        # in-QEMU suites: 7 memory + 3 block + 11 ext2/VFS + 4 arch/timer + ledgers
 # from the host
 python3 tools/run.py --keys "help\n" --shot /tmp/shot.png --check-font --scan-all
 python3 tools/run.py --disk /tmp/pagh.img --keys "ls /mnt\n" --shot /tmp/fs.png
@@ -124,20 +124,23 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
    the id is still in `a0` (`boot.rs:23-28, 56-63`). The same applies to every other
    M-mode CSR: `ecall` (SBI) is the only door.
 5. **Device-tree honesty.** The FDT is the machine description; a parse failure is
-   fatal and loud (`src/main.rs:65-72`), never a guess. The reader answers exactly
-   three questions: `/memory` `reg`, `/cpus:timebase-frequency`, and the
-   `virtio,mmio` transport windows (M5). It assumes 2+2 `reg` cells and reads every
-   field as big-endian byte-by-byte. Do not extend it speculatively: a new device
-   means a named accessor and an update here.
+   fatal and loud (`src/main.rs`), never a guess. The reader answers exactly five
+   questions: `/memory` `reg`, `/cpus:timebase-frequency`, the `virtio,mmio`
+   transport windows (M5), the PLIC's `reg` (M3) and the console UART's
+   `interrupts` cell (M3). It assumes 2+2 `reg` cells and reads every field as
+   big-endian byte-by-byte. Do not extend it speculatively: a new device means a
+   named accessor and an update here.
    The two hard-coded addresses are the console UART (`drivers/uart.rs:20`) and
    `fw_cfg` (`drivers/mod.rs:1-11`), because both are needed before the tree is
    parsed — keep them in those places, with the comments that say why.
 6. **Boot phase order is load-bearing** (`docs/architecture.md` §3): console before
    any print, FDT before the shell (and before any device work), **frame pool before
    the first allocation**, paging before any MMIO beyond the console, traps before the
-   shell, hart parking before Rust. `kmain` is a list of phases that depend on each
-   other in one direction only. M5 adds two: the block driver after the map and traps
-   (it reads MMIO), the filesystem after the driver and the heap (mounting allocates).
+   shell, hart parking before Rust. M3 adds two: the timer and the PLIC after the
+   trap vector is installed (`sie` must stay 0 until both compare register and
+   controller are ready, and the PLIC must route the UART line before the UART
+   raises it), and M5 adds two more: the block driver after the map and traps (it
+   reads MMIO), the filesystem after the driver and the heap (mounting allocates).
 7. **`.bss` is not zeroed by `_start`.** The kernel relies on the loader zero-filling
    the NOBITS `PT_LOAD` (QEMU does). Three things stand on that: the boot stack, the
    `BOOT_HART_ID` static, and the PMM bitmap's polarity ("a set bit means **free**",
@@ -193,7 +196,7 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
 ## Testing philosophy
 
 What exists: the in-QEMU suites (shell `selftest`: 7 memory + 3 block + 11 ext2/VFS
-checks, idempotent, each group prints a free-frame ledger), the headless QEMU smoke
++ 4 interrupt/timer checks, idempotent, each group prints a free-frame ledger), the headless QEMU smoke
 driver in four modes (serial, ramfb, disk-fresh, disk-existing) including the M5
 format/mount/persist acceptance, and the pixel check that proves a screenshot is
 really the committed font. What does not: host property tests, an E2E driver,
@@ -253,7 +256,8 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
 | Gap | Consequence for your change |
 |---|---|
 | Sv39 is on with an **identity** map, so a physical address is still a pointer | any address handed to a device (`fw_cfg`, ramfb) relies on that identity; a non-identity or per-process map breaks it silently |
-| No timer, no `sie` bits, no PLIC (M3, in flight) | anything time-based or interrupt-driven is a new milestone, not a tweak |
+| A 100 Hz tick exists, but nothing is scheduled on it yet (M6) | preemption is a scheduler change; `timer::set_tick_handler` is the seam, not a scheduler |
+| Interrupt handlers cannot allocate or print | put work in normal context; bump a counter and read it from `time`/`selftest` |
 | The filesystem has **no journal** (M5 deliberately skipped the x86 WAL) | a power cut between two writes can leave an operation half-applied; do not claim crash consistency |
 | One block device slot, no partitions/hot-plug | a second disk is a design change, not a registration |
 | Formatting is the only destructive operation and is gated by `format_policy` | never format "to recover": a failed mount is not permission to erase |

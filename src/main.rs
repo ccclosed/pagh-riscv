@@ -90,20 +90,37 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     // is the same list the driver will probe.
     let mut virtio_mmio = [fdt::VirtioMmio::NONE; fdt::MAX_VIRTIO_MMIO];
     let virtio_mmio_count = tree.virtio_mmio(&mut virtio_mmio);
+    // Interrupt routing as the tree declares it: the PLIC's base and the console
+    // UART's source number. Both are asked for before the address space is built
+    // because the PLIC's register pages have to be mapped as devices; `None` is
+    // not fatal (the console stays polled, the timer is unaffected), but it is
+    // reported once routing is attempted so "no external interrupts" is visible
+    // in the log rather than inferred from silence.
+    let plic = tree.plic();
+    let uart_irq = tree.uart_interrupt();
+
     // Every MMIO window the kernel touches after the switch: the console UART,
-    // which prints through it, and each transport window the tree just named. A
-    // window the map does not cover is not an unmapped device — it is a trap on
-    // the first register read — so the list comes from the device tree rather
-    // than from `0x1000_1000`; a machine without virtio adds nothing.
-    let mut device_windows = [(0usize, 0usize); 1 + fdt::MAX_VIRTIO_MMIO];
+    // which prints through it, the PLIC's own register pages (only the windows
+    // the driver addresses — priority, enable and this hart's context page, see
+    // `plic::windows`) and each virtio transport window the tree named. A window
+    // the map does not cover is not an unmapped device — it is a trap on the
+    // first register read — so the list comes from the device tree rather than
+    // from constants; a machine without virtio or a PLIC adds nothing.
+    const PLIC_WINDOWS: usize = 3;
+    let mut device_windows = [(0usize, 0usize); 1 + PLIC_WINDOWS + fdt::MAX_VIRTIO_MMIO];
     device_windows[0] = (drivers::uart::BASE, 0x100);
-    for (entry, window) in device_windows[1..]
-        .iter_mut()
-        .zip(&virtio_mmio[..virtio_mmio_count])
-    {
-        *entry = (window.base, window.length);
+    let mut slots = 1usize;
+    if let Some((base, _size)) = plic {
+        for (offset, length) in arch::riscv64::plic::windows() {
+            device_windows[slots] = (base + offset, length);
+            slots += 1;
+        }
     }
-    let devices = &device_windows[..1 + virtio_mmio_count];
+    for window in &virtio_mmio[..virtio_mmio_count] {
+        device_windows[slots] = (window.base, window.length);
+        slots += 1;
+    }
+    let devices = &device_windows[..slots];
 
     // The frame allocator needs the two things the boot path already has: the
     // `/memory` range, and the list of physical ranges the kernel must never hand
@@ -150,7 +167,54 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     // report itself instead of resetting the machine silently.
     arch::riscv64::traps::init();
 
-    // The block driver first: it probes every transport window, so it needs the
+    // First interrupt source: the periodic tick. `traps::init` has installed the
+    // vector and set `sstatus.SIE`, but `sie` is still 0; this programs the first
+    // absolute deadline with SBI and only then raises `sie.STIE`, so the timer
+    // cannot fire while the compare value is still firmware's default. A failure
+    // (no timebase, firmware refusing the call) is loud and non-fatal: `time` and
+    // `sleep` fall back to polling the `time` CSR.
+    let timebase = tree.timebase_frequency().unwrap_or(0);
+    if arch::riscv64::timer::init(timebase as usize) {
+        crate::kprintln!(
+            "timer       {} ms ticks ({} Hz, timebase {} Hz)",
+            arch::riscv64::timer::TICK_MS,
+            arch::riscv64::timer::TICK_HZ,
+            timebase
+        );
+    } else {
+        crate::kprintln!(
+            "timer       not programmed (timebase {} Hz) — sleep falls back to polling",
+            timebase
+        );
+    }
+
+    // Second interrupt source: the console's receive line, through the PLIC. The
+    // order inside is the contract: `plic::init` enables the source before raising
+    // `sie.SEIE`, and the UART's own IER bit is set only after the controller
+    // routes it — a byte that arrives in between waits in the FIFO instead of
+    // being announced on a line nobody claims. If either half is missing the
+    // console stays polled, which the old path still provides.
+    match (plic.map(|(base, _size)| base), uart_irq) {
+        (Some(base), Some(irq)) => match arch::riscv64::plic::init(base, irq as usize) {
+            Ok(()) => {
+                drivers::uart::enable_rx_interrupt();
+                crate::kprintln!(
+                    "plic        {:#x} context {}, uart irq {} (rx interrupt on)",
+                    base,
+                    arch::riscv64::plic::context(),
+                    irq
+                );
+            }
+            Err(error) => crate::kprintln!(
+                "plic        {error} — external interrupts off, uart rx stays polled"
+            ),
+        },
+        _ => crate::kprintln!(
+            "plic        no PLIC/UART interrupt in the device tree — external interrupts off, uart rx stays polled"
+        ),
+    }
+
+    // The block driver next: it probes every transport window, so it needs the
     // map (a read through an unmapped window would fault) and the trap handler
     // above (a broken window must report itself, not reset the machine). Absence
     // is logged, not fatal: a headless CI boot has no disk attached, and the

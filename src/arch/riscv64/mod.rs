@@ -9,7 +9,10 @@
 pub mod boot;
 pub mod csr;
 pub mod mmu;
+pub mod plic;
 pub mod sbi;
+pub mod selftest;
+pub mod timer;
 pub mod traps;
 
 /// Stop this hart forever. `wfi` lets the emulator skip the hart's time slice,

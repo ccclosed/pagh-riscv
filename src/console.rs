@@ -55,6 +55,18 @@ pub fn set_framebuffer(on: bool) {
     FRAMEBUFFER.store(on, Ordering::Relaxed);
 }
 
+/// Send everything from here on to the serial line only.
+///
+/// For the trap handler's exception path, which must not deadlock: the screen
+/// keeps its writer behind a non-reentrant spinlock, and an exception taken while
+/// that lock is held (a fault inside the framebuffer code itself) would spin
+/// forever trying to draw its own diagnostics. The screen is deliberately not
+/// restored — the exception path prints and parks the hart; a machine that is
+/// still running after it has no business being reachable anyway.
+pub fn serial_only() {
+    set_framebuffer(false);
+}
+
 /// Whether the framebuffer sink is currently part of the fan-out.
 pub fn framebuffer_enabled() -> bool {
     FRAMEBUFFER.load(Ordering::Relaxed)

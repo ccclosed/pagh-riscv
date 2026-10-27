@@ -29,6 +29,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 
 use crate::arch::riscv64::csr;
+use crate::arch::riscv64::timer;
 use crate::drivers::block::{self, MemBlock, SECTOR_SIZE};
 use crate::drivers::uart;
 use crate::fdt::Fdt;
@@ -73,7 +74,10 @@ pub fn run(tree: Fdt) -> ! {
     loop {
         crate::kprint!("pagh:rv64> ");
         loop {
-            let byte = uart::get_byte();
+            // Idle wait, not a poll: the UART interrupt wakes this `wfi` and the
+            // timer guarantees a periodic wake-up even if a byte is lost to the
+            // ring-check/`wfi` window (`uart::wait_byte`).
+            let byte = uart::wait_byte();
             match byte {
                 b'\r' | b'\n' => {
                     crate::kprintln!();
@@ -179,7 +183,7 @@ fn print_error(op: &str, path: &str, e: VfsError) {
 }
 
 fn execute(line: &str, tree: &Fdt, state: &mut State) {
-    let (name, args) = split(line);
+    let (name, mut args) = split(line);
     let Some(name) = name else { return };
     match name {
         "help" => {
@@ -194,6 +198,7 @@ fn execute(line: &str, tree: &Fdt, state: &mut State) {
             crate::kprintln!(
                 "  selftest      run the in-QEMU memory, block and filesystem self-tests"
             );
+            crate::kprintln!("  sleep <secs>  wait for that many seconds of timer ticks");
             crate::kprintln!("  time          the `time` CSR (timebase ticks) and its frequency");
             crate::kprintln!("  hart          the hart this kernel is running on");
             crate::kprintln!("  echo <text>   print the text back");
@@ -293,17 +298,68 @@ fn execute(line: &str, tree: &Fdt, state: &mut State) {
         // state mutation — the free-frame ledgers must read the same both times.
         "selftest" => {
             crate::memory::selftest::run();
+            crate::drivers::selftest::run();
             crate::fs::selftest::run();
+            crate::arch::riscv64::selftest::run();
         }
         "time" => {
+            // Two clocks, and printing both is the point: the `time` CSR is the
+            // hardware counter (it pauses for nothing), while the tick count is
+            // what `sleep` and a future scheduler run on. They advance at
+            // different rates by design; a log where the two disagree is how a
+            // timer that is not actually firing gets caught.
             let hz = tree.timebase_frequency().unwrap_or(0);
-            let ticks = csr::read_time();
+            let now = csr::read_time();
             crate::kprintln!(
                 "time {} ticks (~{} s at {} Hz)",
-                ticks,
-                ticks / hz.max(1) as usize,
+                now,
+                now / hz.max(1) as usize,
                 hz
             );
+            crate::kprintln!(
+                "uptime {} ms ({} timer ticks at {} Hz, {} timer interrupts)",
+                timer::uptime_ms(),
+                timer::ticks(),
+                timer::TICK_HZ,
+                timer::interrupts()
+            );
+            // The PLIC counters are the only place a routed-but-silent external
+            // line is observable: the handler prints nothing (trap context), so
+            // claim/complete counts and the UART's dropped-byte count are read
+            // here instead.
+            let (claims, completions, unknown) = crate::arch::riscv64::plic::stats();
+            if unknown == 0 {
+                crate::kprintln!(
+                    "plic {} claims, {} completed, uart irq {}, {} uart rx overrun(s)",
+                    claims,
+                    completions,
+                    crate::arch::riscv64::plic::uart_irq(),
+                    uart::rx_overruns()
+                );
+            } else {
+                crate::kprintln!(
+                    "plic {} claims, {} completed, uart irq {}, {} uart rx overrun(s), {} unknown source(s)",
+                    claims,
+                    completions,
+                    crate::arch::riscv64::plic::uart_irq(),
+                    uart::rx_overruns(),
+                    unknown
+                );
+            }
+        }
+        "sleep" => {
+            // Seconds in, ticks out: the command is a user-facing duration, the
+            // wait is the kernel's clock. `wfi` inside `sleep_ticks` is what makes
+            // this an idle wait rather than a spin.
+            let seconds = args.next().and_then(|word| word.parse::<u64>().ok());
+            match seconds {
+                Some(seconds) => {
+                    let wait = seconds.saturating_mul(timer::TICK_HZ as u64);
+                    crate::kprintln!("sleep: {} s ({} timer ticks)", seconds, wait);
+                    timer::sleep_ticks(wait);
+                }
+                None => crate::kprintln!("sleep: usage: sleep <seconds>"),
+            }
         }
         "hart" => crate::kprintln!("hart {}", crate::arch::riscv64::hart_id()),
         "echo" => {

@@ -36,6 +36,7 @@ read_csr!(read_scause, "scause");
 read_csr!(read_sepc, "sepc");
 read_csr!(read_stval, "stval");
 read_csr!(read_sstatus, "sstatus");
+read_csr!(read_sie, "sie");
 read_csr!(read_time, "time");
 write_csr!(write_stvec, "stvec");
 write_csr!(write_sscratch, "sscratch");
@@ -46,6 +47,10 @@ write_csr!(write_sstatus, "sstatus");
 
 /// Supervisor interrupt-enable bit in `sstatus`.
 pub const SSTATUS_SIE: usize = 1 << 1;
+/// Supervisor timer interrupt-enable bit in `sie`/`sip`.
+pub const SIE_STIE: usize = 1 << 5;
+/// Supervisor external interrupt-enable bit in `sie`/`sip`.
+pub const SIE_SEIE: usize = 1 << 9;
 
 /// Enable or disable interrupts on this hart, returning whether they were on.
 ///

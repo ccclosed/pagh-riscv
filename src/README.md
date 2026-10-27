@@ -17,7 +17,10 @@
 | `arch/riscv64/boot.rs` | `_start`: стек, парковка hart'ов, вызов `kmain`; `BOOT_HART_ID` |
 | `arch/riscv64/csr.rs` | типизированный доступ к супервизорным CSR |
 | `arch/riscv64/sbi.rs` | `ecall` в M-mode: SRST (выключение) |
-| `arch/riscv64/traps.rs` | `stvec`, `trap_entry`, кадр на 264 байта, диспетчер |
+| `arch/riscv64/traps.rs` | `stvec`, `trap_entry`, кадр на 264 байта, диспетчер исключений и прерываний |
+| `arch/riscv64/timer.rs` | тик 100 Гц через SBI TIME: абсолютный дедлайн, `sleep_ticks`, шов `set_tick_handler` для M6 |
+| `arch/riscv64/plic.rs` | PLIC из DTB: enable/priority/threshold, claim/complete, окна контекста S-mode |
+| `arch/riscv64/selftest.rs` | четыре проверки таймера/PLIC/кольца UART для `selftest` |
 | `arch/riscv64/mmu.rs` | примитивы Sv39: флаги PTE, `PageTable`, `vpn`, `satp_for`, `activate`, `sfence` — вызывает `memory::paging` |
 | `fdt.rs` | минимальный читатель flattened device tree |
 | `memory/mod.rs` | фасад памяти: `init`, `stats`, `kernel_end`, `boot_stack`, `fdt_span` |
@@ -25,7 +28,7 @@
 | `memory/heap.rs` | free-list внутри 64 KiB-чанков, `GlobalAlloc` |
 | `memory/selftest.rs` | семь неразрушающих проверок памяти (PMM, Sv39, куча, чанки) для `selftest` |
 | `drivers/mod.rs` | фасад драйверов |
-| `drivers/uart.rs` | NS16550: polled-консоль |
+| `drivers/uart.rs` | NS16550: приём по прерыванию PLIC в кольцо, передача polled, запасной polled-путь |
 | `drivers/fw_cfg.rs` | QEMU fw_cfg: селектор/данные + DMA |
 | `drivers/ramfb.rs` | конфигурация устройства ramfb |
 | `drivers/framebuffer.rs` | текстовый экран: тень, шрифт покрытия, статус-бар |
@@ -63,6 +66,8 @@
 | 9 | PMM: пул кадров минус образ ядра, стек и DTB; печать статистики | `main.rs:83-107`, `memory/mod.rs:75-77` | `alloc` уже существует — аллокатор должен быть готов до первой аллокации |
 | 10 | `paging::init`: identity-карта Sv39 (RAM + страница UART + окна virtio-mmio), `satp` | `main.rs` | все фазы после неё работают на карте, которую выбрало ядро |
 | 11 | `traps::init()`: `stvec` + `sstatus.SIE` | `main.rs`, `arch/riscv64/traps.rs` | ловушки раньше того, что может сбойнуть |
+| 11a | `timer::init`: первый дедлайн через SBI, затем `sie.STIE` | `main.rs`, `arch/riscv64/timer.rs` | `sie` = 0 до готового compare-регистра |
+| 11b | `plic::init` (DBT-база/source) → `uart::enable_rx_interrupt()` → `sie.SEIE` | `main.rs`, `arch/riscv64/plic.rs`, `drivers/uart.rs` | контроллер разводит линию раньше, чем UART её поднимает |
 | 12 | `virtio_mmio::init(&tree)`: перебор окон из DTB, регистрация диска (нет диска — строка в лог) | `main.rs`, `drivers/virtio_mmio.rs` | нужна карта (MMIO) и ловушки (сломанное окно) |
 | 13 | `vfs::init()` + `init_fs()`: смонтировать `/mnt`, пустое устройство — отформатировать | `main.rs::init_fs` | куча уже есть (монтирование аллоцирует); без диска — строка и дальше |
 | 14 | `shell::run(tree)`, не возвращается | `main.rs`, `shell.rs` | возвращаться некуда: планировщика нет (M6) |
@@ -87,7 +92,7 @@
 | release | `cargo build --locked --release` | `target/riscv64gc-unknown-none-elf/release/pagh` |
 | smoke (serial) | `python3 .github/smoke.py <kernel>` | exit 0 + серийный лог |
 | smoke (+экран) | `python3 .github/smoke.py <kernel> --ramfb` | то же, с `-device ramfb` |
-| память в госте | команда `selftest` | `SELFTEST SUMMARY: 7/7 passed` + `SELFTEST ext2 summary: 11/11 passed` |
+| память в госте | команда `selftest` | `SELFTEST SUMMARY: 7/7`, `(block) 3/3`, `ext2 summary: 11/11`, `(arch) 4/4` |
 | диск в госте | `qemu-img create` + `-device virtio-blk-device` + `-global virtio-mmio.force-legacy=false` | пустой образ форматируется, `/mnt` монтируется, файл переживает перезагрузку |
 
 Оба профиля: `panic = "abort"` (`Cargo.toml:10-14`), release дополнительно

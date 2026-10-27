@@ -2,10 +2,11 @@
 //!
 //! The device tree is how an RV64 machine says what it is: OpenSBI hands us the
 //! blob's physical address and the kernel is expected to read memory size, the
-//! timebase frequency and device addresses out of it. This is not a general FDT
-//! library — it walks the structure block, tracks the node path, and answers the
-//! three questions the boot path asks. Everything else (phandles, `interrupts`,
-//! `stdout-path`) can be added the day something needs it.
+//! timebase frequency, the console's interrupt line and the interrupt controller
+//! out of it. This is not a general FDT library — it walks the structure block,
+//! tracks the node path, and answers the questions the boot path asks. Everything
+//! else (phandles, `interrupt-parent` resolution, `stdout-path`) can be added the
+//! day something needs it.
 //!
 //! The blob is big-endian by specification, on a machine that may be either, so
 //! every field is read through explicit byte assembly.
@@ -391,6 +392,109 @@ impl Fdt {
         });
         count
     }
+
+    /// The PLIC's `(base, size)` as the device tree declares it, or `None`.
+    ///
+    /// The node is found by its `compatible` (`riscv,plic0` or the newer
+    /// `sifive,plic-1.0.0`), not by its name: the unit address that QEMU bakes
+    /// into `plic@c000000` is exactly the kind of machine-specific detail this
+    /// reader refuses to depend on. Its `reg` must be one 2+2-cell region — the
+    /// layout every 64-bit DT declares — and anything else yields `None` rather
+    /// than a base address that would point MMIO at unrelated memory.
+    pub fn plic(&self) -> Option<(usize, usize)> {
+        let mut path = [0u8; NODE_PATH_CAPACITY];
+        let len = self.find_compatible(&["riscv,plic0", "sifive,plic-1.0.0"], &mut path)?;
+        self.reg_at(&path[..len])
+    }
+
+    /// The console UART's `interrupts` cell: the PLIC source number it raises
+    /// when a byte arrives (`10` on QEMU `virt`), or `None`.
+    ///
+    /// The node is found by its `ns16550a` compatible. The property must be
+    /// exactly one cell: a multi-cell `interrupts` description uses some other
+    /// controller's encoding, and guessing a source number from it would enable
+    /// an interrupt line nobody routed. `None` keeps the console polled, which is
+    /// the design's honest fallback rather than a failure to boot.
+    pub fn uart_interrupt(&self) -> Option<u32> {
+        let mut path = [0u8; NODE_PATH_CAPACITY];
+        let len = self.find_compatible(&["ns16550a", "ns16550"], &mut path)?;
+        self.u32_prop_at(&path[..len], "interrupts")
+    }
+
+    /// Find the first node whose `compatible` names one of `wanted`, and copy its
+    /// path into `out`. Returns the copied length.
+    ///
+    /// The two-pass shape — find the node, then read a property of it — exists
+    /// because [`Self::walk`] lends the path for the duration of one callback
+    /// only. Copying it into a fixed array lets a later pass ask "is this the
+    /// node?" without tracking per-node state in the walker, and without an
+    /// allocator (the tree is parsed before the boot heap is usable).
+    fn find_compatible(
+        &self,
+        wanted: &[&str],
+        out: &mut [u8; NODE_PATH_CAPACITY],
+    ) -> Option<usize> {
+        let mut found = None;
+        self.walk(|path, name, value| {
+            if name != "compatible" || !compatible_matches(value, wanted) {
+                return false;
+            }
+            let bytes = path.as_bytes();
+            let take = bytes.len().min(NODE_PATH_CAPACITY);
+            out[..take].copy_from_slice(&bytes[..take]);
+            found = Some(take);
+            true
+        });
+        found
+    }
+
+    /// The `reg` of the node at `target`, as `(base, size)`, if it is one 2+2-cell
+    /// region. See [`Self::plic`] for why any other layout is refused.
+    fn reg_at(&self, target: &[u8]) -> Option<(usize, usize)> {
+        let mut result = None;
+        self.walk(|path, name, value| {
+            if name != "reg" || path.as_bytes() != target || value.len() != 16 {
+                return false;
+            }
+            let base = addr_cells2(&value[0..8]);
+            let size = addr_cells2(&value[8..16]);
+            result = Some((base, size));
+            true
+        });
+        result
+    }
+
+    /// The single-cell `property` of the node at `target`.
+    fn u32_prop_at(&self, target: &[u8], property: &str) -> Option<u32> {
+        let mut result = None;
+        self.walk(|path, name, value| {
+            if name != property || path.as_bytes() != target || value.len() != 4 {
+                return false;
+            }
+            result = Some(be_u32(value));
+            true
+        });
+        result
+    }
+}
+
+/// Longest node path this reader will copy while scanning: `/soc/serial@10000000`
+/// is 22 bytes; a deeper `virt` variant still fits with room to spare.
+const NODE_PATH_CAPACITY: usize = 96;
+
+/// Read two big-endian cells (one 64-bit `reg` address or size) byte-by-byte.
+fn addr_cells2(cells: &[u8]) -> usize {
+    ((be_u32(&cells[0..4]) as u64) << 32 | be_u32(&cells[4..8]) as u64) as usize
+}
+
+/// Whether a `compatible` property (NUL-separated list of names) contains any
+/// name in `wanted`.
+fn compatible_matches(value: &[u8], wanted: &[&str]) -> bool {
+    value.split(|byte| *byte == 0).any(|entry| {
+        core::str::from_utf8(entry)
+            .map(|name| wanted.contains(&name))
+            .unwrap_or(false)
+    })
 }
 
 /// A tiny fixed-capacity path builder — the device tree is deep, not wide, and

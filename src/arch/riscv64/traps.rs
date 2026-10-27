@@ -11,6 +11,7 @@
 //!   asserted against that order by the tests.
 
 use core::arch::global_asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// The register file as `trap_entry` saves it.
 ///
@@ -148,7 +149,16 @@ pub const CAUSE_INTERRUPT_BIT: usize = 1 << 63;
 pub const CAUSE_SUPERVISOR_TIMER: usize = 5;
 pub const CAUSE_SUPERVISOR_EXTERNAL: usize = 9;
 
+/// Bitmap of interrupt causes already reported as unhandled (bit = cause & 63),
+/// so a source nobody expects names itself once instead of flooding the console.
+static UNHANDLED_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
+
 /// Install `trap_entry` as the trap vector and enable supervisor interrupts.
+///
+/// This only opens the door: `sie` begins at 0, so no interrupt can arrive until
+/// the driver that owns a source enables its bit *after* it has programmed the
+/// source (see `timer::init`, `plic::init`). That ordering is the whole reason
+/// `SIE` can be set here, early, without a race.
 pub fn init() {
     crate::arch::riscv64::csr::write_stvec(trap_entry as usize);
     crate::arch::riscv64::csr::enable_interrupts();
@@ -171,18 +181,25 @@ pub extern "C" fn trap_dispatch(frame: *mut TrapFrame) {
     if scause & CAUSE_INTERRUPT_BIT != 0 {
         let code = scause & !CAUSE_INTERRUPT_BIT;
         match code {
-            // The timer is the only interrupt this milestone enables; it is
-            // acknowledged through SBI by whoever programmed it.
-            CAUSE_SUPERVISOR_TIMER => return,
-            CAUSE_SUPERVISOR_EXTERNAL => {
-                crate::kprintln!("[EXC] external interrupt (PLIC not routed yet)");
-                return;
-            }
+            // The timer is acknowledged by pointing firmware at the next absolute
+            // deadline; there is no separate EOI. Everything the handler does is
+            // bounded and silent (see `timer::on_tick` for the contract).
+            CAUSE_SUPERVISOR_TIMER => crate::arch::riscv64::timer::on_tick(),
+            // Claim, dispatch and complete; silent and bounded (see `plic`).
+            CAUSE_SUPERVISOR_EXTERNAL => crate::arch::riscv64::plic::handle_external_interrupt(),
             _ => {
-                crate::kprintln!("[EXC] interrupt cause {code} (unhandled)");
-                return;
+                // Reported once per cause: an interrupt is *enabled*, so a handler
+                // that printed on every occurrence would turn a stray source into a
+                // console flood that hides the message it is printing.
+                let bit = 1u64 << (code & 63);
+                if UNHANDLED_INTERRUPTS.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+                    crate::kprintln!("[EXC] interrupt cause {code} (unhandled, reported once)");
+                }
             }
         }
+        // Only an interrupt returns: the epilogue below is `sret`, restoring the
+        // interrupted context exactly where it stopped.
+        return;
     }
 
     let name = match scause {
@@ -192,6 +209,10 @@ pub extern "C" fn trap_dispatch(frame: *mut TrapFrame) {
         CAUSE_STORE_PAGE_FAULT => "store page fault",
         _ => "exception",
     };
+    // Serial only from here on: the exception may have been taken while the
+    // framebuffer's writer lock was held (a fault inside the screen code), and a
+    // console write that tried to draw would deadlock instead of logging.
+    crate::console::serial_only();
     crate::kprintln!();
     crate::kprintln!("[EXC] {name} (scause={scause}, stval={stval:#x}, sepc={sepc:#x})");
     crate::kprintln!("[EXC] ra={:#x} sp={:#x}", frame.ra, frame.sp);

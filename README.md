@@ -146,20 +146,20 @@ SELFTEST SUMMARY: 6/6 passed
 | Модель привилегий | готово | S-mode под OpenSBI, M-mode не трогаем; выключение через SBI SRST | `src/arch/riscv64/sbi.rs` |
 | Device tree | частично | только `/memory` (`reg`) и `/cpus:timebase-frequency`; ошибка разбора фатальна | `src/fdt.rs` |
 | Ловушки | частично | `stvec` → `trap_entry` → диспетчер: называет причину и останавливает hart; восстановления после исключения нет | `src/arch/riscv64/traps.rs` |
-| Консоль | готово | NS16550 по `0x1000_0000`, polled, 8N1; один текстовый поток — два стока | `src/drivers/uart.rs`, `src/console.rs` |
+| Консоль | готово | NS16550 по `0x1000_0000`, 8N1; приём — по прерыванию PLIC в кольцевой буфер (polled-путь остаётся запасным), передача по-прежнему polled; один текстовый поток — два стока | `src/drivers/uart.rs`, `src/console.rs` |
 | Экран | готово | ramfb 1280×800, stride 5120, сетка 100×37, шрифт покрытия 8×18, статус-бар; кадр отдаётся на каждый `kprint!` | `src/drivers/{fw_cfg,ramfb,framebuffer}.rs` |
-| Шелл | готово | редактор строки (128 байт, backspace) + 8 команд | `src/shell.rs` |
+| Шелл | готово | редактор строки, `wfi`-ожидание ввода; команды памяти/диска/ФС, `sleep`, `time`, `halt` (полный список — в таблице ниже) | `src/shell.rs` |
 | Физическая память (PMM) | готово | битовая карта 4 KiB-кадров окна 4 GiB, `set = свободен`, выделение одиночное и непрерывным блоком | `src/memory/pmm.rs` |
 | Куча ядра, `alloc` | готово | `#[global_allocator]` поверх PMM-кадров: чанки по 64 KiB, free-list, целиком свободный чанк возвращается в PMM; `Vec` проверен `selftest` | `src/memory/{heap,selftest}.rs` |
 | Страницы (Sv39) | готово (ядро) | identity-карта 4 KiB-страниц, `satp` включён: `[RAM base, __kernel_end)` RWX, выше — RW **без X**, страница UART RW; таблицы берутся из PMM, пустые возвращаются при `unmap`. Пользовательских адресных пространств нет | `src/memory/paging.rs`, `src/arch/riscv64/mmu.rs` |
-| Таймер | **нет** | `time` CSR читается, но таймер не программируется, `sie` = 0 | — |
-| Прерывания / PLIC | **нет** | ветки в диспетчере есть, источников нет: `[EXC] external interrupt (PLIC not routed yet)` | `src/arch/riscv64/traps.rs` |
+| Таймер | готово | тик 100 Гц через SBI TIME: абсолютный дедлайн (+10 мс на прерывание, без накопления дрейфа), `sie.STIE`, `sleep`/`uptime` в тиках; холостой цикл — `wfi` | `src/arch/riscv64/timer.rs` |
+| Прерывания / PLIC | готово | PLIC из DTB (`riscv,plic0`), контекст S-mode, UART source из DTB (10 на QEMU `virt`), claim/complete, счётчики и `overrun`; диспетчер различает timer/external и возвращается через `sret` | `src/arch/riscv64/plic.rs`, `src/arch/riscv64/traps.rs` |
 | Блочное устройство | готово | virtio-mmio (modern virtio 1.x, version 2), polled: окна транспорта находятся через DTB, read/write/flush, опрос завершения с ограничением и FAILED после таймаута; `-global virtio-mmio.force-legacy=false` обязателен (иначе QEMU даёт legacy-транспорт) | `src/drivers/block.rs`, `src/drivers/virtio_mmio.rs` |
 | Файловая система (ext2) | готово | чтение/запись файлов (direct + single/double indirect), truncate, каталоги, create/unlink/mkdir/rmdir/rename, симлинки; совместимо с образом хостового `mkfs.ext2 -t ext2`; форматируется только пустое устройство (MBR/GPT/чужие данные — отказ с причиной); журнала/WAL нет | `src/fs/ext2/`, `src/fs/format_policy.rs` |
 | VFS | готово | `VfsNode`, синтетический корень, монтирование в `/mnt`, два примитива разрешения путей (`lookup_path` без последней симлинки / `walk` с переходом и бюджетом) | `src/vfs/mod.rs` |
 | Задачи, syscalls, userland | **нет** | — | M6, план |
 | Сеть, пакеты, apt | **нет** | есть в [x86-репозитории](https://github.com/ccclosed/Pagh-OS), сюда не портируется | — |
-| Тесты | частично | host-тестов нет; in-QEMU `selftest` — 7 проверок памяти + 3 блочного слоя + 11 ext2/VFS (идемпотентность по ledger'у свободных кадров), QEMU-smoke в четырёх режимах (serial, ramfb, диск-fresh, диск-existing) и проверка пикселей `tools/font_check.py` | `src/memory/selftest.rs`, `src/drivers/selftest.rs`, `src/fs/selftest.rs`, `.github/smoke.py`, `tools/` |
+| Тесты | частично | host-тестов нет; in-QEMU `selftest` — 7 проверок памяти + 3 блочного слоя + 11 ext2/VFS + 4 прерываний/таймера (идемпотентность по ledger'у свободных кадров), QEMU-smoke в четырёх режимах (serial, ramfb, диск-fresh, диск-existing) и проверка пикселей `tools/font_check.py` | `src/memory/selftest.rs`, `src/drivers/selftest.rs`, `src/fs/selftest.rs`, `src/arch/riscv64/selftest.rs`, `.github/smoke.py`, `tools/` |
 | CI | готово | `fmt`, debug/release build, QEMU-smoke (serial, ramfb, и приёмка M5: пустой диск → формат/монтирование/запись, повторная загрузка того же образа читает файл) | `.github/workflows/ci.yml` |
 
 ---
@@ -230,10 +230,11 @@ backspace работает, всё остальное — команды:
 | `cp <src> <dst>` / `mv <src> <dst>` | копировать / переименовать |
 | `ln [-s] <target> <path>` | жёсткая или символическая ссылка |
 | `ramdisk [sectors]` | **только для тестов**: отформатировать RAM-диск и смонтировать его в `/mnt` |
-| `time` | значение CSR `time` и частота timebase |
+| `time` | два счётчика: CSR `time` (аппаратный) и тики ядра; uptime, число прерываний таймера, статистика PLIC/UART |
 | `hart` | id hart'а, на котором работает ядро |
 | `echo <text>` | печатает текст (слова через один пробел) |
 | `clear` | очистка экрана ANSI-последовательностью (чистит и экран, и терминал) |
+| `sleep <secs>` | ждать столько секунд тиков (`wfi`, не спин) |
 | `halt` | выключение машины через SBI SRST |
 
 Истории, автодополнения и стрелок нет — это следующий уровень шелла, а не
