@@ -86,9 +86,15 @@ jobs:
           # The target lives in different packages across runner images
           # (qemu-system-misc on some, a split qemu-system-riscv on others), and a
           # missing binary used to fail here with exit 127 and no explanation.
-          for pkg in qemu-system-misc qemu-system-riscv qemu-system qemu-system-data; do
+          # qemu-img lives in qemu-utils, not in the qemu-system packages: the
+          # disk-acceptance steps create the image with it (exit 127 otherwise).
+          for pkg in qemu-system-misc qemu-system-riscv qemu-system qemu-system-data qemu-utils; do
             sudo apt-get install -y --no-install-recommends "$pkg" || true
           done
+          command -v qemu-img || {
+            echo "qemu-img is missing (the disk acceptance needs qemu-utils)"
+            exit 1
+          }
           command -v qemu-system-riscv64 || {
             echo "qemu-system-riscv64 is still missing; packages that mention it:"
             apt-cache search qemu-system | head -20
