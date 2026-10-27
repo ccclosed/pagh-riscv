@@ -1,4 +1,4 @@
-//! The very first instructions: set a stack, park the secondary harts, call Rust.
+//! The very first instructions: set a stack and call Rust.
 //!
 //! OpenSBI enters S-mode at `_start` with `a0` = hart id and `a1` = the device
 //! tree's physical address, interrupts disabled and no stack. The only thing
@@ -11,9 +11,16 @@ global_asm!(
     .section .text.entry
     .globl _start
 _start:
-    /* Only hart 0 boots the kernel. The others park here, before any Rust code
-       can run, so no kernel data structure is ever touched by two harts. */
-    bnez a0, 2f
+    /* Exactly one hart reaches this instruction: OpenSBI's boot protocol hands
+       S-mode to one hart it picked, and keeps every other hart in the HSM's
+       "stopped" state until software starts it. The id need NOT be 0 — with
+       `-smp 4` firmware booted hart 2, and the old `bnez a0, park` parked the
+       only running hart (silent hang, no trap). So: no id check, no parking; the
+       single-S-mode-hart property is firmware's, and an atomic claim is not
+       available here (this target's features do not enable Zaamo) — if a
+       firmware ever starts several harts, first enable that and claim with
+       `amoswap`, not by assuming hart 0.
+    */
 
     /* A stack before anything else: `sp` is arbitrary on entry. */
     la      sp, __stack_top
@@ -32,10 +39,6 @@ _start:
 
 1:  wfi
     j       1b
-
-2:  /* Secondary harts: wait for an IPI that will only come once SMP exists. */
-    wfi
-    j       2b
 "#
 );
 

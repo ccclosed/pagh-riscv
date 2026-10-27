@@ -33,7 +33,7 @@ use crate::sync::{Guard, Spinlock};
 /// but it is what a frame index can reach in one `usize` arithmetic step, and the
 /// cost is 128 KiB of `.bss` whether the machine uses it or not. RAM above the
 /// window is reported and left unusable rather than half-tracked.
-pub const WINDOW: usize = 1 << 32;
+pub const WINDOW: usize = 1 << 33;
 
 /// Frames in the window.
 const FRAMES: usize = WINDOW / FRAME_SIZE;

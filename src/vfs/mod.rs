@@ -467,6 +467,60 @@ pub fn resolve(cwd: &str, path: &str) -> String {
     out
 }
 
+/// Lexically normalise an absolute path: drop `.` and empty components, and fold
+/// `..` against the preceding component.
+///
+/// Unlike [`resolve`] this is meant for *display* and for keeping the shell's
+/// cwd honest (`cd /mnt/demo; cd ..` must leave `pwd` at `/mnt`, not at
+/// `/mnt/demo/..`). It is still lexical: it does not touch the filesystem, so it
+/// cannot see symlinks — callers resolve the path through [`walk`] first and use
+/// this only for the name to report.
+///
+/// `..` never leaves a mount: the mounted root's parent is itself (the
+/// documented v1 simplification), so when the normalised prefix is a mount
+/// point, `..` keeps it.
+pub fn normalize(path: &str) -> String {
+    if !path.starts_with('/') {
+        return path.to_string();
+    }
+    // One snapshot of the mount names; the shell is the only caller and this is
+    // not a hot path.
+    let mounts: Vec<String> = match ROOT_DIR.lock().clone() {
+        Some(root) => root
+            .children
+            .lock()
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect(),
+        None => Vec::new(),
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for comp in path.split('/').filter(|c| !c.is_empty() && *c != ".") {
+        if comp == ".." {
+            if parts.is_empty() {
+                continue; // `/..` is `/`
+            }
+            let mut current = String::from("/");
+            current.push_str(&parts.join("/"));
+            if mounts
+                .iter()
+                .any(|m| current.strip_prefix('/') == Some(m.as_str()))
+            {
+                continue; // do not climb out of a mount
+            }
+            parts.pop();
+        } else {
+            parts.push(comp);
+        }
+    }
+    let mut out = String::from("/");
+    out.push_str(&parts.join("/"));
+    if out.len() > 1 && out.ends_with('/') {
+        out.pop();
+    }
+    out
+}
+
 /// Split an absolute path into `(parent, leaf)` for the create/remove/rename
 /// family. The leaf must name a real entry — `""`, `"."` and `".."` are refused
 /// because none of them can be created or removed.
@@ -563,8 +617,16 @@ pub fn walk(path: &str, follow_final: bool) -> VfsResult<Arc<dyn VfsNode>> {
             }
             // A relative target is relative to the directory that contains the
             // link, which is `cur` right now (the link was looked up *in* it).
-            let mut expansion = components(&target);
-            while let Some(c) = expansion.pop() {
+            //
+            // `components` returns the path *reversed* (its `pop` is the next
+            // component to process), and `stack` uses the same convention — so
+            // the target's components are pushed back in reverse order. Pushing
+            // them in the order `components` hands them out is what puts the
+            // first component of the target on top; the earlier loop popped
+            // while pushing, which reversed the target twice and made every
+            // symlink resolve to a rotated path.
+            let expansion = components(&target);
+            for c in expansion {
                 stack.push(c);
             }
             continue;

@@ -103,8 +103,14 @@ pub fn run(tree: Fdt) -> ! {
                 _ => {}
             }
         }
+        let overflowed = line.overflowed;
         let command = line.take();
-        if !command.is_empty() {
+        if overflowed {
+            crate::kprintln!(
+                "line too long ({} bytes max) — refused, nothing was executed",
+                LINE_CAPACITY
+            );
+        } else if !command.is_empty() {
             execute(&command, &tree, &mut state);
         }
     }
@@ -114,6 +120,10 @@ pub fn run(tree: Fdt) -> ! {
 struct Line {
     buf: [u8; LINE_CAPACITY],
     len: usize,
+    /// A byte arrived that did not fit. The line is then *refused* at Enter, not
+    /// executed as its 128-byte prefix — executing half a command is how a typo
+    /// becomes a different command.
+    overflowed: bool,
 }
 
 impl Line {
@@ -121,12 +131,15 @@ impl Line {
         Line {
             buf: [0; LINE_CAPACITY],
             len: 0,
+            overflowed: false,
         }
     }
 
-    /// Append `byte`; false when the line is full.
+    /// Append `byte`; false when the line is full (and mark it overflowed, so
+    /// the caller refuses the whole line instead of running a prefix).
     fn push(&mut self, byte: u8) -> bool {
         if self.len == LINE_CAPACITY {
+            self.overflowed = true;
             return false;
         }
         self.buf[self.len] = byte;
@@ -149,6 +162,7 @@ impl Line {
     fn take(&mut self) -> String {
         let text = String::from_utf8_lossy(&self.buf[..self.len]).into_owned();
         self.len = 0;
+        self.overflowed = false;
         text
     }
 }
@@ -215,6 +229,7 @@ fn execute(line: &str, tree: &Fdt, state: &mut State) {
             crate::kprintln!("  mv <src> <dst>         rename or move an entry");
             crate::kprintln!("  ln [-s] <target> <path> create a hard or symbolic link");
             crate::kprintln!("  ramdisk [sectors]      TEST ONLY: format+mount a RAM disk at /mnt");
+            crate::kprintln!("  fs            filesystem status: device, mount point, free space");
             crate::kprintln!("  clear         clear the screen (ANSI)");
             crate::kprintln!("  halt          power the machine off (SBI SRST)");
         }
@@ -422,7 +437,10 @@ fn cmd_cd<'a>(mut args: impl Iterator<Item = &'a str>, state: &mut State) {
     match vfs::walk(&target, true) {
         Ok(node) => {
             if node.is_directory() {
-                state.cwd = target;
+                // Report the path lexically normalised (`/mnt/demo/..` is `/mnt`,
+                // not a string with a dangling `..`), while `walk` above is what
+                // actually checked it exists and is a directory.
+                state.cwd = vfs::normalize(&target);
             } else {
                 print_error("cd", arg, VfsError::NotADirectory);
             }

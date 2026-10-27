@@ -114,10 +114,13 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
    (`Cargo.toml:10-16`): a panic anywhere kills the machine, and inside a trap the
    frame is the only evidence. The handler prints and parks — keep it that way.
    Exception paths never return; only interrupts return via `sret`.
-3. **Single-hart boot.** `_start` sends every hart but hart 0 into a `wfi` loop
-   (`src/arch/riscv64/boot.rs:13-16, 33-38`) before any Rust runs. All kernel state
-   assumes one context and `sync.rs` is one non-reentrant spinlock. SMP is not a
-   refactor — it is a new boot protocol plus real locking.
+3. **Single-hart boot.** OpenSBI's boot protocol hands S-mode to exactly one
+   hart and leaves the rest stopped in its HSM, and the id it picks need not be 0
+   (`-smp 4` booted hart 2 — the old `bnez a0, park` parked the only running
+   hart and hung silently). `_start` therefore makes no id assumption. All kernel
+   state assumes one context and `sync.rs` is one non-reentrant spinlock; SMP is
+   not a refactor — it is a new boot protocol plus real locking (and an atomic
+   claim, which `rv64gc` here does not let inline asm use yet: Zaamo is off).
 4. **`mhartid` is an M-mode CSR.** Reading it from S-mode is an illegal instruction
    (this actually happened: `scause=2, stval=0xf1402573`, machine halted). Use
    `arch::riscv64::hart_id()`, which reads `BOOT_HART_ID`, captured in `_start` while
@@ -178,11 +181,11 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
     prints to the console (`traps.rs:177-180`), and it would deadlock against a
     preempted lock holder. See `docs/architecture.md` §11.1.
 13. **`#![no_std]`, no dependencies.** `Cargo.toml`'s `[dependencies]` is empty.
-    `alloc` **is** available now (`extern crate alloc` + `#[global_allocator]` in
-    `src/main.rs:16, 35-36`), but nothing on the boot path allocates and drivers
-    deliberately use fixed statics — a driver that cannot run before the frame pool
-    must not need the heap. Adding a crate is an architecture decision, not an
-    implementation detail.
+    `alloc` **is** available (`extern crate alloc` + `#[global_allocator]` in
+    `src/main.rs`). Nothing that runs *before* the frame pool may allocate, and the
+    drivers that run early (console, ramfb, virtio probe) use fixed statics — but
+    the filesystem mount and the shell are normal `alloc` users by design. Adding a
+    crate is an architecture decision, not an implementation detail.
 14. **`unsafe` blocks carry `SAFETY:` comments** — every one, including the asm
     contracts (house style; no automated gate yet, unlike x86's `check_safety.py`).
 15. **Only a blank device is ever formatted.** `main.rs::init_fs` mounts first and
@@ -202,6 +205,11 @@ format/mount/persist acceptance, and the pixel check that proves a screenshot is
 really the committed font. What does not: host property tests, an E2E driver,
 adversarial fuzzing. That is a gap, not a policy — the rule stands:
 
+- **Input before the banner is discarded, by design.** `uart::init` sets the
+  16550's `FCR` to clear both FIFOs, so bytes a driver writes before the guest is
+  listening never reach the shell (piping `help\nhalt\n` into QEMU at start-up
+  produces a partial command). Scripts wait for `Type 'help' for the command list.`
+  first — `.github/smoke.py` does, and so must anything new.
 - **A regression fix without a check is not done.** The cheapest check is extending
   `EXPECTED` in `.github/smoke.py`; state that can be exercised belongs in a
   `SELFTEST <name> PASS/FAIL` routine next to `memory/selftest.rs`; pure logic

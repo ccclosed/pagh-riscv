@@ -24,7 +24,7 @@
 | `arch/riscv64/mmu.rs` | примитивы Sv39: флаги PTE, `PageTable`, `vpn`, `satp_for`, `activate`, `sfence` — вызывает `memory::paging` |
 | `fdt.rs` | минимальный читатель flattened device tree |
 | `memory/mod.rs` | фасад памяти: `init`, `stats`, `kernel_end`, `boot_stack`, `fdt_span` |
-| `memory/pmm.rs` | битовая карта физических кадров 4 KiB (окно 4 GiB) |
+| `memory/pmm.rs` | битовая карта физических кадров 4 KiB (окно 8 GiB) |
 | `memory/heap.rs` | free-list внутри 64 KiB-чанков, `GlobalAlloc` |
 | `memory/selftest.rs` | семь неразрушающих проверок памяти (PMM, Sv39, куча, чанки) для `selftest` |
 | `drivers/mod.rs` | фасад драйверов |
@@ -55,7 +55,7 @@
 
 | # | Фаза | Код | Почему здесь |
 |---|---|---|---|
-| 1 | `_start`: hart 0 продолжает, остальные — в `wfi` | `arch/riscv64/boot.rs:13-16, 33-38` | до любого Rust-кода, поэтому нет гонок между hart'ами |
+| 1 | `_start`: OpenSBI запускает ровно один hart (id может быть не 0) | `arch/riscv64/boot.rs` | нельзя предполагать hart 0 |
 | 2 | стек `sp = __stack_top`, 64 KiB в `.bss`, выравнивание 16 | `arch/riscv64/boot.rs:18-21, 44-54` | на входе `sp` произвольный |
 | 3 | hart id → `BOOT_HART_ID` | `arch/riscv64/boot.rs:23-28` | `mhartid` из S-mode недоступен, а `a0` ещё цел |
 | 4 | `call kmain(a0, a1)` | `arch/riscv64/boot.rs:30-31` | аргументы уже в нужных регистрах |

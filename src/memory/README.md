@@ -10,12 +10,12 @@ paging, so a physical address *is* a pointer (§ [Not implemented](#not-implemen
 |---|---|
 | Unit | 4 KiB (`memory::FRAME_SIZE`), the granule Sv39 will map |
 | Pool | the device tree's `/memory` node, rounded outward to frames |
-| Table | a bitmap, 1 bit per frame, covering physical addresses `0..4 GiB` |
+| Table | a bitmap, 1 bit per frame, covering physical addresses `0..8 GiB` |
 | Strategy | first fit from a next-fit cursor, run-length scan |
 | API | `alloc_frame`, `free_frame`, `alloc_frames_contiguous`, `free_frames_contiguous`, `stats`, `pool_range` |
 
 `run.sh` boots `virt` with 256 MiB, so the pool is 65536 frames. The bitmap's window is
-4 GiB — 128 KiB of `.bss`, paid whether the machine uses it or not — because that is what
+8 GiB — 256 KiB of `.bss`, paid whether the machine uses it or not — because that is what
 a frame index can reach in one `usize` step. RAM above the window is reported at boot and
 left unusable rather than half-tracked.
 
