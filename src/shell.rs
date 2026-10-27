@@ -38,6 +38,9 @@ use crate::vfs::{self, VfsError, VfsNode};
 /// silently shortened command is worse than a rejected one.
 const LINE_CAPACITY: usize = 128;
 
+/// 512-byte sectors in one MiB, for the human-readable capacity in `disk`.
+const SECTORS_PER_MIB: u64 = (1024 * 1024) / SECTOR_SIZE as u64;
+
 /// Cap on `cat`/`cp` bytes, so a huge file cannot lock the console for minutes.
 const MAX_FILE_BYTES: u64 = 256 * 1024;
 
@@ -185,7 +188,12 @@ fn execute(line: &str, tree: &Fdt, state: &mut State) {
             crate::kprintln!(
                 "  mem           device tree range, frame pool, heap and the page table"
             );
-            crate::kprintln!("  selftest      run the in-QEMU memory + filesystem self-tests");
+            crate::kprintln!(
+                "  disk          block device: name, capacity and a sector-0 read check"
+            );
+            crate::kprintln!(
+                "  selftest      run the in-QEMU memory, block and filesystem self-tests"
+            );
             crate::kprintln!("  time          the `time` CSR (timebase ticks) and its frequency");
             crate::kprintln!("  hart          the hart this kernel is running on");
             crate::kprintln!("  echo <text>   print the text back");
@@ -258,11 +266,31 @@ fn execute(line: &str, tree: &Fdt, state: &mut State) {
                 None => crate::kprintln!("sv39   no address space (paging has not been built)"),
             }
         }
-        // The suites: memory first (frames, heap, Sv39), then the filesystem on
-        // its own RAM device. Both are written to be non-destructive and
-        // idempotent, so running `selftest` twice in one boot is a real check
-        // instead of a state mutation — the free-frame ledgers must read the
-        // same both times.
+        // The block seam's one visible surface: what device the boot path found,
+        // how big it is, and a live read proving the driver still answers. Sector
+        // 0 is read (never written) because a device that cannot read it is not a
+        // disk, and the read is non-destructive. No device is a normal state on a
+        // headless boot, so it is a line, not an error.
+        "disk" => match block::get() {
+            Some(device) => {
+                let sectors = device.sector_count();
+                let mut sector = [0u8; SECTOR_SIZE];
+                let readable = device.read_block(0, &mut sector).is_ok();
+                crate::kprintln!(
+                    "disk: {} {} sectors ({} MiB), sector 0 {}",
+                    device.name(),
+                    sectors,
+                    sectors / SECTORS_PER_MIB,
+                    if readable { "readable" } else { "NOT readable" }
+                );
+            }
+            None => crate::kprintln!("disk: no block device"),
+        },
+        // The suites: memory first (frames, heap, Sv39), then the block layer
+        // (RAM round-trip + read-only device checks), then the filesystem on its
+        // own RAM device. All are written to be non-destructive and idempotent,
+        // so running `selftest` twice in one boot is a real check instead of a
+        // state mutation — the free-frame ledgers must read the same both times.
         "selftest" => {
             crate::memory::selftest::run();
             crate::fs::selftest::run();

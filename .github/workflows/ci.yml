@@ -110,3 +110,17 @@ jobs:
         run: python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh
       - name: Boot it with ramfb (the screen path)
         run: python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb
+      # M5 acceptance, end to end: a blank virtio-mmio image is formatted by the
+      # kernel, mounted at /mnt and written to; the second run boots the very same
+      # image and must mount it (no reformat) and read the marker file back. Two
+      # runs, because persistence across a reboot is the claim.
+      - name: Create a blank disk image
+        run: qemu-img create -f raw /tmp/pagh-ci.img 64M
+      - name: Format and mount a blank disk (virtio-mmio + ext2)
+        run: >-
+          python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh
+          --ramfb --disk /tmp/pagh-ci.img --fresh
+      - name: Remount the same disk and read the file back
+        run: >-
+          python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh
+          --ramfb --disk /tmp/pagh-ci.img

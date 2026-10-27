@@ -10,7 +10,7 @@
   <img alt="Target: riscv64gc-unknown-none-elf" src="https://img.shields.io/badge/target-riscv64gc--unknown--none--elf-blue.svg">
   <img alt="no_std" src="https://img.shields.io/badge/%23!%5Bno__std%5D-yes-informational.svg">
   <img alt="Boot: OpenSBI S-mode" src="https://img.shields.io/badge/boot-OpenSBI%20S--mode-purple.svg">
-  <img alt="Milestone: M1-M2, M4 done" src="https://img.shields.io/badge/milestone-M1%E2%80%93M2%2C%20M4%20done-brightgreen.svg">
+  <img alt="Milestone: M1-M2, M4-M5 done" src="https://img.shields.io/badge/milestone-M1%E2%80%93M2%2C%20M4%E2%80%93M5%20done-brightgreen.svg">
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green.svg">
 </p>
 
@@ -34,6 +34,7 @@ and the CI smoke test asserts the exact boot log this README shows.
 ```sh
 cargo build                              # riscv64gc-unknown-none-elf, pinned nightly
 ./run.sh                                 # serial console; Ctrl-A X to leave
+DISK=/tmp/pagh.img ./run.sh              # + virtio-диск: пустой образ будет отформатирован и смонтирован в /mnt
 python3 tools/run.py --keys "help\n" --shot /tmp/shot.png --check-font   # screen + font
 ```
 
@@ -46,6 +47,12 @@ Docs: [architecture](docs/architecture.md) · [roadmap](docs/roadmap.md) ·
 ## Скриншот
 
 ![Консоль pagh-riscv: команда help на экране 1280×800](docs/shell.png)
+
+Диск M5: virtio-mmio-устройство найдено через DTB, пустой образ отформатирован,
+ext2 смонтирован в `/mnt`; `ls`/`cat`/`stat` работают, `disk` показывает ёмкость и
+живую проверку сектора 0.
+
+![ext2 на virtio-диске: ls, cat, stat](docs/fs.png)
 
 Это не макет и не рендер на хосте: кадр нарисован самим ядром в теневом буфере и
 отдан устройству `ramfb`, а снят из работающего QEMU через `screendump`. Команда
@@ -147,11 +154,13 @@ SELFTEST SUMMARY: 6/6 passed
 | Страницы (Sv39) | готово (ядро) | identity-карта 4 KiB-страниц, `satp` включён: `[RAM base, __kernel_end)` RWX, выше — RW **без X**, страница UART RW; таблицы берутся из PMM, пустые возвращаются при `unmap`. Пользовательских адресных пространств нет | `src/memory/paging.rs`, `src/arch/riscv64/mmu.rs` |
 | Таймер | **нет** | `time` CSR читается, но таймер не программируется, `sie` = 0 | — |
 | Прерывания / PLIC | **нет** | ветки в диспетчере есть, источников нет: `[EXC] external interrupt (PLIC not routed yet)` | `src/arch/riscv64/traps.rs` |
-| Блочное устройство, ext2, VFS | **нет** | — | M5, план |
+| Блочное устройство | готово | virtio-mmio (modern virtio 1.x, version 2), polled: окна транспорта находятся через DTB, read/write/flush, опрос завершения с ограничением и FAILED после таймаута; `-global virtio-mmio.force-legacy=false` обязателен (иначе QEMU даёт legacy-транспорт) | `src/drivers/block.rs`, `src/drivers/virtio_mmio.rs` |
+| Файловая система (ext2) | готово | чтение/запись файлов (direct + single/double indirect), truncate, каталоги, create/unlink/mkdir/rmdir/rename, симлинки; совместимо с образом хостового `mkfs.ext2 -t ext2`; форматируется только пустое устройство (MBR/GPT/чужие данные — отказ с причиной); журнала/WAL нет | `src/fs/ext2/`, `src/fs/format_policy.rs` |
+| VFS | готово | `VfsNode`, синтетический корень, монтирование в `/mnt`, два примитива разрешения путей (`lookup_path` без последней симлинки / `walk` с переходом и бюджетом) | `src/vfs/mod.rs` |
 | Задачи, syscalls, userland | **нет** | — | M6, план |
 | Сеть, пакеты, apt | **нет** | есть в [x86-репозитории](https://github.com/ccclosed/Pagh-OS), сюда не портируется | — |
-| Тесты | частично | host-тестов нет; есть in-QEMU `selftest` (кадры, шаблон в кадре, куча; идемпотентность по ledger'у свободных кадров), QEMU-smoke (2 режима) и проверка пикселей `tools/font_check.py` | `src/memory/selftest.rs`, `.github/smoke.py`, `tools/` |
-| CI | готово | 5 команд: `fmt`, debug/release build, QEMU-smoke (serial + ramfb) | `.github/workflows/ci.yml` |
+| Тесты | частично | host-тестов нет; in-QEMU `selftest` — 7 проверок памяти + 3 блочного слоя + 11 ext2/VFS (идемпотентность по ledger'у свободных кадров), QEMU-smoke в четырёх режимах (serial, ramfb, диск-fresh, диск-existing) и проверка пикселей `tools/font_check.py` | `src/memory/selftest.rs`, `src/drivers/selftest.rs`, `src/fs/selftest.rs`, `.github/smoke.py`, `tools/` |
+| CI | готово | `fmt`, debug/release build, QEMU-smoke (serial, ramfb, и приёмка M5: пустой диск → формат/монтирование/запись, повторная загрузка того же образа читает файл) | `.github/workflows/ci.yml` |
 
 ---
 
@@ -186,6 +195,7 @@ qemu-system-riscv64 -machine virt -m 256M -device ramfb \
 | `PROFILE` | `debug` | `release` — собрать и запустить release-ядро |
 | `MEMORY` | `256M` | объём RAM у `virt` |
 | `BIOS` | — (QEMU `-bios default`) | внешняя прошивка, например `BIOS=/path/opensbi.bin` |
+| `DISK` | — | образ virtio-mmio диска; отсутствующий создаётся пустым (64 MiB), пустой форматируется ядром и монтируется в `/mnt` |
 
 Выход из QEMU — `Ctrl-A`, затем `X`. Изнутри гостя: команда `halt` (SBI SRST,
 машина действительно выключается, QEMU завершается с кодом 0).
@@ -208,7 +218,18 @@ backspace работает, всё остальное — команды:
 |---|---|
 | `help` | список команд |
 | `mem` | память из device tree **и** статистика PMM и кучи (свободно/всего кадров, диапазон пула, байты кучи) |
-| `selftest` | in-QEMU self-tests памяти: кадры, шаблон в кадре, куча; печатает ledger свободных кадров до и после прогона |
+| `selftest` | in-QEMU self-tests: 7 проверок памяти, 3 блочного слоя, 11 ext2/VFS; печатает ledger свободных кадров до и после прогона |
+| `disk` | блочное устройство: имя, ёмкость, живая проверка чтения сектора 0 |
+| `ls [path]` | листинг каталога (каталоги с `/`) |
+| `cat <path>` | содержимое файла |
+| `stat <path>` | путь, имя, тип, режим, размер, inode, ссылки |
+| `cd [path]` / `pwd` | текущий каталог (лексическое склеивание, без `..` из монтирования) |
+| `mkdir <path>` / `touch <path>` | создать каталог / пустой файл |
+| `write <path> <text>` | заменить содержимое файла текстом |
+| `rm [-r] <path>` | удалить файл, каталог — с `-r` |
+| `cp <src> <dst>` / `mv <src> <dst>` | копировать / переименовать |
+| `ln [-s] <target> <path>` | жёсткая или символическая ссылка |
+| `ramdisk [sectors]` | **только для тестов**: отформатировать RAM-диск и смонтировать его в `/mnt` |
 | `time` | значение CSR `time` и частота timebase |
 | `hart` | id hart'а, на котором работает ядро |
 | `echo <text>` | печатает текст (слова через один пробел) |
@@ -277,7 +298,7 @@ backspace работает, всё остальное — команды:
 | M2 | Физический аллокатор кадров, Sv39, куча ядра, `alloc` | **готов** (identity Sv39 с W^X, куча и `alloc`; page-fault ловушки — задел M6) |
 | M3 | Таймер через SBI, PLIC, консоль на прерываниях | план |
 | M4 | ramfb + шрифт покрытия Fira Code, съёмка скриншотов | **готов** (экран, шрифт и снимок проверены) |
-| M5 | virtio-mmio блочное устройство, ext2, VFS | план |
+| M5 | virtio-mmio блочное устройство, ext2, VFS | **готов** (virtio-mmio, ext2 rw + формат пустого диска, VFS, шелл-команды; журнала нет) |
 | M6 | Задачи, syscalls, Linux-compat-слой из x86-ветки | план |
 
 Что считается «сделано» для каждого майлстоуна и что в него не входит —
@@ -325,7 +346,7 @@ backspace работает, всё остальное — команды:
 безопасно; как только появится первый источник прерываний, критическую секцию
 нужно обернуть в `csr::without_interrupts`, иначе обработчик, печатающий в
 консоль, встанет на локе, который держит прерванный контекст. Разбор —
-`docs/architecture.md`, раздел 10.1.
+`docs/architecture.md`, раздел 11.1.
 
 ---
 

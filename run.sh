@@ -14,6 +14,10 @@
 # QEMU ships the firmware as `-bios default`; a system copy of
 # opensbi-riscv64-generic-fw_dynamic.bin is used when present, and an external
 # firmware can be forced with BIOS=/path/to/fw.bin.
+#
+# DISK=/path/to/image attaches a virtio-mmio block device (M5). A missing image
+# is created blank (64 MiB); the kernel formats it on boot only if it is blank,
+# mounts it at /mnt, and from then on the image is a normal ext2 filesystem.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -54,12 +58,28 @@ if ((WINDOW)); then
   DISPLAY_ARGS=(-display gtk)
 fi
 
+# A virtio-mmio disk, when DISK names one. `force-legacy=false` is what makes
+# QEMU expose the modern (version 2) transport this kernel speaks; without it the
+# transport is legacy and the kernel logs "legacy virtio-mmio version 1".
+DISK_ARGS=()
+if [[ -n "${DISK:-}" ]]; then
+  if [[ ! -f "$DISK" ]]; then
+    qemu-img create -f raw "$DISK" 64M >/dev/null
+  fi
+  DISK_ARGS=(
+    -drive "file=$DISK,format=raw,if=none,id=hd0"
+    -device virtio-blk-device,drive=hd0
+    -global virtio-mmio.force-legacy=false
+  )
+fi
+
 exec qemu-system-riscv64 \
   -machine virt \
   "${BIOS_ARGS[@]}" \
   -m "$MEMORY" \
   -kernel "$KERNEL" \
   -device ramfb \
+  "${DISK_ARGS[@]}" \
   "${DISPLAY_ARGS[@]}" \
   -serial mon:stdio \
   -no-reboot

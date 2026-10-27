@@ -9,6 +9,10 @@ any expected line is missing.  Used by the `smoke` job in
     cargo build
     python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh             # serial only
     python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb     # + screen
+    # M5: format a blank image, then (second run, same image) mount it and read back
+    qemu-img create -f raw /tmp/ci.img 64M
+    python3 .github/smoke.py <elf> --disk /tmp/ci.img --fresh
+    python3 .github/smoke.py <elf> --disk /tmp/ci.img
 
 `--ramfb` attaches QEMU's ramfb device, so the run also covers the framebuffer
 bring-up (`fw_cfg` -> `etc/ramfb` -> the console's second sink) while staying
@@ -91,6 +95,45 @@ SCREEN_MARKER = {
 # a FIFO, so a burst is fine once the kernel is listening.
 COMMANDS = b"mem\nhart\ntime\necho smoke ok\nnosuchcmd\nhelp\nhalt\n"
 
+# ── the disk mode (M5) ─────────────────────────────────────────────────────
+# `--disk PATH` attaches a virtio-mmio block device and then behaves differently
+# on purpose: a fresh image must be formatted by the kernel, an existing one must
+# mount without touching it. The two runs together prove format-if-blank,
+# mount, write-through and persistence across a reboot — the M5 acceptance
+# criteria — while the no-disk mode above keeps proving the machine works
+# without any block device at all.
+DISK_BOOT_PREFIX = [
+    "virtio-blk: virtio-blk0 at 0x",
+    "fs          virtio-blk0 (",
+]
+DISK_FRESH_BOOT = ["fs          virtio-blk0 is blank — formatting ext2"]
+DISK_MOUNTED = ["fs          ext2 on /mnt,"]
+DISK_COMMANDS_FRESH = (
+    b"disk\nls /mnt\nmkdir /mnt/ci\n"
+    b"write /mnt/ci/marker.txt hello-from-ci\n"
+    b"cat /mnt/ci/marker.txt\nstat /mnt/ci/marker.txt\nselftest\nhalt\n"
+)
+DISK_COMMANDS_EXISTING = b"disk\ncat /mnt/ci/marker.txt\nselftest\nhalt\n"
+DISK_EXPECTED_FRESH = [
+    "pagh:rv64> disk",
+    "disk: virtio-blk0",
+    "sector 0 readable",
+    "pagh:rv64> ls /mnt",
+    "lost+found/",
+    "write: wrote",
+    "hello-from-ci",
+    "size:",
+    "SELFTEST SUMMARY: 7/7 passed",
+    "SELFTEST ext2 summary: 11/11 passed",
+    "halt: powering off",
+]
+DISK_EXPECTED_EXISTING = [
+    "pagh:rv64> cat /mnt/ci/marker.txt",
+    "hello-from-ci",
+    "SELFTEST ext2 summary: 11/11 passed",
+    "halt: powering off",
+]
+
 BANNER = "Type 'help' for the command list."
 HALT = "halt: powering off"
 QEMU = os.environ.get("QEMU", "qemu-system-riscv64")
@@ -100,7 +143,7 @@ QEMU = os.environ.get("QEMU", "qemu-system-riscv64")
 BIOS = os.environ.get("PAGH_BIOS", "").strip()
 
 
-def boot(kernel, ramfb=False, timeout=120.0):
+def boot(kernel, ramfb=False, disk=None, commands=COMMANDS, timeout=120.0):
     """Boot `kernel`, drive the shell, return (reached_halt, powered_off, exit_code, log)."""
     cmd = [
         QEMU, "-machine", "virt", "-m", "256M",
@@ -110,6 +153,14 @@ def boot(kernel, ramfb=False, timeout=120.0):
     ]
     if ramfb:
         cmd += ["-device", "ramfb"]
+    if disk:
+        # QEMU's virtio-mmio transports default to the legacy (version 1) layout;
+        # this kernel speaks modern virtio only, so the transport is pinned here.
+        cmd += [
+            "-drive", "file=%s,format=raw,if=none,id=hd0" % disk,
+            "-device", "virtio-blk-device,drive=hd0",
+            "-global", "virtio-mmio.force-legacy=false",
+        ]
     proc = subprocess.Popen(
         cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, bufsize=0,
@@ -136,7 +187,7 @@ def boot(kernel, ramfb=False, timeout=120.0):
 
     reached = pump_until(BANNER)
     if reached:
-        proc.stdin.write(COMMANDS)
+        proc.stdin.write(commands)
         proc.stdin.flush()
         reached = pump_until(HALT)
 
@@ -170,19 +221,51 @@ def main():
     args = sys.argv[1:]
     ramfb = "--ramfb" in args
     args = [a for a in args if a != "--ramfb"]
+    fresh = "--fresh" in args
+    args = [a for a in args if a != "--fresh"]
+    disk = None
+    if "--disk" in args:
+        i = args.index("--disk")
+        if i + 1 >= len(args):
+            print("usage: smoke.py <kernel> [--ramfb] [--disk PATH [--fresh]]", file=sys.stderr)
+            return 2
+        disk = args[i + 1]
+        args = args[:i] + args[i + 2 :]
     if len(args) != 1:
-        print("usage: smoke.py <path-to-kernel-elf> [--ramfb]", file=sys.stderr)
+        print("usage: smoke.py <kernel> [--ramfb] [--disk PATH [--fresh]]", file=sys.stderr)
         return 2
 
     kernel = args[0]
     if not os.path.exists(kernel):
         print("SMOKE: no kernel at %s (run `cargo build` first)" % kernel, file=sys.stderr)
         return 2
+    if disk and not os.path.exists(disk):
+        print("SMOKE: no disk image at %s (create it first: qemu-img create -f raw ...)" % disk,
+              file=sys.stderr)
+        return 2
 
-    reached, powered_off, exit_code, log = boot(kernel, ramfb=ramfb)
+    mode = "ramfb" if ramfb else "serial"
+    if disk:
+        mode += "+disk" + ("+fresh" if fresh else "+existing")
+        commands = DISK_COMMANDS_FRESH if fresh else DISK_COMMANDS_EXISTING
+        reached, powered_off, exit_code, log = boot(kernel, ramfb=ramfb, disk=disk, commands=commands)
+        # Boot markers that come before the banner, so they must be expected
+        # before the shared block; the banner and everything after it are shared.
+        banner_at = EXPECTED.index(BANNER)
+        expected = (
+            [SCREEN_MARKER[ramfb]]
+            + EXPECTED[:banner_at]          # banner .. pmm, before the devices
+            + DISK_BOOT_PREFIX              # virtio-blk probe
+            + (DISK_FRESH_BOOT if fresh else [])   # format line, when formatting
+            + DISK_MOUNTED                  # ext2 mount
+            + [EXPECTED[banner_at]]         # "Type 'help' ..."
+            + (DISK_EXPECTED_FRESH if fresh else DISK_EXPECTED_EXISTING)
+        )
+    else:
+        reached, powered_off, exit_code, log = boot(kernel, ramfb=ramfb)
+        expected = [SCREEN_MARKER[ramfb]] + EXPECTED
     print(log, end="" if log.endswith("\n") else "\n")
 
-    expected = [SCREEN_MARKER[ramfb]] + EXPECTED
     failures = []
     if not reached:
         failures.append("the guest never reached the halt marker (%r)" % HALT)
@@ -200,13 +283,12 @@ def main():
         failures.append("missing expected line: %r" % want)
 
     if failures:
-        print("SMOKE: FAIL (%s)" % ("ramfb" if ramfb else "serial"), file=sys.stderr)
+        print("SMOKE: FAIL (%s)" % mode, file=sys.stderr)
         for why in failures:
             print("  - %s" % why, file=sys.stderr)
         return 1
     print(
-        "SMOKE: PASS (%s) — %d markers in order, QEMU exited 0 after halt"
-        % ("ramfb" if ramfb else "serial", len(expected))
+        "SMOKE: PASS (%s) — %d markers in order, QEMU exited 0 after halt" % (mode, len(expected))
     )
     return 0
 
