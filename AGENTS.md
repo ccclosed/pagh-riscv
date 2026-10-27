@@ -275,7 +275,7 @@ seconds. Verify locally with `cargo build --locked` after any version change.
 - **Tags** — tag the release commit with the bare version string (`0.3.0`) and push
   it. Tags must never run ahead of `Cargo.toml`. Note: `0.2.0` was tagged on a commit
   whose manifest still said `0.1.0` (the drift this rule exists to prevent); it is
-  left as history, and `0.3.0` is the first tag that matches its manifest.
+  left as history, and `0.4.0` is the first tag that matches its manifest (M3/M5/M6a landed after `0.3.0` was written but before it was tagged).
 
 ## Known gaps (documented, not hidden)
 

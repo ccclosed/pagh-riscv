@@ -90,7 +90,9 @@ python3 tools/run.py --keys "clear\n" --shot /tmp/riscv-clear.png \
 
 ## Что смотреть глазами
 
-* `docs/shell.png` — снимок для README (снимается тем же `run.py`, см. выше);
+* `docs/shell.png` — консоль с `help` (снимается тем же `run.py`, см. выше);
+* `docs/fs.png` — `DISK`-образ: `ls /mnt`, `disk`, `cat`, `stat`;
+* `docs/tasks.png` — `spawn 3`, `tasks`, `yield 48`: таблица потоков и счётчики;
 * статус-бар внизу: слева `pagh OS  RISC-V (RV64)`, справа `ramfb 1280x800`;
 * текст занимает 100×37 клеток, ниже — чёрная полоса, затем бар (раскладка
   x86-версии, см. `src/drivers/README.md`);

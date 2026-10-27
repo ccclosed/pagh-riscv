@@ -672,16 +672,16 @@ impl VirtioBlk {
 /// Probe one transport window.
 ///
 /// The checks are in the order the protocol makes meaningful: identify the
-/// transport (magic), the version (modern only), the device (a block device),
-/// then its features, then its queue. Every rejection names itself, because the
-/// caller's job is to put it on the serial line.
+/// transport (magic), the device (a block device — an *empty* slot has id 0 and
+/// is the normal state of the seven transports QEMU declares but does not use),
+/// the version (modern only), then features, then the queue. Empty-before-version
+/// matters for the log: QEMU's legacy transports report version 1 even with no
+/// device plugged in, and eight "legacy transport" warnings for eight empty
+/// slots on every boot is noise that hides a real one (a disk attached without
+/// `-global virtio-mmio.force-legacy=false`).
 fn probe(base: usize) -> Result<VirtioBlk, Error> {
     if read32(base, MAGIC_VALUE) != MAGIC {
         return Err(Error::NotVirtioMmio);
-    }
-    let version = read32(base, VERSION);
-    if version != VERSION_MODERN {
-        return Err(Error::Legacy(version));
     }
     let device_id = read32(base, DEVICE_ID);
     if device_id == 0 {
@@ -689,6 +689,10 @@ fn probe(base: usize) -> Result<VirtioBlk, Error> {
     }
     if device_id != DEVICE_ID_BLOCK {
         return Err(Error::NotBlock(device_id));
+    }
+    let version = read32(base, VERSION);
+    if version != VERSION_MODERN {
+        return Err(Error::Legacy(version));
     }
 
     // Reset, then the initialization sequence of §3.1: ACKNOWLEDGE, DRIVER,
