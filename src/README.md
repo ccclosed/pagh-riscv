@@ -46,9 +46,14 @@
 | `task/mod.rs` | фасад планировщика |
 | `task/scheduler.rs` | таблица потоков, ready-queue, квант, стеки из PMM, `tick`/`yield`/`exit`/`reap`, вытеснение таймером |
 | `task/selftest.rs` | пять проверок планировщика для `selftest` |
+| `user/mod.rs` | `run_image`: ELF → user-стек → задача → `sret` в U-mode → reap; `on_fault`; встроенные hello/fault/spin |
+| `user/elf.rs` | ELF64-загрузчик: валидация до первого кадра, `PT_LOAD` с `U=1`, откат кадров, `Loaded`/`ElfError` |
+| `user/syscall.rs` | `ecall`-диспетчер Linux/RISC-V: `write`/`exit`/`sched_yield`/`getpid`, проверка user-указателей, `sepc+4` |
+| `user/selftest.rs` | семь проверок user-mode для `selftest` |
 | `sync.rs` | один нереентерабельный спинлок |
 
 Подкаталоги документируют себя сами: [`arch/README.md`](arch/README.md),
+[`user/README.md`](user/README.md),
 [`drivers/README.md`](drivers/README.md), [`memory/README.md`](memory/README.md),
 [`fs/README.md`](fs/README.md), [`vfs/README.md`](vfs/README.md).
 Устройство `src/memory/**` (PMM, куча, selftest, пределы, чего нет) — в README
@@ -74,7 +79,7 @@
 | 11b | `plic::init` (DBT-база/source) → `uart::enable_rx_interrupt()` → `sie.SEIE` | `main.rs`, `arch/riscv64/plic.rs`, `drivers/uart.rs` | контроллер разводит линию раньше, чем UART её поднимает |
 | 12 | `virtio_mmio::init(&tree)`: перебор окон из DTB, регистрация диска (нет диска — строка в лог) | `main.rs`, `drivers/virtio_mmio.rs` | нужна карта (MMIO) и ловушки (сломанное окно) |
 | 13 | `vfs::init()` + `init_fs()`: смонтировать `/mnt`, пустое устройство — отформатировать | `main.rs::init_fs` | куча уже есть (монтирование аллоцирует); без диска — строка и дальше |
-| 14 | `shell::run(tree)`, не возвращается | `main.rs`, `shell.rs` | возвращаться некуда: планировщика нет (M6) |
+| 14 | `shell::run(tree)`: задача 0; команда `run` — вход в U-mode (M6b) | `main.rs`, `shell.rs` | планировщик, таймер и user-mode уже подняты; shell не возвращается |
 
 Исходы вне фаз: `panic_handler` печатает `[PANIC]` и паркует hart
 (`main.rs:116-130`); `halt` в шелле уходит в SBI SRST и выключает машину
@@ -82,12 +87,13 @@
 
 ## Чего в `src/` нет
 
-Ни одного из модулей x86-версии, кроме перечисленных выше: нет `vmm` (Sv39 включён,
-но карта одна и только для ядра), `task/`, `net/`, `pkg/`, `security/`, `debug/`,
-`log.rs`, `provision.rs`, `selftest_lx.rs` (Linux-compat). User mode/syscalls/ELF —
-M6b, их тоже нет. Нет host-tests: тесты,
-которые есть, живут внутри ядра — `memory/selftest.rs` и `fs/selftest.rs`
-(команда `selftest`). Подробный список — `README.md` → «Чего нет».
+Ни одного из модулей x86-версии, кроме перечисленных выше: нет `vmm`
+(Sv39 включён, но карта одна — identity; пользовательские страницы живут в ней же
+через бит `U`, отдельного адресного пространства на процесс нет), `net/`, `pkg/`,
+`security/`, `debug/`, `log.rs`, `provision.rs`, `selftest_lx.rs` (Linux-compat).
+Нет host-tests: тесты, которые есть, живут внутри ядра — `memory/selftest.rs`,
+`fs/selftest.rs`, `task/selftest.rs`, `user/selftest.rs` и остальные, — команда
+`selftest`. Подробный список — `README.md` → «Чего нет».
 
 ## Сборка и проверки
 
@@ -97,7 +103,7 @@ M6b, их тоже нет. Нет host-tests: тесты,
 | release | `cargo build --locked --release` | `target/riscv64gc-unknown-none-elf/release/pagh` |
 | smoke (serial) | `python3 .github/smoke.py <kernel>` | exit 0 + серийный лог |
 | smoke (+экран) | `python3 .github/smoke.py <kernel> --ramfb` | то же, с `-device ramfb` |
-| память в госте | команда `selftest` | `SELFTEST SUMMARY: 7/7`, `(block) 3/3`, `ext2 summary: 11/11`, `(arch) 4/4`, `(task) 5/5` |
+| память в госте | команда `selftest` | `SELFTEST SUMMARY: 7/7`, `(block) 3/3` (или 2/3 + skip без диска), `ext2 summary: 11/11`, `(arch) 4/4`, `(task) 5/5`, `(user) 7/7` |
 | диск в госте | `qemu-img create` + `-device virtio-blk-device` + `-global virtio-mmio.force-legacy=false` | пустой образ форматируется, `/mnt` монтируется, файл переживает перезагрузку |
 
 Оба профиля: `panic = "abort"` (`Cargo.toml:10-14`), release дополнительно

@@ -27,6 +27,7 @@
 
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use crate::arch::riscv64::csr;
 use crate::arch::riscv64::timer;
@@ -215,7 +216,7 @@ fn execute(line: &str, tree: &Fdt, state: &mut State) {
                 "  disk          block device: name, capacity and a sector-0 read check"
             );
             crate::kprintln!(
-                "  selftest      run the in-QEMU self-tests (memory, block, fs, timer, tasks)"
+                "  selftest      run the in-QEMU self-tests (memory, block, fs, timer, tasks, user)"
             );
             crate::kprintln!("  sleep <secs>  wait for that many seconds of timer ticks");
             crate::kprintln!("  tasks         list kernel threads: id, name, state, work, stack");
@@ -237,6 +238,12 @@ fn execute(line: &str, tree: &Fdt, state: &mut State) {
             crate::kprintln!("  mv <src> <dst>         rename or move an entry");
             crate::kprintln!("  ln [-s] <target> <path> create a hard or symbolic link");
             crate::kprintln!("  ramdisk [sectors]      TEST ONLY: format+mount a RAM disk at /mnt");
+            crate::kprintln!(
+                "  run <path>             run a static RV64 ELF from the filesystem in U-mode"
+            );
+            crate::kprintln!(
+                "  run demo|fault|spin    run the embedded hello / fault / timer fixtures"
+            );
             crate::kprintln!("  fs            filesystem status: device, mount point, free space");
             crate::kprintln!("  clear         clear the screen (ANSI)");
             crate::kprintln!("  halt          power the machine off (SBI SRST)");
@@ -325,6 +332,7 @@ fn execute(line: &str, tree: &Fdt, state: &mut State) {
             crate::fs::selftest::run();
             crate::arch::riscv64::selftest::run();
             crate::task::selftest::run();
+            crate::user::selftest::run();
         }
         "tasks" => list_tasks(),
         "spawn" => {
@@ -472,6 +480,7 @@ fn execute(line: &str, tree: &Fdt, state: &mut State) {
         "ln" => cmd_ln(args, state),
         "fs" => cmd_fs(),
         "ramdisk" => cmd_ramdisk(args, state),
+        "run" => cmd_run(args, state),
         "clear" => crate::kprint!("\x1b[2J\x1b[H"),
         "halt" => {
             // Ask firmware to power the machine off (SBI SRST). Parking the hart
@@ -1029,5 +1038,79 @@ fn list_tasks() {
                 info.stack_bytes() / 1024
             );
         }
+    }
+}
+
+// ─── user-mode programs (M6b) ──────────────────────────────────────────────
+
+/// `run <path>` / `run demo` / `run fault`: execute a static RV64 ELF in U-mode.
+///
+/// `demo` and `fault` are the embedded fixtures (`src/user/mod.rs`) and need no
+/// filesystem — they are the acceptance runs M6b names. A path is read from the
+/// VFS into one heap buffer first: the loader validates a whole image before it
+/// maps anything, so a short read must be refused as an invalid image rather than
+/// mapped page by page from the filesystem.
+///
+/// The result line is stable enough for the E2E scripts to grep:
+/// `run: <name> exited with code N` or `run: <name> killed: <reason>`.
+fn cmd_run<'a>(mut args: impl Iterator<Item = &'a str>, state: &mut State) {
+    let Some(argument) = args.next() else {
+        crate::kprintln!("run: usage: run <path> | run demo | run fault");
+        return;
+    };
+    match argument {
+        "demo" => run_one(crate::user::HELLO_ELF, "demo"),
+        "fault" => run_one(crate::user::FAULT_ELF, "fault"),
+        "spin" => run_one(crate::user::SPIN_ELF, "spin"),
+        path => {
+            let full = resolve_arg(state, path);
+            let node = match vfs::walk(&full, true) {
+                Ok(node) => node,
+                Err(error) => return print_error("run", &full, error),
+            };
+            if node.is_directory() {
+                return print_error("run", &full, VfsError::IsADirectory);
+            }
+            let size = node.size();
+            if size == 0 || size > crate::user::elf::MAX_IMAGE_BYTES as u64 {
+                crate::kprintln!(
+                    "run: {}: image size {} B is outside 1..={} B",
+                    full,
+                    size,
+                    crate::user::elf::MAX_IMAGE_BYTES
+                );
+                return;
+            }
+            // The heap allocates in 64 KiB chunks, so an image larger than one
+            // chunk is refused by name instead of aborting in the allocator;
+            // `try_reserve` is what makes the refusal a line, not a panic.
+            let mut image: Vec<u8> = Vec::new();
+            if image.try_reserve_exact(size as usize).is_err() {
+                crate::kprintln!("run: {}: {} B does not fit in one heap chunk", full, size);
+                return;
+            }
+            image.resize(size as usize, 0);
+            let mut offset = 0usize;
+            while offset < image.len() {
+                match node.read(offset as u64, &mut image[offset..]) {
+                    Ok(0) => break,
+                    Ok(read) => offset += read,
+                    Err(error) => return print_error("run", &full, error),
+                }
+            }
+            if offset != image.len() {
+                image.truncate(offset);
+            }
+            run_one(&image, path);
+        }
+    }
+}
+
+/// Load one image, run it to completion and print the result in the stable
+/// `run:` shape the shell tests grep.
+fn run_one(image: &[u8], name: &str) {
+    match crate::user::run_image(image, name) {
+        Ok(exit) => crate::kprintln!("run: {} {}", name, exit),
+        Err(error) => crate::kprintln!("run: {}: {}", name, error),
     }
 }

@@ -10,7 +10,7 @@
   <img alt="Target: riscv64gc-unknown-none-elf" src="https://img.shields.io/badge/target-riscv64gc--unknown--none--elf-blue.svg">
   <img alt="no_std" src="https://img.shields.io/badge/%23!%5Bno__std%5D-yes-informational.svg">
   <img alt="Boot: OpenSBI S-mode" src="https://img.shields.io/badge/boot-OpenSBI%20S--mode-purple.svg">
-  <img alt="Milestone: M1-M5, M6a done" src="https://img.shields.io/badge/milestone-M1%E2%80%93M5%2C%20M6a%20done-brightgreen.svg">
+  <img alt="Milestone: M1-M6 done" src="https://img.shields.io/badge/milestone-M1%E2%80%93M6%20done-brightgreen.svg">
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green.svg">
 </p>
 
@@ -24,10 +24,13 @@ machine, reads the machine description from the flattened device tree, allocates
 physical frames from a bitmap pool, serves `alloc` from a kernel heap that grows in
 64 KiB chunks, brings up a ramfb screen with an 8×18 coverage font next to the serial
 console, installs a trap vector that names its cause instead of resetting silently,
-and drops into an interactive serial shell with an in-kernel self-test. **These parts
-are verified on a live boot**; the timer, block devices, tasks and syscalls are
-*not implemented* and are listed plainly in
-[Чего нет](#чего-нет). The documentation is deliberately checkable: every claim in
+and drops into an interactive serial shell with an in-kernel self-test. On top of
+that it has a 100 Hz timer, a PLIC-driven UART, a virtio-mmio disk with ext2/VFS,
+preemptive kernel threads and — since M6b — **user mode**: a static ELF runs with
+the `U` bit set, enters through `sret`, talks to the kernel through an `ecall`
+ABI and is killed (not the machine) when it faults. **All of these are verified on
+a live boot**; what is genuinely missing — per-process page tables, a journal,
+SMP, networking — is listed plainly in [Чего нет](#чего-нет). The documentation is deliberately checkable: every claim in
 [`docs/architecture.md`](docs/architecture.md) cites the file and line it comes from,
 and the CI smoke test asserts the exact boot log this README shows.
 
@@ -58,6 +61,13 @@ ext2 смонтирован в `/mnt`; `ls`/`cat`/`stat` работают, `disk
 (id, имя, состояние, переключения, счётчик работы, стек), `yield 48` прогнал тики
 и переключения; `idle` держит hart в `wfi`, счётчики демо-потоков растут и без
 единого `yield`, потому что тик таймера вытесняет их из trap-контекста.
+
+User mode M6b: `run demo` исполняет статический ELF в U-mode (`write`,
+`sched_yield`, `exit(42)`), `run fault` намеренно падает по load page fault —
+ядро печатает причину и **оставляет машину живой**, `run spin` крутится в U-mode
+0.2 с, чтобы таймер успел вытеснить задачу, и выходит с кодом 7.
+
+![user mode: run demo, run fault, run spin](docs/user.png)
 
 ![Потоки ядра: spawn, tasks, yield](docs/tasks.png)
 
@@ -150,24 +160,24 @@ SELFTEST SUMMARY: 6/6 passed
 | Подсистема | Статус | Что именно есть | Где |
 |---|---|---|---|
 | Загрузка | готово | `_start` ставит стек и вызывает `kmain(a0, a1)`; OpenSBI запускает ровно один hart (id не обязательно 0), остальные держит остановленными | `src/arch/riscv64/boot.rs` |
-| Модель привилегий | готово | S-mode под OpenSBI, M-mode не трогаем; выключение через SBI SRST | `src/arch/riscv64/sbi.rs` |
-| Device tree | частично | только `/memory` (`reg`) и `/cpus:timebase-frequency`; ошибка разбора фатальна | `src/fdt.rs` |
-| Ловушки | частично | `stvec` → `trap_entry` → диспетчер: называет причину и останавливает hart; восстановления после исключения нет | `src/arch/riscv64/traps.rs` |
+| Модель привилегий | готово | S-mode под OpenSBI, M-mode не трогаем; U-mode для user-программ через `sret` (`SPP=0`), выключение через SBI SRST | `src/arch/riscv64/{sbi,traps}.rs`, `src/user/mod.rs` |
+| Device tree | готово | пять вопросов: `/memory`, `timebase-frequency`, окна `virtio,mmio`, PLIC `reg`, UART `interrupts`; ошибка разбора фатальна | `src/fdt.rs` |
+| Ловушки | готово | `stvec` → `trap_entry` (обмен `sscratch` различает U/S), диспетчер: прерывания возвращаются, исключение из S-mode печатает и паркует hart, исключение из U-mode завершает только задачу | `src/arch/riscv64/traps.rs`, `src/user/mod.rs` |
 | Консоль | готово | NS16550 по `0x1000_0000`, 8N1; приём — по прерыванию PLIC в кольцевой буфер (polled-путь остаётся запасным), передача по-прежнему polled; один текстовый поток — два стока | `src/drivers/uart.rs`, `src/console.rs` |
 | Экран | готово | ramfb 1280×800, stride 5120, сетка 100×37, шрифт покрытия 8×18, статус-бар; кадр отдаётся на каждый `kprint!` | `src/drivers/{fw_cfg,ramfb,framebuffer}.rs` |
-| Шелл | готово | редактор строки (строки длиннее 128 байт отклоняются целиком, а не обрезаются), `wfi`-ожидание ввода; команды памяти/диска/ФС, `sleep`, `time`, `halt` (полный список — в таблице ниже) | `src/shell.rs` |
+| Шелл | готово | редактор строки (строки длиннее 128 байт отклоняются целиком, а не обрезаются), `wfi`-ожидание ввода; команды памяти/диска/ФС, `run <path>|demo|fault|spin`, `sleep`, `time`, `halt` (полный список — в таблице ниже) | `src/shell.rs`, `src/user/mod.rs` |
 | Физическая память (PMM) | готово | битовая карта 4 KiB-кадров окна 8 GiB (покрывает QEMU `virt` с RAM выше 4 GiB), `set = свободен`, выделение одиночное и непрерывным блоком | `src/memory/pmm.rs` |
 | Куча ядра, `alloc` | готово | `#[global_allocator]` поверх PMM-кадров: чанки по 64 KiB, free-list, целиком свободный чанк возвращается в PMM; `Vec` проверен `selftest` | `src/memory/{heap,selftest}.rs` |
-| Страницы (Sv39) | готово (ядро) | identity-карта 4 KiB-страниц, `satp` включён: `[RAM base, __kernel_end)` RWX, выше — RW **без X**, страница UART RW; таблицы берутся из PMM, пустые возвращаются при `unmap`. Пользовательских адресных пространств нет | `src/memory/paging.rs`, `src/arch/riscv64/mmu.rs` |
+| Страницы (Sv39) | готово | identity-карта 4 KiB-страниц, `satp` включён: `[RAM base, __kernel_end)` RWX, выше — RW **без X**, страницы устройств RW без U; таблицы берутся из PMM, пустые возвращаются при `unmap`. User-страницы живут в этой же карте с `U=1`; отдельного `satp` на процесс нет | `src/memory/paging.rs`, `src/arch/riscv64/mmu.rs`, `src/user/elf.rs` |
 | Таймер | готово | тик 100 Гц через SBI TIME: абсолютный дедлайн (+10 мс на прерывание, без накопления дрейфа), `sie.STIE`, `sleep`/`uptime` в тиках; холостой цикл — `wfi` | `src/arch/riscv64/timer.rs` |
 | Прерывания / PLIC | готово | PLIC из DTB (`riscv,plic0`), контекст S-mode, UART source из DTB (10 на QEMU `virt`), claim/complete, счётчики и `overrun`; диспетчер различает timer/external и возвращается через `sret` | `src/arch/riscv64/plic.rs`, `src/arch/riscv64/traps.rs` |
 | Блочное устройство | готово | virtio-mmio (modern virtio 1.x, version 2), polled: окна транспорта находятся через DTB, read/write/flush, опрос завершения с ограничением и FAILED после таймаута; `-global virtio-mmio.force-legacy=false` обязателен (иначе QEMU даёт legacy-транспорт) | `src/drivers/block.rs`, `src/drivers/virtio_mmio.rs` |
 | Файловая система (ext2) | готово | чтение/запись файлов (direct + single/double indirect), truncate, каталоги, create/unlink/mkdir/rmdir/rename, симлинки; совместимо с образом хостового `mkfs.ext2 -t ext2`; форматируется только пустое устройство (MBR/GPT/чужие данные — отказ с причиной); журнала/WAL нет | `src/fs/ext2/`, `src/fs/format_policy.rs` |
 | VFS | готово | `VfsNode`, синтетический корень, монтирование в `/mnt`, два примитива разрешения путей (`lookup_path` без последней симлинки / `walk` с переходом и бюджетом) | `src/vfs/mod.rs` |
-| Планировщик, потоки ядра (M6a) | готово | контекстный switch (callee-saved ABI), до 8 потоков, round-robin, квант 8 тиков, стек 16 KiB + guard из PMM, вытеснение тиком таймера из trap-контекста, `tasks`/`spawn`/`yield`; exit возвращает кадры | `src/arch/riscv64/switch.rs`, `src/task/` |
-| User mode, syscalls, ELF (M6b) | **нет** | — | M6b, план: U-бит в карте, `sret` в U-mode, `ecall`-диспетчер, ELF-загрузчик |
+| Планировщик, потоки ядра (M6a) | готово | контекстный switch (callee-saved ABI), до 8 потоков, round-robin, квант 8 тиков, стек 16 KiB + guard из PMM, вытеснение тиком таймера из trap-контекста (включая вытеснение U-mode), `tasks`/`spawn`/`yield`; exit возвращает кадры | `src/arch/riscv64/switch.rs`, `src/task/` |
+| User mode, syscalls, ELF (M6b) | готово | `sret` в U-mode (`SPP=0`, `SPIE=1`, `SUM=0`, `sscratch`-контракт), `ecall`-диспетчер Linux/RISC-V (`write`/`exit`/`sched_yield`/`getpid`, `sepc+4`, проверка user-указателей, `SUM` вокруг копии), ELF64-загрузчик с откатом кадров, `run <path>|demo|fault|spin`, fault из U убивает только задачу; таймер вытесняет U-mode | `src/user/`, `userland/` |
 | Сеть, пакеты, apt | **нет** | есть в [x86-репозитории](https://github.com/ccclosed/Pagh-OS), сюда не портируется | — |
-| Тесты | частично | host-тестов нет; in-QEMU `selftest` — 7 памяти + 3 блочного слоя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика (идемпотентность по ledger'у свободных кадров), QEMU-smoke в четырёх режимах (serial, ramfb, диск-fresh, диск-existing) и проверка пикселей `tools/font_check.py` | `src/memory/selftest.rs`, `src/drivers/selftest.rs`, `src/fs/selftest.rs`, `src/arch/riscv64/selftest.rs`, `src/task/selftest.rs`, `.github/smoke.py`, `tools/` |
+| Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 3 блочного слоя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 7 user-mode (идемпотентность по ledger'у свободных кадров), QEMU-smoke в четырёх режимах (serial, ramfb, диск-fresh, диск-existing) и проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/user/selftest.rs`, `.github/smoke.py`, `tools/` |
 | CI | готово | `fmt`, debug/release build, QEMU-smoke (serial, ramfb, и приёмка M5: пустой диск → формат/монтирование/запись, повторная загрузка того же образа читает файл) | `.github/workflows/ci.yml` |
 
 ---
@@ -217,6 +227,16 @@ python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb   
 python3 tools/run.py --keys "help\n" --shot /tmp/shot.png --check-font          # пиксели против ассета
 ```
 
+M6b вживую (те же команды понимает шелл):
+
+```sh
+# после prompt'а pagh:rv64>
+run demo        # hello from user mode + run: demo exited with code 42
+run fault       # [user] fault killed: load page fault ... ; шелл жив
+run spin        # 0.2 s в U-mode (таймер вытесняет) -> exit 7
+selftest        # + SELFTEST user-*: 7/7
+```
+
 ### Как управлять шеллом
 
 Промпт `pagh:rv64> `, строка до 128 байт (более длинная отвергается целиком),
@@ -226,7 +246,7 @@ backspace работает, всё остальное — команды:
 |---|---|
 | `help` | список команд |
 | `mem` | память из device tree **и** статистика PMM и кучи (свободно/всего кадров, диапазон пула, байты кучи) |
-| `selftest` | in-QEMU self-tests: 7 проверок памяти, 3 блочного слоя, 11 ext2/VFS; печатает ledger свободных кадров до и после прогона |
+| `selftest` | in-QEMU self-tests: 7 памяти, 3 блочного слоя, 11 ext2/VFS, 4 таймера/PLIC, 5 планировщика, 7 user-mode; печатает ledger свободных кадров до и после каждого блока |
 | `disk` | блочное устройство: имя, ёмкость, живая проверка чтения сектора 0 |
 | `ls [path]` | листинг каталога (каталоги с `/`) |
 | `cat <path>` | содержимое файла |
@@ -238,6 +258,8 @@ backspace работает, всё остальное — команды:
 | `cp <src> <dst>` / `mv <src> <dst>` | копировать / переименовать |
 | `ln [-s] <target> <path>` | жёсткая или символическая ссылка |
 | `ramdisk [sectors]` | **только для тестов**: отформатировать RAM-диск и смонтировать его в `/mnt` |
+| `run <path>` | исполнить статический RV64 ELF из VFS в U-mode (файл грузится в heap-буфер, ≤ одного 64 KiB-чанка) |
+| `run demo` / `run fault` / `run spin` | встроенные фикстуры: hello (exit 42), падение по load page fault (задача убита, машина жива), 0.2 s спина в U-mode (exit 7) |
 | `time` | два счётчика: CSR `time` (аппаратный) и тики ядра; uptime, число прерываний таймера, статистика PLIC/UART |
 | `hart` | id hart'а, на котором работает ядро |
 | `echo <text>` | печатает текст (слова через один пробел) |
@@ -307,11 +329,11 @@ backspace работает, всё остальное — команды:
 | # | Майлстоун | Статус |
 |---|---|---|
 | M1 | Загрузка под OpenSBI, DTB, ловушки, UART-консоль и шелл | **готов** |
-| M2 | Физический аллокатор кадров, Sv39, куча ядра, `alloc` | **готов** (identity Sv39 с W^X, куча и `alloc`; page-fault ловушки — задел M6) |
-| M3 | Таймер через SBI, PLIC, консоль на прерываниях | план |
+| M2 | Физический аллокатор кадров, Sv39, куча ядра, `alloc` | **готов** (identity Sv39 с W^X, куча и `alloc`; page-fault ловушки — M6b для U-mode) |
+| M3 | Таймер через SBI, PLIC, консоль на прерываниях | **готов** (100 Гц, PLIC, UART RX в кольцо) |
 | M4 | ramfb + шрифт покрытия Fira Code, съёмка скриншотов | **готов** (экран, шрифт и снимок проверены) |
 | M5 | virtio-mmio блочное устройство, ext2, VFS | **готов** (virtio-mmio, ext2 rw + формат пустого диска, VFS, шелл-команды; журнала нет) |
-| M6 | Задачи, syscalls, Linux-compat-слой из x86-ветки | M6a (планировщик и потоки) — **готов**; M6b (user mode, syscalls, ELF) — план |
+| M6 | Задачи, syscalls, Linux-compat-слой из x86-ветки | M6a (планировщик/потоки) — **готов**; M6b (user mode, syscalls, ELF) — **готов**; Linux-compat — нет |
 
 Что считается «сделано» для каждого майлстоуна и что в него не входит —
 [`docs/roadmap.md`](docs/roadmap.md).
@@ -323,44 +345,31 @@ backspace работает, всё остальное — команды:
 Этот список — часть документации, а не извинение. Если подсистемы здесь нет,
 значит её нет в коде.
 
-* **Нет пользовательских адресных пространств.** Sv39 включён, но карта одна и
-  только для ядра: identity, 4 KiB-страницы, без суперстраниц, без user-бита,
-  `satp.ASID = 0`; `map`/`unmap`/`translate` есть, VMM/mprotect/разделяемых
-  страниц нет. Куча и `alloc`
-  уже есть: `#[global_allocator]` поверх PMM-кадров (`src/memory/heap.rs`), так что
-  `Vec`, `String` и `Box` доступны и проверены `selftest`; буферы шелла пока
-  фиксированные. `Cargo.toml` не содержит ни одной зависимости.
-* **Нет таймера и прерываний.** `sie` не включается ни для одного источника;
-  `time` просто читает CSR. Ветка таймера в диспетчере — пустой `return`.
-* **Нет PLIC.** Внешнее прерывание печатает «not routed yet».
-* **Нет восстановления после исключения.** Любой сбой в ядре — печать и
-  остановка hart: продолжить безопасно нельзя, состояние осталось на месте.
-* **Экран есть только там, где есть устройство `ramfb`.** `run.sh` передаёт
-  `-device ramfb`, поэтому «из коробки» экран есть; QEMU без этого флага (и любая
-  другая машина) — это serial-консоль без экрана, и ядро говорит об этом в логе.
-  Шрифт — офлайн-растеризованный ассет `assets/font8x18.bin`; TrueType-парсера в
-  ядре нет, глифов вне ASCII тоже.
-* **Нет диска, ФС, VFS, задач, syscall'ов, userland, сети.** Ни файлов, ни
-  модулей.
-* **Нет host-тестов.** Логика ядра тестами не покрыта: `selftest` проверяет только
-  память (кадры, шаблон в кадре, куча), остальное — QEMU-smoke в двух режимах
-  (serial и ramfb) и сверка пикселей `tools/font_check.py`. Чистая логика
-  (`src/fdt.rs`) не покрыта ничем.
-* **Нет SMP.** Работает ровно один hart; остальные запаркованы в `_start`.
+* **Нет адресного пространства на процесс.** Sv39 включён, но карта одна:
+  identity для RAM, плюс user-окно с `U=1` (образ и стек) в той же таблице.
+  `satp.ASID = 0`, VMM/mprotect/разделяемых страниц нет; два user-процесса друг
+  от друга не защищены — только юзер от ядра. `run_image` держит «одна программа
+  за раз».
+* **Нет `fork`/`exec`, сигналов и динамического ELF.** Загрузчик понимает только
+  статические `ET_EXEC`/`ET_DYN` без интерпретатора; userland — голые `ecall`.
+  `run <path>` читает файл *ядром* и грузит его: отображения `/mnt` в адресное
+  пространство процесса как отдельной сущности нет.
+* **Нет журнала/WAL в ext2.** Сбой между двумя записями может оставить операцию
+  недоделанной; crash-consistency не заявляется.
+* **Один блочный слот, нет разделов/hot-plug.** Второй диск — изменение дизайна.
+* **Нет сети/apt.** Это осознанно не портируется с x86-ветки.
+* **Нет SMP.** Один hart, остальные запаркованы в `_start`; планировщик и локи
+  это предполагают.
+* **Нет восстановления после S-mode исключения.** Сбой в ядре — печать и
+  остановка hart. Сбой в U-mode (page fault, illegal instruction) завершает
+  только задачу.
+* **Нет host-тестов.** Логика ядра покрыта in-QEMU `selftest` и smoke-тестом;
+  чистая логика (`src/fdt.rs`) не покрыта ничем.
 * **Нет поддержки реального железа.** Адреса UART и `fw_cfg` захардкожены,
-  поддерживается только QEMU `virt` с `-kernel` + OpenSBI.
-* **Сборка даёт предупреждения** (неиспользуемые CSR-хелперы, мёртвый код,
+  поддержан только QEMU `virt` с `-kernel` + OpenSBI.
+* **Сборка даёт предупреждения** (неиспользуемые диагностические хелперы,
   приведение функции к числу в `traps.rs`); CI их не гейтит.
 * **LICENSE-файла нет**, хотя `Cargo.toml` объявляет MIT.
-
-Отдельно, как требование к следующему шагу: `uart::put_byte` берёт спинлок с
-включёнными прерываниями (`src/drivers/uart.rs:67-73`). Пока `sie` = 0, это
-безопасно; как только появится первый источник прерываний, критическую секцию
-нужно обернуть в `csr::without_interrupts`, иначе обработчик, печатающий в
-консоль, встанет на локе, который держит прерванный контекст. Разбор —
-`docs/architecture.md`, раздел 12.1.
-
----
 
 ## Устройство репозитория
 
@@ -376,6 +385,12 @@ src/fdt.rs                     минимальный читатель flattened
 src/memory/{mod,pmm}.rs        пул физических кадров (битовая карта 4 KiB)
 src/memory/heap.rs             куча: free-list поверх чанков по 64 KiB
 src/memory/selftest.rs         in-QEMU self-tests памяти (selftest)
+src/user/mod.rs                run_image: ELF -> user-стек -> задача -> sret в U-mode
+src/user/elf.rs                ELF64-загрузчик: валидация, PT_LOAD с U=1, откат кадров
+src/user/syscall.rs            ecall-диспетчер: write/exit/sched_yield/getpid, sepc+4
+src/user/selftest.rs           in-QEMU self-tests user mode (7 проверок)
+userland/{hello,fault,spin}.rs статические RV64-фикстуры + user.ld + build.sh
+userland/README.md             как пересобрать и что доказывает каждая фикстура
 src/memory/README.md           дизайн памяти: кадры, куча, чего нет
 src/drivers/uart.rs            NS16550, polled
 src/drivers/fw_cfg.rs          QEMU fw_cfg: селектор/данные + DMA
@@ -387,6 +402,7 @@ src/sync.rs                    один нереентерабельный сп�
 docs/architecture.md           загрузка, кадр ловушки, привилегии, карта памяти
 docs/roadmap.md                майлстоуны M1–M6 и их критерии
 docs/shell.png                 снимок экрана из работающего QEMU
+docs/user.png                  снимок run demo / run fault / run spin
 assets/font8x18.bin            шрифт покрытия 8×18 (8 бит на пиксель)
 tools/run.py                   запуск + screendump + проверка шрифта
 tools/gen_font.py              офлайн-растеризация шрифта в ассет

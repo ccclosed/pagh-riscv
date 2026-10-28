@@ -23,8 +23,8 @@ pub mod selftest;
 // `scheduler::` directly: they need internals (`check_stack`, `tick_from_timer`)
 // that are deliberately not part of this surface.
 pub use scheduler::{
-    snapshot, spawn_demo, stats, tick, timer_clock_attached, TaskInfo, GUARD_SIZE, MAX_TASKS,
-    QUANTUM_TICKS, STACK_SIZE,
+    snapshot, spawn, spawn_demo, stats, tick, timer_clock_attached, TaskInfo, GUARD_SIZE,
+    MAX_TASKS, QUANTUM_TICKS, STACK_SIZE,
 };
 
 /// Build the scheduler. Called once from `kmain`, after the PMM exists and after

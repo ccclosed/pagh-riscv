@@ -139,3 +139,18 @@ macro_rules! kprintln {
 pub fn sink() -> impl Write {
     ConsoleSink
 }
+
+/// Write raw bytes to both sinks.
+///
+/// This is the `write(2)` path: a user buffer is not a Rust `str` and may hold
+/// any byte. The UART gets the bytes verbatim; the screen runs them through the
+/// same ANSI filter as kernel output, then flushes once so one syscall is one
+/// frame.
+pub fn write_bytes(bytes: &[u8]) {
+    for &byte in bytes {
+        uart::put_byte(byte);
+    }
+    if framebuffer_enabled() {
+        framebuffer::write_bytes(bytes);
+    }
+}

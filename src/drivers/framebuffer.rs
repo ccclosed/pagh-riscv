@@ -842,6 +842,19 @@ impl FbWriter {
             writer.flush();
         }
     }
+
+    /// Append bytes that are not necessarily UTF-8 (a user program's `write`
+    /// buffer) and push the frame. Each byte goes through the same ANSI filter
+    /// and cell placement as `write_str`; the flush makes one `write` syscall one
+    /// visible frame, the same boundary a `kprint!` has.
+    fn write_bytes(&self, bytes: &[u8]) {
+        if let Some(writer) = self.inner.lock().as_mut() {
+            for &byte in bytes {
+                writer.write_byte(byte);
+            }
+            writer.flush();
+        }
+    }
 }
 
 static FB_WRITER: FbWriter = FbWriter::new();
@@ -916,6 +929,16 @@ fn text_rows_for(height: usize) -> usize {
 /// frame is pushed by [`_print`] once per formatted call.
 pub fn write_str(s: &str) {
     FB_WRITER.write_str(s);
+}
+
+/// Append raw bytes and push the frame.
+///
+/// The console's [`write_bytes`](crate::console::write_bytes) path uses this for
+/// a user program's `write(2)` buffer, which may contain any byte and is not a
+/// Rust `str`. One call is one frame, matching `write_str`'s contract for kernel
+/// output.
+pub fn write_bytes(bytes: &[u8]) {
+    FB_WRITER.write_bytes(bytes);
 }
 
 /// Print formatted text into the framebuffer and push the frame.

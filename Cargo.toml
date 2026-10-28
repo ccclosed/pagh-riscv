@@ -1,6 +1,6 @@
 [package]
 name = "pagh"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "pagh OS — a 64-bit RISC-V (RV64) kernel in Rust"
 license = "MIT"

@@ -61,12 +61,34 @@ global_asm!(
     .align 4
     .globl trap_entry
 trap_entry:
+    /* A trap from U-mode arrives with the user's `sp`; a trap from S-mode
+       arrives with the interrupted kernel stack. The two need different
+       treatment, and `sscratch` is the only register that can be read without
+       first having somewhere safe to save what is already in it.
+       Invariant: while S-mode runs `sscratch` is 0; before entering U-mode it
+       is set to the kernel stack pointer a trap may use.
+
+       From S-mode: `sp <- 0`, `sscratch <- interrupted sp`; the branch is not
+       taken and the second swap puts everything back. From U-mode: `sp <- the
+       kernel trap stack`, `sscratch <- the user sp`; the branch is taken. No
+       general-purpose register is used, so nothing has to be saved first. */
+    csrrw   sp, sscratch, sp
+    bnez    sp, .Ltrap_from_user
+    csrrw   sp, sscratch, sp
     addi    sp, sp, -264
+    sd      sp,   8(sp)             /* S-mode ABI: the slot keeps the frame base */
+    sd      t0,  32(sp)
+    j       .Ltrap_save
+.Ltrap_from_user:
+    addi    sp, sp, -264
+    sd      t0,  32(sp)             /* save the interrupted t0 before borrowing it */
+    csrr    t0, sscratch
+    sd      t0,   8(sp)             /* U-mode ABI: the slot keeps the user sp */
+    csrw    sscratch, zero          # S-mode must never look like a user context
+.Ltrap_save:
     sd      ra,   0(sp)
-    sd      sp,   8(sp)
     sd      gp,  16(sp)
     sd      tp,  24(sp)
-    sd      t0,  32(sp)
     sd      t1,  40(sp)
     sd      t2,  48(sp)
     sd      s0,  56(sp)
@@ -108,7 +130,8 @@ trap_entry:
     ld      ra,   0(sp)
     ld      gp,  16(sp)
     ld      tp,  24(sp)
-    ld      t0,  32(sp)
+    /* t0 is deliberately deferred: the return-to-U path needs one scratch
+       register after every other register has been restored. */
     ld      t1,  40(sp)
     ld      t2,  48(sp)
     ld      s0,  56(sp)
@@ -135,6 +158,22 @@ trap_entry:
     ld      t4, 224(sp)
     ld      t5, 232(sp)
     ld      t6, 240(sp)
+
+    /* SPP in the *restored* sstatus says where `sret` is about to go. S-mode:
+       the frame base arithmetic is the old epilogue. U-mode: re-arm sscratch
+       with the kernel trap stack (frame base + 264), fetch the user `sp` from
+       the frame slot, and restore the deferred t0 through the negative offset
+       before `sp` stops pointing at the frame. */
+    csrr    t0, sstatus
+    andi    t0, t0, 0x100
+    bnez    t0, .Ltrap_return_supervisor
+    addi    sp, sp, 264
+    csrw    sscratch, sp
+    ld      t0, -232(sp)            /* frame + 32: interrupted t0 */
+    ld      sp, -256(sp)            /* frame + 8: interrupted user sp */
+    sret
+.Ltrap_return_supervisor:
+    ld      t0,  32(sp)
     addi    sp, sp, 264
     sret
 "#
@@ -143,15 +182,48 @@ trap_entry:
 /// Cause codes this kernel knows by name (`scause`).
 pub const CAUSE_ILLEGAL_INSTRUCTION: usize = 2;
 pub const CAUSE_BREAKPOINT: usize = 3;
+pub const CAUSE_ECALL_FROM_USER: usize = 8;
+pub const CAUSE_INSTRUCTION_PAGE_FAULT: usize = 12;
 pub const CAUSE_LOAD_PAGE_FAULT: usize = 13;
 pub const CAUSE_STORE_PAGE_FAULT: usize = 15;
 pub const CAUSE_INTERRUPT_BIT: usize = 1 << 63;
 pub const CAUSE_SUPERVISOR_TIMER: usize = 5;
 pub const CAUSE_SUPERVISOR_EXTERNAL: usize = 9;
 
+/// The stable, greppable name of an exception cause.
+///
+/// One spelling for the S-mode print-and-park path and for `user::on_fault`'s
+/// one-line diagnostic; a reason string that differed between the two would make
+/// the serial log a poor witness of *which* user fault happened.
+pub fn cause_name(cause: usize) -> &'static str {
+    match cause {
+        CAUSE_ILLEGAL_INSTRUCTION => "illegal instruction",
+        CAUSE_BREAKPOINT => "breakpoint",
+        CAUSE_ECALL_FROM_USER => "ecall from U-mode",
+        CAUSE_INSTRUCTION_PAGE_FAULT => "instruction page fault",
+        CAUSE_LOAD_PAGE_FAULT => "load page fault",
+        CAUSE_STORE_PAGE_FAULT => "store page fault",
+        _ => "exception",
+    }
+}
+
 /// Bitmap of interrupt causes already reported as unhandled (bit = cause & 63),
 /// so a source nobody expects names itself once instead of flooding the console.
 static UNHANDLED_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
+
+/// Timer interrupts taken while the *saved* `sstatus.SPP` says U-mode.
+///
+/// This is the evidence the user-mode self-test needs: a `sret` into U-mode, a
+/// preemption there and a return through the U-mode epilogue cannot be observed
+/// from the program itself. Incremented only in the timer branch, before the
+/// scheduler is entered; plain relaxed ordering is enough because it is a
+/// counter read by the same hart that increments it.
+static USER_TIMER_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
+
+/// How many timer interrupts have been taken from U-mode so far.
+pub fn user_timer_ticks() -> u64 {
+    USER_TIMER_INTERRUPTS.load(Ordering::Relaxed)
+}
 
 /// Install `trap_entry` as the trap vector and enable supervisor interrupts.
 ///
@@ -159,7 +231,12 @@ static UNHANDLED_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
 /// the driver that owns a source enables its bit *after* it has programmed the
 /// source (see `timer::init`, `plic::init`). That ordering is the whole reason
 /// `SIE` can be set here, early, without a race.
+///
+/// `sscratch` is cleared before the door opens: the trap entry treats a nonzero
+/// value as "the interrupted context was U-mode", and firmware's leftover value
+/// would make the first S-mode trap try to switch to a stack that does not exist.
 pub fn init() {
+    crate::arch::riscv64::csr::write_sscratch(0);
     crate::arch::riscv64::csr::write_stvec(trap_entry as usize);
     crate::arch::riscv64::csr::enable_interrupts();
 }
@@ -184,7 +261,14 @@ pub extern "C" fn trap_dispatch(frame: *mut TrapFrame) {
             // The timer is acknowledged by pointing firmware at the next absolute
             // deadline; there is no separate EOI. Everything the handler does is
             // bounded and silent (see `timer::on_tick` for the contract).
-            CAUSE_SUPERVISOR_TIMER => crate::arch::riscv64::timer::on_tick(),
+            CAUSE_SUPERVISOR_TIMER => {
+                // Saved SPP is the only provenance: 0 means the interrupt was
+                // taken while U-mode ran, which is what the spin fixture proves.
+                if frame.sstatus & crate::arch::riscv64::csr::SSTATUS_SPP == 0 {
+                    USER_TIMER_INTERRUPTS.fetch_add(1, Ordering::Relaxed);
+                }
+                crate::arch::riscv64::timer::on_tick()
+            }
             // Claim, dispatch and complete; silent and bounded (see `plic`).
             CAUSE_SUPERVISOR_EXTERNAL => crate::arch::riscv64::plic::handle_external_interrupt(),
             _ => {
@@ -198,17 +282,26 @@ pub extern "C" fn trap_dispatch(frame: *mut TrapFrame) {
             }
         }
         // Only an interrupt returns: the epilogue below is `sret`, restoring the
-        // interrupted context exactly where it stopped.
+        // interrupted context exactly where it stopped. This includes an
+        // interrupt taken while U-mode ran — the frame's `SPP = 0` makes the
+        // epilogue restore the user `sp` and `sscratch`.
         return;
     }
 
-    let name = match scause {
-        CAUSE_ILLEGAL_INSTRUCTION => "illegal instruction",
-        CAUSE_BREAKPOINT => "breakpoint",
-        CAUSE_LOAD_PAGE_FAULT => "load page fault",
-        CAUSE_STORE_PAGE_FAULT => "store page fault",
-        _ => "exception",
-    };
+    // Synchronous exception. The saved SPP is the only reliable provenance:
+    // hardware has already overwritten the live CSR. User faults are not kernel
+    // faults — they end one task, not the machine — so they are the one class of
+    // exception the dispatcher does *not* print-and-park.
+    if frame.sstatus & crate::arch::riscv64::csr::SSTATUS_SPP == 0 {
+        if scause == CAUSE_ECALL_FROM_USER {
+            crate::user::syscall::dispatch(frame);
+        } else {
+            crate::user::on_fault(scause, sepc, stval);
+        }
+        return;
+    }
+
+    let name = cause_name(scause);
     // Serial only from here on: the exception may have been taken while the
     // framebuffer's writer lock was held (a fault inside the screen code), and a
     // console write that tried to draw would deadlock instead of logging.

@@ -24,6 +24,7 @@ mod memory;
 mod shell;
 mod sync;
 mod task;
+mod user;
 mod vfs;
 
 use alloc::sync::Arc;

@@ -29,6 +29,7 @@ python3 tools/run.py --shot /tmp/riscv-shell.png
 ```sh
 python3 tools/run.py --keys "help\n" --shot /tmp/riscv-help.png
 python3 tools/run.py --keys "clear\n" --shot /tmp/riscv-clear.png
+python3 tools/run.py --keys "run demo\nrun fault\n" --shot /tmp/riscv-user.png --check-font
 python3 tools/run.py --attach --keys "mem\n" --shot /tmp/riscv-mem.png   # к уже запущенному QEMU
 python3 tools/run.py --help
 ```
@@ -93,6 +94,10 @@ python3 tools/run.py --keys "clear\n" --shot /tmp/riscv-clear.png \
 * `docs/shell.png` — консоль с `help` (снимается тем же `run.py`, см. выше);
 * `docs/fs.png` — `DISK`-образ: `ls /mnt`, `disk`, `cat`, `stat`;
 * `docs/tasks.png` — `spawn 3`, `tasks`, `yield 48`: таблица потоков и счётчики;
+* `docs/user.png` — M6b: `run demo` (hello + exit 42), `run fault` (killed, машина
+  жива), `run spin` (0.2 s в U-mode, exit 7); снимается
+  `python3 tools/run.py --keys "run demo\nrun fault\nrun spin\n" --shot docs/user.png
+  --check-font --expect "run: demo exited with code 42" --scan-all`;
 * статус-бар внизу: слева `pagh OS  RISC-V (RV64)`, справа `ramfb 1280x800`;
 * текст занимает 100×37 клеток, ниже — чёрная полоса, затем бар (раскладка
   x86-версии, см. `src/drivers/README.md`);

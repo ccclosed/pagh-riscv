@@ -47,6 +47,22 @@ write_csr!(write_sstatus, "sstatus");
 
 /// Supervisor interrupt-enable bit in `sstatus`.
 pub const SSTATUS_SIE: usize = 1 << 1;
+/// Supervisor previous-privilege-interrupt-enable bit in `sstatus`. `sret`
+/// copies it into `SIE`; user entry sets it so U-mode runs with interrupts on.
+pub const SSTATUS_SPIE: usize = 1 << 5;
+/// Supervisor previous-privilege bit in `sstatus`: 0 = U-mode, 1 = S-mode.
+///
+/// The trap handler's one test of "did this trap come from user code?" is the
+/// **saved** `sstatus.SPP` in the trap frame, never the live CSR: by the time
+/// the dispatcher runs the hardware has already overwritten the live value with
+/// the trap's own provenance (and a nested trap would overwrite it again).
+pub const SSTATUS_SPP: usize = 1 << 8;
+/// Permit supervisor accesses to pages whose leaf entry has `U=1`.
+///
+/// The kernel uses this around the copy in a `write` syscall and nowhere else:
+/// with `SUM` clear, an errant kernel pointer into user memory is a page fault
+/// rather than a silent read, which is the cheap half of pointer validation.
+pub const SSTATUS_SUM: usize = 1 << 18;
 /// Supervisor timer interrupt-enable bit in `sie`/`sip`.
 pub const SIE_STIE: usize = 1 << 5;
 /// Supervisor external interrupt-enable bit in `sie`/`sip`.

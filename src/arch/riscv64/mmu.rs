@@ -120,6 +120,22 @@ impl Flags {
         Flags(PTE_V | PTE_R | PTE_W | PTE_G | PTE_A | PTE_D)
     }
 
+    /// User read/write, no execute: a user stack or a writable data page.
+    ///
+    /// `U` makes the page reachable from U-mode; the kernel's own pages never
+    /// carry it, which is what keeps a user program out of the kernel despite
+    /// the single address space (see `memory::paging`). `G` is deliberately
+    /// clear: a user page belongs to one address space, not to every ASID, and
+    /// this kernel has exactly one ASID anyway.
+    pub const fn user_rw() -> Self {
+        Flags(PTE_V | PTE_R | PTE_W | PTE_U | PTE_A | PTE_D)
+    }
+
+    /// User read/execute, no write: a user text/rodata page.
+    pub const fn user_rx() -> Self {
+        Flags(PTE_V | PTE_R | PTE_X | PTE_U | PTE_A | PTE_D)
+    }
+
     /// Device MMIO: read/write, global, never executable.
     ///
     /// A device register file has no business being an instruction, and the
