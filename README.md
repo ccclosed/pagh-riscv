@@ -165,7 +165,7 @@ SELFTEST SUMMARY: 6/6 passed
 | Ловушки | готово | `stvec` → `trap_entry` (обмен `sscratch` различает U/S), диспетчер: прерывания возвращаются, исключение из S-mode печатает и паркует hart, исключение из U-mode завершает только задачу | `src/arch/riscv64/traps.rs`, `src/user/mod.rs` |
 | Консоль | готово | NS16550 по `0x1000_0000`, 8N1; приём — по прерыванию PLIC в кольцевой буфер (polled-путь остаётся запасным), передача по-прежнему polled; один текстовый поток — два стока | `src/drivers/uart.rs`, `src/console.rs` |
 | Экран | готово | ramfb 1280×800, stride 5120, сетка 100×37, шрифт покрытия 8×18, статус-бар; кадр отдаётся на каждый `kprint!` | `src/drivers/{fw_cfg,ramfb,framebuffer}.rs` |
-| Шелл | готово | редактор строки (строки длиннее 128 байт отклоняются целиком, а не обрезаются), `wfi`-ожидание ввода; команды памяти/диска/ФС, `run <path>|demo|fault|spin`, `sleep`, `time`, `halt` (полный список — в таблице ниже) | `src/shell.rs`, `src/user/mod.rs` |
+| Шелл | готово | редактор строки (строки длиннее 128 байт отклоняются целиком, а не обрезаются), `wfi`-ожидание ввода; команды памяти/диска/ФС, `run <path>`, `run demo` / `run fault` / `run spin`, `sleep`, `time`, `halt` (полный список — в таблице ниже) | `src/shell.rs`, `src/user/mod.rs` |
 | Физическая память (PMM) | готово | битовая карта 4 KiB-кадров окна 8 GiB (покрывает QEMU `virt` с RAM выше 4 GiB), `set = свободен`, выделение одиночное и непрерывным блоком | `src/memory/pmm.rs` |
 | Куча ядра, `alloc` | готово | `#[global_allocator]` поверх PMM-кадров: чанки по 64 KiB, free-list, целиком свободный чанк возвращается в PMM; `Vec` проверен `selftest` | `src/memory/{heap,selftest}.rs` |
 | Страницы (Sv39) | готово | identity-карта 4 KiB-страниц, `satp` включён: `[RAM base, __kernel_end)` RWX, выше — RW **без X**, страницы устройств RW без U; таблицы берутся из PMM, пустые возвращаются при `unmap`. User-страницы живут в этой же карте с `U=1`; отдельного `satp` на процесс нет | `src/memory/paging.rs`, `src/arch/riscv64/mmu.rs`, `src/user/elf.rs` |
@@ -175,8 +175,8 @@ SELFTEST SUMMARY: 6/6 passed
 | Файловая система (ext2) | готово | чтение/запись файлов (direct + single/double indirect), truncate, каталоги, create/unlink/mkdir/rmdir/rename, симлинки; совместимо с образом хостового `mkfs.ext2 -t ext2`; форматируется только пустое устройство (MBR/GPT/чужие данные — отказ с причиной); журнала/WAL нет | `src/fs/ext2/`, `src/fs/format_policy.rs` |
 | VFS | готово | `VfsNode`, синтетический корень, монтирование в `/mnt`, два примитива разрешения путей (`lookup_path` без последней симлинки / `walk` с переходом и бюджетом) | `src/vfs/mod.rs` |
 | Планировщик, потоки ядра (M6a) | готово | контекстный switch (callee-saved ABI), до 8 потоков, round-robin, квант 8 тиков, стек 16 KiB + guard из PMM, вытеснение тиком таймера из trap-контекста (включая вытеснение U-mode), `tasks`/`spawn`/`yield`; exit возвращает кадры | `src/arch/riscv64/switch.rs`, `src/task/` |
-| User mode, syscalls, ELF (M6b) | готово | `sret` в U-mode (`SPP=0`, `SPIE=1`, `SUM=0`, `sscratch`-контракт), `ecall`-диспетчер Linux/RISC-V (`write`/`exit`/`sched_yield`/`getpid`, `sepc+4`, проверка user-указателей, `SUM` вокруг копии), ELF64-загрузчик с откатом кадров, `run <path>|demo|fault|spin`, fault из U убивает только задачу; таймер вытесняет U-mode | `src/user/`, `userland/` |
-| Сеть, пакеты, apt | **нет** | есть в [x86-репозитории](https://github.com/ccclosed/Pagh-OS), сюда не портируется | — |
+| User mode, syscalls, ELF (M6b) | готово | `sret` в U-mode (`SPP=0`, `SPIE=1`, `SUM=0`, `sscratch`-контракт), `ecall`-диспетчер Linux/RISC-V (`write`/`exit`/`sched_yield`/`getpid`, `sepc+4`, проверка user-указателей, `SUM` вокруг копии), ELF64-загрузчик с откатом кадров, `run <path>` и фикстуры `demo`/`fault`/`spin`, fault из U убивает только задачу; таймер вытесняет U-mode | `src/user/`, `userland/` |
+| Сеть, пакеты, apt | в работе (M7) | сеть переносится с [x86-репозитория](https://github.com/ccclosed/Pagh-OS): virtio-net + свой стек; TLS/apt — после неё | — |
 | Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 3 блочного слоя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 7 user-mode (идемпотентность по ledger'у свободных кадров), QEMU-smoke в четырёх режимах (serial, ramfb, диск-fresh, диск-existing) и проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/user/selftest.rs`, `.github/smoke.py`, `tools/` |
 | CI | готово | `fmt`, debug/release build, QEMU-smoke (serial, ramfb, и приёмка M5: пустой диск → формат/монтирование/запись, повторная загрузка того же образа читает файл) | `.github/workflows/ci.yml` |
 
@@ -357,7 +357,7 @@ backspace работает, всё остальное — команды:
 * **Нет журнала/WAL в ext2.** Сбой между двумя записями может оставить операцию
   недоделанной; crash-consistency не заявляется.
 * **Один блочный слот, нет разделов/hot-plug.** Второй диск — изменение дизайна.
-* **Нет сети/apt.** Это осознанно не портируется с x86-ветки.
+* **Сети и apt пока нет.** Сеть — следующий майлстоун (M7): virtio-net и свой TCP/IP; TLS и apt появятся после неё. Это не «нельзя портировать», а порядок работ: порт держится проверяемыми майлстоунами.
 * **Нет SMP.** Один hart, остальные запаркованы в `_start`; планировщик и локи
   это предполагают.
 * **Нет восстановления после S-mode исключения.** Сбой в ядре — печать и
