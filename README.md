@@ -10,7 +10,7 @@
   <img alt="Target: riscv64gc-unknown-none-elf" src="https://img.shields.io/badge/target-riscv64gc--unknown--none--elf-blue.svg">
   <img alt="no_std" src="https://img.shields.io/badge/%23!%5Bno__std%5D-yes-informational.svg">
   <img alt="Boot: OpenSBI S-mode" src="https://img.shields.io/badge/boot-OpenSBI%20S--mode-purple.svg">
-  <img alt="Milestone: M1-M6 done" src="https://img.shields.io/badge/milestone-M1%E2%80%93M6%20done-brightgreen.svg">
+  <img alt="Milestone: M1-M7 done" src="https://img.shields.io/badge/milestone-M1%E2%80%93M7%20done-brightgreen.svg">
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green.svg">
 </p>
 
@@ -26,7 +26,8 @@ physical frames from a bitmap pool, serves `alloc` from a kernel heap that grows
 console, installs a trap vector that names its cause instead of resetting silently,
 and drops into an interactive serial shell with an in-kernel self-test. On top of
 that it has a 100 Hz timer, a PLIC-driven UART, a virtio-mmio disk with ext2/VFS,
-preemptive kernel threads and — since M6b — **user mode**: a static ELF runs with
+preemptive kernel threads, a virtio-net NIC with its own TCP/IP stack (DHCP, DNS,
+ICMP, a minimal TCP client) and — since M6b — **user mode**: a static ELF runs with
 the `U` bit set, enters through `sret`, talks to the kernel through an `ecall`
 ABI and is killed (not the machine) when it faults. **All of these are verified on
 a live boot**; what is genuinely missing — per-process page tables, a journal,
@@ -68,6 +69,12 @@ User mode M6b: `run demo` исполняет статический ELF в U-mod
 0.2 с, чтобы таймер успел вытеснить задачу, и выходит с кодом 7.
 
 ![user mode: run demo, run fault, run spin](docs/user.png)
+
+Сеть M7: `net` показывает MAC и DHCP-lease, `ping 10.0.2.2` проходит через
+собственный ARP/ICMP-путь, `dns example.com` разрешает имя через DNS из lease, а
+`http` открывает TCP-соединение собственным клиентом.
+
+![network: net, ping, dns](docs/net.png)
 
 ![Потоки ядра: spawn, tasks, yield](docs/tasks.png)
 
@@ -165,7 +172,7 @@ SELFTEST SUMMARY: 6/6 passed
 | Ловушки | готово | `stvec` → `trap_entry` (обмен `sscratch` различает U/S), диспетчер: прерывания возвращаются, исключение из S-mode печатает и паркует hart, исключение из U-mode завершает только задачу | `src/arch/riscv64/traps.rs`, `src/user/mod.rs` |
 | Консоль | готово | NS16550 по `0x1000_0000`, 8N1; приём — по прерыванию PLIC в кольцевой буфер (polled-путь остаётся запасным), передача по-прежнему polled; один текстовый поток — два стока | `src/drivers/uart.rs`, `src/console.rs` |
 | Экран | готово | ramfb 1280×800, stride 5120, сетка 100×37, шрифт покрытия 8×18, статус-бар; кадр отдаётся на каждый `kprint!` | `src/drivers/{fw_cfg,ramfb,framebuffer}.rs` |
-| Шелл | готово | редактор строки (строки длиннее 128 байт отклоняются целиком, а не обрезаются), `wfi`-ожидание ввода; команды памяти/диска/ФС, `run <path>`, `run demo` / `run fault` / `run spin`, `sleep`, `time`, `halt` (полный список — в таблице ниже) | `src/shell.rs`, `src/user/mod.rs` |
+| Шелл | готово | редактор строки (строки длиннее 128 байт отклоняются целиком, а не обрезаются), `wfi`-ожидание ввода; команды памяти/диска/ФС/сети, `run <path>`, `run demo` / `run fault` / `run spin`, `sleep`, `time`, `halt` (полный список — в таблице ниже) | `src/shell.rs`, `src/user/mod.rs`, `src/net/` |
 | Физическая память (PMM) | готово | битовая карта 4 KiB-кадров окна 8 GiB (покрывает QEMU `virt` с RAM выше 4 GiB), `set = свободен`, выделение одиночное и непрерывным блоком | `src/memory/pmm.rs` |
 | Куча ядра, `alloc` | готово | `#[global_allocator]` поверх PMM-кадров: чанки по 64 KiB, free-list, целиком свободный чанк возвращается в PMM; `Vec` проверен `selftest` | `src/memory/{heap,selftest}.rs` |
 | Страницы (Sv39) | готово | identity-карта 4 KiB-страниц, `satp` включён: `[RAM base, __kernel_end)` RWX, выше — RW **без X**, страницы устройств RW без U; таблицы берутся из PMM, пустые возвращаются при `unmap`. User-страницы живут в этой же карте с `U=1`; отдельного `satp` на процесс нет | `src/memory/paging.rs`, `src/arch/riscv64/mmu.rs`, `src/user/elf.rs` |
@@ -176,8 +183,9 @@ SELFTEST SUMMARY: 6/6 passed
 | VFS | готово | `VfsNode`, синтетический корень, монтирование в `/mnt`, два примитива разрешения путей (`lookup_path` без последней симлинки / `walk` с переходом и бюджетом) | `src/vfs/mod.rs` |
 | Планировщик, потоки ядра (M6a) | готово | контекстный switch (callee-saved ABI), до 8 потоков, round-robin, квант 8 тиков, стек 16 KiB + guard из PMM, вытеснение тиком таймера из trap-контекста (включая вытеснение U-mode), `tasks`/`spawn`/`yield`; exit возвращает кадры | `src/arch/riscv64/switch.rs`, `src/task/` |
 | User mode, syscalls, ELF (M6b) | готово | `sret` в U-mode (`SPP=0`, `SPIE=1`, `SUM=0`, `sscratch`-контракт), `ecall`-диспетчер Linux/RISC-V (`write`/`exit`/`sched_yield`/`getpid`, `sepc+4`, проверка user-указателей, `SUM` вокруг копии), ELF64-загрузчик с откатом кадров, `run <path>` и фикстуры `demo`/`fault`/`spin`, fault из U убивает только задачу; таймер вытесняет U-mode | `src/user/`, `userland/` |
-| Сеть, пакеты, apt | в работе (M7) | сеть переносится с [x86-репозитория](https://github.com/ccclosed/Pagh-OS): virtio-net + свой стек; TLS/apt — после неё | — |
-| Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 3 блочного слоя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 7 user-mode (идемпотентность по ledger'у свободных кадров), QEMU-smoke в четырёх режимах (serial, ramfb, диск-fresh, диск-existing) и проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/user/selftest.rs`, `.github/smoke.py`, `tools/` |
+| Сеть (M7) | готово | virtio-net (modern, polled) + свой стек: Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP-клиент, DNS-резолвер, `net`/`dhcp`/`ping`/`dns`/`http`; без smoltcp и внешних крейтов | `src/net/`, `src/drivers/virtio_net.rs` |
+| Пакеты, apt | **нет** | нужен TLS-стек (vendored `embedded-tls` + OpenPGP-проверка), как на x86; следующий майлстоун после сети | — |
+| Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 3 блочного слоя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 7 user-mode + 11 сети (идемпотентность по ledger'у свободных кадров), QEMU-smoke уже в пяти режимах (serial, ramfb, диск-fresh, диск-existing, net) и проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/net/selftest.rs`, `.github/smoke.py`, `tools/` |
 | CI | готово | `fmt`, debug/release build, QEMU-smoke (serial, ramfb, и приёмка M5: пустой диск → формат/монтирование/запись, повторная загрузка того же образа читает файл) | `.github/workflows/ci.yml` |
 
 ---
@@ -206,6 +214,12 @@ qemu-system-riscv64 -machine virt -m 256M -device ramfb \
 без `-device ramfb`, ядро остаётся serial-консолью и честно печатает
 `framebuffer  ramfb: no such fw_cfg item — serial console only`.
 
+Сеть включена по умолчанию: `run.sh` добавляет `-netdev user -device
+virtio-net-device`, ядро получает `10.0.2.15/24` по DHCP, шлюз `10.0.2.2`
+(он же loopback хоста, поэтому `http 10.0.2.2 <port>` достучится до слушателя на
+хосте) и DNS `10.0.2.3`. `NO_NET=1 ./run.sh` — машина без сетевой карты, путь
+«NIC отсутствует» тоже проверяется smoke-тестом.
+
 | Аргумент / переменная | По умолчанию | Смысл |
 |---|---|---|
 | `--window` | выключено | показать экран окном QEMU (`-display gtk`) |
@@ -214,6 +228,7 @@ qemu-system-riscv64 -machine virt -m 256M -device ramfb \
 | `MEMORY` | `256M` | объём RAM у `virt` |
 | `BIOS` | — (QEMU `-bios default`) | внешняя прошивка, например `BIOS=/path/opensbi.bin` |
 | `DISK` | — | образ virtio-mmio диска; отсутствующий создаётся пустым (64 MiB), пустой форматируется ядром и монтируется в `/mnt` |
+| `NO_NET` | `0` | `1` — не подключать virtio-net (проверка отсутствия NIC и старых сценариев) |
 
 Выход из QEMU — `Ctrl-A`, затем `X`. Изнутри гостя: команда `halt` (SBI SRST,
 машина действительно выключается, QEMU завершается с кодом 0).
@@ -260,6 +275,11 @@ backspace работает, всё остальное — команды:
 | `ramdisk [sectors]` | **только для тестов**: отформатировать RAM-диск и смонтировать его в `/mnt` |
 | `run <path>` | исполнить статический RV64 ELF из VFS в U-mode (файл грузится в heap-буфер, ≤ одного 64 KiB-чанка) |
 | `run demo` / `run fault` / `run spin` | встроенные фикстуры: hello (exit 42), падение по load page fault (задача убита, машина жива), 0.2 s спина в U-mode (exit 7) |
+| `net` | MAC, `ip/mask`, gateway, DNS и срок DHCP-lease |
+| `dhcp` | повторить DHCP-обмен (DISCOVER/OFFER/REQUEST/ACK) и напечатать новый lease |
+| `ping <ip> [n]` | до 4 ICMP echo через свой ARP/IPv4/ICMP-путь; печатает `seq`, время и итог |
+| `dns <name>` | A-запись через DNS-сервер из lease |
+| `http <ip> <port> <path>` | HTTP/1.0 GET через TCP-клиент; ответ печатается в консоль |
 | `time` | два счётчика: CSR `time` (аппаратный) и тики ядра; uptime, число прерываний таймера, статистика PLIC/UART |
 | `hart` | id hart'а, на котором работает ядро |
 | `echo <text>` | печатает текст (слова через один пробел) |
@@ -309,6 +329,13 @@ backspace работает, всё остальное — команды:
 и `fw_cfg` продублированы константами только потому, что консоль нужна раньше
 разбора (у обоих в коде написано, почему, и оба падают громко, а не молча).
 
+**Сеть.** `virtio_net` — тот же modern virtio-mmio (две очереди, polled), а над
+ним свой стек: `wire.rs` знает байты и контрольные суммы, `mod.rs` — ARP-кэш,
+IPv4, ICMP и UDP, а `dhcp`/`dns`/`tcp` — маленькие клиенты. Всё синхронно:
+`net::poll()` вызывается из сетевых команд и idle-цикла шелла, а ожидание —
+опрос до дедлайна в тиках, поэтому сеть не требует ни потока, ни прерывания.
+Детали и честные границы — [`src/net/README.md`](src/net/README.md).
+
 **Память.** Ядро линкуется на `0x8020_0000` (`linker.ld`), `.bss` — 8 МиБ:
 две поверхности экрана (тень и scanout), битовая карта PMM, стек 64 KiB и
 статики; `__kernel_end` выровнен на 4 KiB. `.bss` не обнуляется кодом ядра:
@@ -334,6 +361,7 @@ backspace работает, всё остальное — команды:
 | M4 | ramfb + шрифт покрытия Fira Code, съёмка скриншотов | **готов** (экран, шрифт и снимок проверены) |
 | M5 | virtio-mmio блочное устройство, ext2, VFS | **готов** (virtio-mmio, ext2 rw + формат пустого диска, VFS, шелл-команды; журнала нет) |
 | M6 | Задачи, syscalls, Linux-compat-слой из x86-ветки | M6a (планировщик/потоки) — **готов**; M6b (user mode, syscalls, ELF) — **готов**; Linux-compat — нет |
+| M7 | Сеть: virtio-net и свой TCP/IP-стек | **готов** (Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP, DNS, `net`/`ping`/`dns`/`http`; TLS/apt — следующий шаг) |
 
 Что считается «сделано» для каждого майлстоуна и что в него не входит —
 [`docs/roadmap.md`](docs/roadmap.md).
@@ -357,7 +385,14 @@ backspace работает, всё остальное — команды:
 * **Нет журнала/WAL в ext2.** Сбой между двумя записями может оставить операцию
   недоделанной; crash-consistency не заявляется.
 * **Один блочный слот, нет разделов/hot-plug.** Второй диск — изменение дизайна.
-* **Сети и apt пока нет.** Сеть — следующий майлстоун (M7): virtio-net и свой TCP/IP; TLS и apt появятся после неё. Это не «нельзя портировать», а порядок работ: порт держится проверяемыми майлстоунами.
+* **Нет TLS и apt.** Сеть есть (M7), но это `http`, а не `https`: TLS-стек и
+  OpenPGP-проверка Debian-метаданных (как на x86) — следующий майлстоун. До него
+  `apt` намеренно не подключается: «скачали и поставили без проверки» — это
+  ровно то, чего fail-closed apt не делает.
+* **TCP-клиент минимальный.** Одно active-open соединение, без
+  retransmission-таймера (кроме двух SYN), out-of-order reassembly, congestion
+  control и прослушивания портов; IPv6, фрагментация и несколько интерфейсов не
+  поддерживаются.
 * **Нет SMP.** Один hart, остальные запаркованы в `_start`; планировщик и локи
   это предполагают.
 * **Нет восстановления после S-mode исключения.** Сбой в ядре — печать и
@@ -389,6 +424,11 @@ src/user/mod.rs                run_image: ELF -> user-стек -> задача -
 src/user/elf.rs                ELF64-загрузчик: валидация, PT_LOAD с U=1, откат кадров
 src/user/syscall.rs            ecall-диспетчер: write/exit/sched_yield/getpid, sepc+4
 src/user/selftest.rs           in-QEMU self-tests user mode (7 проверок)
+src/net/mod.rs                 сетевой стек: poll, ARP-кэш, диспетчер кадров, ping
+src/net/wire.rs                чистые форматы Ethernet/ARP/IPv4/ICMP/UDP/TCP/DHCP/DNS
+src/net/{dhcp,dns,tcp}.rs      DHCP-клиент, DNS-резолвер, минимальный TCP-клиент
+src/net/selftest.rs            in-QEMU self-tests сети (11 проверок)
+src/net/README.md              дизайн стека: опрос, wire, DHCP/DNS/TCP, чего нет
 userland/{hello,fault,spin}.rs статические RV64-фикстуры + user.ld + build.sh
 userland/README.md             как пересобрать и что доказывает каждая фикстура
 src/memory/README.md           дизайн памяти: кадры, куча, чего нет
@@ -396,13 +436,15 @@ src/drivers/uart.rs            NS16550, polled
 src/drivers/fw_cfg.rs          QEMU fw_cfg: селектор/данные + DMA
 src/drivers/ramfb.rs           конфигурация устройства ramfb
 src/drivers/framebuffer.rs     текстовый экран: тень, шрифт, статус-бар
+src/drivers/virtio_net.rs      virtio-net: две очереди, polled, MAC, RX/TX-кадры
 src/console.rs                 kprint!/kprintln!: UART + экран
 src/shell.rs                   редактор строки и команды
 src/sync.rs                    один нереентерабельный спинлок
 docs/architecture.md           загрузка, кадр ловушки, привилегии, карта памяти
-docs/roadmap.md                майлстоуны M1–M6 и их критерии
+docs/roadmap.md                майлстоуны M1–M7 и их критерии
 docs/shell.png                 снимок экрана из работающего QEMU
 docs/user.png                  снимок run demo / run fault / run spin
+docs/net.png                   снимок net / ping / dns через собственный стек
 assets/font8x18.bin            шрифт покрытия 8×18 (8 бит на пиксель)
 tools/run.py                   запуск + screendump + проверка шрифта
 tools/gen_font.py              офлайн-растеризация шрифта в ассет
@@ -427,14 +469,18 @@ linker.ld                      один сегмент, точка входа _s
 | Release-сборка | `cargo build --locked --release` |
 | Дымовой тест: serial | `python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh` |
 | Дымовой тест: экран | `python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb` |
+| Дымовой тест: сеть | `python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --net` |
 
 Всё это выполняется в CI (`.github/workflows/ci.yml`) на запиненном nightly из
-`rust-toolchain.toml`: `fmt` и обе сборки — отдельными job'ами, два режима smoke —
-двумя шагами одного job'а. Режим `--ramfb` добавляет
-`-device ramfb`, так что поднятие экрана проверяется без дисплея. Smoke-тест ждёт
+`rust-toolchain.toml`: `fmt` и обе сборки — отдельными job'ами, а smoke-режимы —
+шагами одного job'а. `--ramfb` добавляет `-device ramfb`, так что поднятие экрана
+проверяется без дисплея; `--net` добавляет virtio-net на QEMU user network и
+проверяет DHCP, `net` и ping шлюза, не завися от интернета раннера. Smoke-тест ждёт
 баннер (UART очищает FIFO при инициализации, поэтому команды, отправленные
 раньше, теряются), шлёт `mem`, `hart`, `time`, `echo`, неизвестную команду,
 `help` и `halt`, и требует, чтобы после `halt` QEMU завершился с кодом 0.
+Сетевой режим шлёт `net`, `ping 10.0.2.2` и `halt` и требует строку
+`ping: reply from 10.0.2.2`.
 
 ## Родословная
 

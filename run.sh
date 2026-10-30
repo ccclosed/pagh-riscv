@@ -69,7 +69,18 @@ if [[ -n "${DISK:-}" ]]; then
   DISK_ARGS=(
     -drive "file=$DISK,format=raw,if=none,id=hd0"
     -device virtio-blk-device,drive=hd0
-    -global virtio-mmio.force-legacy=false
+  )
+fi
+
+# A virtio-mmio NIC on QEMU's user-mode network: DHCP, ping, DNS and the TCP
+# client work out of the box (10.0.2.15/24, gateway 10.0.2.2, DNS 10.0.2.3).
+# NO_NET=1 boots a machine without a network card, which is the absent path the
+# driver logs (and the smoke test's no-NIC modes rely on).
+NET_ARGS=()
+if [[ "${NO_NET:-0}" != "1" ]]; then
+  NET_ARGS=(
+    -netdev user,id=net0
+    -device virtio-net-device,netdev=net0
   )
 fi
 
@@ -79,7 +90,9 @@ exec qemu-system-riscv64 \
   -m "$MEMORY" \
   -kernel "$KERNEL" \
   -device ramfb \
+  -global virtio-mmio.force-legacy=false \
   "${DISK_ARGS[@]}" \
+  "${NET_ARGS[@]}" \
   "${DISPLAY_ARGS[@]}" \
   -serial mon:stdio \
   -no-reboot

@@ -75,15 +75,20 @@ pub fn run(tree: Fdt) -> ! {
     loop {
         crate::kprint!("pagh:rv64> ");
         loop {
-            // Idle wait, not a poll: the UART interrupt wakes this `wfi` and the
-            // timer guarantees a periodic wake-up even if a byte is lost to the
-            // ring-check/`wfi` window (`uart::wait_byte`).
-            //
-            // The scheduler's software clock is advanced here for machines (or
-            // builds) without a timer interrupt; with M3's timer attached this is
-            // a no-op and the tick arrives through `trap_entry` instead.
+            // Idle wait: one scheduler tick at a time, and a network poll every
+            // round. The shell cannot block on the UART alone any more — the NIC
+            // is polled, so a shell that never woke up while idle would drop
+            // ARP/ICMP answers and stall the stack's tick-based waits. One tick
+            // of `wfi` is the price; the UART ring is drained non-blockingly.
             crate::task::scheduler::pump();
-            let byte = uart::wait_byte();
+            crate::net::poll();
+            let byte = match uart::try_get_byte() {
+                Some(byte) => byte,
+                None => {
+                    timer::sleep_ticks(1);
+                    continue;
+                }
+            };
             match byte {
                 b'\r' | b'\n' => {
                     crate::kprintln!();
@@ -216,7 +221,7 @@ fn execute(line: &str, tree: &Fdt, state: &mut State) {
                 "  disk          block device: name, capacity and a sector-0 read check"
             );
             crate::kprintln!(
-                "  selftest      run the in-QEMU self-tests (memory, block, fs, timer, tasks, user)"
+                "  selftest      run the in-QEMU self-tests (memory, block, fs, timer, tasks, user, net)"
             );
             crate::kprintln!("  sleep <secs>  wait for that many seconds of timer ticks");
             crate::kprintln!("  tasks         list kernel threads: id, name, state, work, stack");
@@ -244,6 +249,11 @@ fn execute(line: &str, tree: &Fdt, state: &mut State) {
             crate::kprintln!(
                 "  run demo|fault|spin    run the embedded hello / fault / timer fixtures"
             );
+            crate::kprintln!("  net           network: MAC, IP/mask, gateway and DNS (after DHCP)");
+            crate::kprintln!("  dhcp          re-run the DHCP client and print the lease");
+            crate::kprintln!("  ping <ip> [n] send up to four ICMP echo requests (default 4)");
+            crate::kprintln!("  dns <name>    resolve a host name through the DHCP DNS server");
+            crate::kprintln!("  http <ip> <port> <path>  GET over TCP and print the response");
             crate::kprintln!("  fs            filesystem status: device, mount point, free space");
             crate::kprintln!("  clear         clear the screen (ANSI)");
             crate::kprintln!("  halt          power the machine off (SBI SRST)");
@@ -333,6 +343,7 @@ fn execute(line: &str, tree: &Fdt, state: &mut State) {
             crate::arch::riscv64::selftest::run();
             crate::task::selftest::run();
             crate::user::selftest::run();
+            crate::net::selftest::run();
         }
         "tasks" => list_tasks(),
         "spawn" => {
@@ -481,6 +492,11 @@ fn execute(line: &str, tree: &Fdt, state: &mut State) {
         "fs" => cmd_fs(),
         "ramdisk" => cmd_ramdisk(args, state),
         "run" => cmd_run(args, state),
+        "net" => cmd_net(),
+        "dhcp" => cmd_dhcp(),
+        "ping" => cmd_ping(args),
+        "dns" => cmd_dns(args),
+        "http" => cmd_http(args),
         "clear" => crate::kprint!("\x1b[2J\x1b[H"),
         "halt" => {
             // Ask firmware to power the machine off (SBI SRST). Parking the hart
@@ -1112,5 +1128,208 @@ fn run_one(image: &[u8], name: &str) {
     match crate::user::run_image(image, name) {
         Ok(exit) => crate::kprintln!("run: {} {}", name, exit),
         Err(error) => crate::kprintln!("run: {}: {}", name, error),
+    }
+}
+
+// ─── network commands (M7) ─────────────────────────────────────────────────
+
+/// Format an IPv4 address into a caller-owned buffer and borrow it as `&str`.
+fn ipv4_text<'a>(ip: [u8; 4], out: &'a mut [u8; 15]) -> &'a str {
+    match crate::net::wire::format_ipv4(ip, out) {
+        Some(length) => core::str::from_utf8(&out[..length]).unwrap_or("?"),
+        None => "?",
+    }
+}
+
+/// Format a MAC address into a caller-owned buffer and borrow it as `&str`.
+fn mac_text<'a>(mac: [u8; 6], out: &'a mut [u8; 17]) -> &'a str {
+    let length = crate::net::wire::format_mac(mac, out);
+    core::str::from_utf8(&out[..length]).unwrap_or("?")
+}
+
+/// `net`: the interface MAC and the DHCP lease.
+fn cmd_net() {
+    let Some(status) = crate::net::status() else {
+        match crate::net::mac() {
+            Some(mac) => {
+                let mut buffer = [0u8; 17];
+                crate::kprintln!(
+                    "net: virtio-net0 MAC {} — no DHCP lease (run `dhcp`)",
+                    mac_text(mac, &mut buffer)
+                );
+            }
+            None => crate::kprintln!(
+                "net: no network device (QEMU: add -netdev user -device virtio-net-device)"
+            ),
+        }
+        return;
+    };
+    let mut mac_buffer = [0u8; 17];
+    let mut ip = [0u8; 15];
+    let mut mask = [0u8; 15];
+    let mut gateway = [0u8; 15];
+    let mut dns = [0u8; 15];
+    let mut server = [0u8; 15];
+    crate::kprintln!(
+        "net: virtio-net0 MAC {}",
+        mac_text(status.mac, &mut mac_buffer)
+    );
+    crate::kprintln!(
+        "  ip {} mask {} gateway {}",
+        ipv4_text(status.config.ip, &mut ip),
+        ipv4_text(status.config.mask, &mut mask),
+        ipv4_text(status.config.gateway, &mut gateway)
+    );
+    crate::kprintln!(
+        "  dns {} lease {} s (server {})",
+        ipv4_text(status.config.dns, &mut dns),
+        status.config.lease_seconds,
+        ipv4_text(status.config.server, &mut server)
+    );
+}
+
+/// `dhcp`: run the client again and print the fresh lease.
+fn cmd_dhcp() {
+    match crate::net::dhcp::renew() {
+        Ok(config) => {
+            let mut ip = [0u8; 15];
+            let mut mask = [0u8; 15];
+            let mut gateway = [0u8; 15];
+            let mut dns = [0u8; 15];
+            crate::kprintln!(
+                "net: DHCP ip {}/{} gw {} dns {} lease {} s",
+                ipv4_text(config.ip, &mut ip),
+                ipv4_text(config.mask, &mut mask),
+                ipv4_text(config.gateway, &mut gateway),
+                ipv4_text(config.dns, &mut dns),
+                config.lease_seconds
+            );
+        }
+        Err(error) => crate::kprintln!("dhcp: {error}"),
+    }
+}
+
+/// `ping <ip> [count]`: ICMP echo through the polled stack.
+fn cmd_ping<'a>(mut args: impl Iterator<Item = &'a str>) {
+    let Some(target) = args.next() else {
+        crate::kprintln!("ping: usage: ping <ip> [count]");
+        return;
+    };
+    let Some(ip) = crate::net::wire::parse_ipv4_str(target) else {
+        crate::kprintln!("ping: {target}: not an IPv4 address");
+        return;
+    };
+    let count = args
+        .next()
+        .and_then(|word| word.parse::<u8>().ok())
+        .unwrap_or(4)
+        .clamp(1, 4);
+    let results = crate::net::ping(ip, count);
+    let mut received = 0u32;
+    let mut total_ms = 0u32;
+    for (index, result) in results.iter().enumerate() {
+        if index >= count as usize {
+            break;
+        }
+        match result {
+            Some(ticks) => {
+                received += 1;
+                total_ms += ticks.saturating_mul(10);
+                crate::kprintln!(
+                    "ping: reply from {target}: seq={} time={} ms",
+                    index + 1,
+                    ticks.saturating_mul(10)
+                );
+            }
+            None => crate::kprintln!("ping: seq={} lost", index + 1),
+        }
+    }
+    if received > 0 {
+        crate::kprintln!(
+            "ping: {}/{} replies, {} ms total",
+            received,
+            count,
+            total_ms
+        );
+    } else {
+        crate::kprintln!("ping: no reply from {target}");
+    }
+}
+
+/// `dns <name>`: resolve through the DHCP DNS server.
+fn cmd_dns<'a>(mut args: impl Iterator<Item = &'a str>) {
+    let Some(name) = args.next() else {
+        crate::kprintln!("dns: usage: dns <name>");
+        return;
+    };
+    match crate::net::resolve_name(name) {
+        Ok(ip) => {
+            let mut buffer = [0u8; 15];
+            crate::kprintln!("dns: {name} -> {}", ipv4_text(ip, &mut buffer));
+        }
+        Err(error) => crate::kprintln!("dns: {name}: {error}"),
+    }
+}
+
+/// `http <ip> <port> <path>`: a minimal HTTP/1.0 GET over the TCP client.
+///
+/// Printing the response verbatim is the point: it exercises `connect`, the
+/// data path and the peer's FIN in one command. The output is intentionally
+/// unbounded in *content* (a page can be large) but bounded in *chunks* so a
+/// server that never stops cannot lock the shell.
+fn cmd_http<'a>(mut args: impl Iterator<Item = &'a str>) {
+    let Some(ip_text) = args.next() else {
+        crate::kprintln!("http: usage: http <ip> <port> <path>");
+        return;
+    };
+    let Some(ip) = crate::net::wire::parse_ipv4_str(ip_text) else {
+        crate::kprintln!("http: {ip_text}: not an IPv4 address");
+        return;
+    };
+    let port = args
+        .next()
+        .and_then(|word| word.parse::<u16>().ok())
+        .unwrap_or(80);
+    let path = args.next().unwrap_or("/");
+    let mut request = String::new();
+    request.push_str("GET ");
+    request.push_str(path);
+    request.push_str(" HTTP/1.0\r\nHost: ");
+    request.push_str(ip_text);
+    request.push_str("\r\nConnection: close\r\n\r\n");
+    match crate::net::tcp::connect(ip, port) {
+        Ok(()) => {
+            crate::kprintln!("http: connected to {ip_text}:{port}, GET {path}");
+            if let Err(error) = crate::net::tcp::send(request.as_bytes()) {
+                crate::kprintln!("http: send failed: {error}");
+                crate::net::tcp::reset();
+                return;
+            }
+            let mut buffer = [0u8; 512];
+            let mut received = 0usize;
+            let mut chunks = 0usize;
+            loop {
+                if chunks >= 64 {
+                    crate::kprintln!("http: response truncated after {chunks} chunks");
+                    break;
+                }
+                chunks += 1;
+                match crate::net::tcp::recv(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        received += read;
+                        crate::kprint!("{}", String::from_utf8_lossy(&buffer[..read]));
+                    }
+                    Err(error) => {
+                        crate::kprintln!("http: receive failed: {error}");
+                        break;
+                    }
+                }
+            }
+            crate::net::tcp::close();
+            crate::kprintln!();
+            crate::kprintln!("http: {received} bytes received");
+        }
+        Err(error) => crate::kprintln!("http: connect failed: {error}"),
     }
 }

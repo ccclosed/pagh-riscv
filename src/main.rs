@@ -21,6 +21,7 @@ mod drivers;
 mod fdt;
 mod fs;
 mod memory;
+mod net;
 mod shell;
 mod sync;
 mod task;
@@ -254,6 +255,11 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     // block device this logs one line and continues — CI boots without a disk.
     vfs::init();
     init_fs();
+
+    // The network stack last: it needs the device tree (transport windows), the
+    // timer (DHCP/ping deadlines) and the heap (the NIC's rings). No NIC is a
+    // log line, not a failure — the shell keeps working.
+    net::init(&tree);
 
     shell::run(tree);
 }

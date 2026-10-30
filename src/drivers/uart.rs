@@ -267,6 +267,7 @@ pub fn try_get_byte() -> Option<u8> {
 /// window (a byte pushed between the ring check and the `wfi`) costs at most one
 /// tick — the loop re-checks after every wake-up. Without the interrupt it is the
 /// old spin on the line-status register.
+#[allow(dead_code)] // the shell polls (the NIC needs the wake-ups); kept as the driver's blocking API
 pub fn wait_byte() -> u8 {
     loop {
         if let Some(byte) = try_get_byte() {

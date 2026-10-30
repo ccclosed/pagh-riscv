@@ -34,6 +34,7 @@
 | `drivers/framebuffer.rs` | текстовый экран: тень, шрифт покрытия, статус-бар |
 | `drivers/block.rs` | шов блочного слоя: трейт `BlockDevice`, один слот реестра, RAM-диск `MemBlock` |
 | `drivers/virtio_mmio.rs` | virtio-blk на mmio-транспорте (modern, version 2), polled; окна — из DTB |
+| `drivers/virtio_net.rs` | virtio-net (modern, две очереди, polled): MAC, RX/TX-кольца, кадры |
 | `drivers/selftest.rs` | проверки блочного слоя (RAM round-trip + read-only реального диска) |
 | `fs/mod.rs` | фасад ФС: ext2, политика формата, in-QEMU тесты |
 | `fs/ext2/` | ext2: суперблок/группы/inode/dirent/alloc/symlink, mount, read/write, rename, mkfs |
@@ -50,10 +51,16 @@
 | `user/elf.rs` | ELF64-загрузчик: валидация до первого кадра, `PT_LOAD` с `U=1`, откат кадров, `Loaded`/`ElfError` |
 | `user/syscall.rs` | `ecall`-диспетчер Linux/RISC-V: `write`/`exit`/`sched_yield`/`getpid`, проверка user-указателей, `sepc+4` |
 | `user/selftest.rs` | семь проверок user-mode для `selftest` |
+| `net/mod.rs` | сетевой стек: состояние, ARP-кэш, `poll()`, диспетчер ARP/IPv4/ICMP/UDP/TCP, `ping`, DHCP-конфигурация |
+| `net/wire.rs` | чистые форматы Ethernet/ARP/IPv4/ICMP/UDP/TCP/DHCP/DNS и контрольные суммы (без устройства и часов) |
+| `net/dhcp.rs` | DHCP-клиент DISCOVER/OFFER/REQUEST/ACK |
+| `net/dns.rs` | stub-резолвер A-записей через UDP |
+| `net/tcp.rs` | минимальный active-open TCP-клиент для HTTP/1.0 |
+| `net/selftest.rs` | одиннадцать проверок сети для `selftest` (без NIC) |
 | `sync.rs` | один нереентерабельный спинлок |
 
 Подкаталоги документируют себя сами: [`arch/README.md`](arch/README.md),
-[`user/README.md`](user/README.md),
+[`user/README.md`](user/README.md), [`net/README.md`](net/README.md),
 [`drivers/README.md`](drivers/README.md), [`memory/README.md`](memory/README.md),
 [`fs/README.md`](fs/README.md), [`vfs/README.md`](vfs/README.md).
 Устройство `src/memory/**` (PMM, куча, selftest, пределы, чего нет) — в README
@@ -79,6 +86,7 @@
 | 11b | `plic::init` (DBT-база/source) → `uart::enable_rx_interrupt()` → `sie.SEIE` | `main.rs`, `arch/riscv64/plic.rs`, `drivers/uart.rs` | контроллер разводит линию раньше, чем UART её поднимает |
 | 12 | `virtio_mmio::init(&tree)`: перебор окон из DTB, регистрация диска (нет диска — строка в лог) | `main.rs`, `drivers/virtio_mmio.rs` | нужна карта (MMIO) и ловушки (сломанное окно) |
 | 13 | `vfs::init()` + `init_fs()`: смонтировать `/mnt`, пустое устройство — отформатировать | `main.rs::init_fs` | куча уже есть (монтирование аллоцирует); без диска — строка и дальше |
+| 13a | `net::init(&tree)`: проба virtio-net + DHCP-клиент (нет NIC — строка в лог) | `main.rs`, `src/net/`, `drivers/virtio_net.rs` | нужны DTB (окна транспорта), таймер (дедлайны DHCP) и куча (кольца) |
 | 14 | `shell::run(tree)`: задача 0; команда `run` — вход в U-mode (M6b) | `main.rs`, `shell.rs` | планировщик, таймер и user-mode уже подняты; shell не возвращается |
 
 Исходы вне фаз: `panic_handler` печатает `[PANIC]` и паркует hart
@@ -89,8 +97,8 @@
 
 Ни одного из модулей x86-версии, кроме перечисленных выше: нет `vmm`
 (Sv39 включён, но карта одна — identity; пользовательские страницы живут в ней же
-через бит `U`, отдельного адресного пространства на процесс нет), `net/`, `pkg/`,
-`security/`, `debug/`, `log.rs`, `provision.rs`, `selftest_lx.rs` (Linux-compat).
+через бит `U`, отдельного адресного пространства на процесс нет), `pkg/`
+(apt), `security/`, `debug/`, `log.rs`, `provision.rs`, `selftest_lx.rs` (Linux-compat).
 Нет host-tests: тесты, которые есть, живут внутри ядра — `memory/selftest.rs`,
 `fs/selftest.rs`, `task/selftest.rs`, `user/selftest.rs` и остальные, — команда
 `selftest`. Подробный список — `README.md` → «Чего нет».
@@ -103,7 +111,7 @@
 | release | `cargo build --locked --release` | `target/riscv64gc-unknown-none-elf/release/pagh` |
 | smoke (serial) | `python3 .github/smoke.py <kernel>` | exit 0 + серийный лог |
 | smoke (+экран) | `python3 .github/smoke.py <kernel> --ramfb` | то же, с `-device ramfb` |
-| память в госте | команда `selftest` | `SELFTEST SUMMARY: 7/7`, `(block) 3/3` (или 2/3 + skip без диска), `ext2 summary: 11/11`, `(arch) 4/4`, `(task) 5/5`, `(user) 7/7` |
+| память в госте | команда `selftest` | `SELFTEST SUMMARY: 7/7`, `(block) 3/3` (или 2/3 + skip без диска), `ext2 summary: 11/11`, `(arch) 4/4`, `(task) 5/5`, `(user) 7/7`, `(net) 11/11` |
 | диск в госте | `qemu-img create` + `-device virtio-blk-device` + `-global virtio-mmio.force-legacy=false` | пустой образ форматируется, `/mnt` монтируется, файл переживает перезагрузку |
 
 Оба профиля: `panic = "abort"` (`Cargo.toml:10-14`), release дополнительно

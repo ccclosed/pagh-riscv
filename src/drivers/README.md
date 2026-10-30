@@ -17,6 +17,7 @@
 | `framebuffer.rs` | текстовый экран: тень, шрифт покрытия, статус-бар | режим 1280x800, сетка 100x37 |
 | `block.rs` | шов блочного слоя: трейт `BlockDevice` + один слот реестра + RAM-диск `MemBlock` | сектор 512 Б; короткий трансфер — `Err`, а не EOF |
 | `virtio_mmio.rs` | virtio-blk на mmio-транспорте (modern, version 2), polled | окна транспорта — из DTB; `-global virtio-mmio.force-legacy=false` |
+| `virtio_net.rs` | virtio-net на том же транспорте: две очереди (RX/TX), polled | negotiate `VIRTIO_F_VERSION_1` + `MRG_RXBUF`; заголовок 12 байт; кадры копируются в ring |
 | `selftest.rs` | проверки блочного слоя для шелл-команды `selftest` | диск только читается; запись проверяется на `MemBlock` |
 
 Фасад — [`mod.rs`](mod.rs); точка входа в экран — `framebuffer::init()`, которую
@@ -187,6 +188,26 @@ python3 /tmp/riscv_drive.py --kernel target/riscv64gc-unknown-none-elf/debug/pag
     --qemu-extra "-global virtio-mmio.force-legacy=false" --ramfb
 ```
 
+## `virtio_net.rs` — сеть (M7)
+
+Тот же транспорт, что у блочного драйвера (modern virtio-mmio, polled, split
+virtqueue, адреса — identity-map), но два кольца: RX (0) и TX (1).
+
+* **Заголовок 12 байт.** Драйвер договаривается о `VIRTIO_F_VERSION_1` и
+  `VIRTIO_NET_F_MRG_RXBUF`; с mergeable-буферами `virtio_net_hdr` — это базовая
+  структура плюс little-endian `num_buffers`, то есть 12 байт. Постфикс на 2
+  байта — первое, что ловится при отладке: кадр уезжает на провод со сдвигом
+  ровно на них (проверено дампом QEMU `filter-dump`; см. комментарий в
+  `NET_HEADER_BYTES`).
+* **RX-буферы постируются заранее** (8 × 2 KiB), завершения вычитываются
+  `poll()`, кадр копируется в software-ring и дескриптор сразу публикуется
+  снова — broadcast-шторм не может опустошить очередь.
+* **TX синхронный**: один дескриптор, заголовок+кадр непрерывны в буфере, после
+  notify драйвер ждёт used-запись с ограничением итераций; таймаут метит NIC
+  FAILED (индексы кольца после этого недостоверны).
+* **Нет прерываний**: `NO_INTERRUPT` в available ring; `net::poll()` вызывается
+  из сетевых команд и из idle-цикла шелла.
+
 ## Чего здесь нет (честно)
 
 * Нет курсора, каретки, выделения, тем, обоев, `paint`, истории и прокрутки
@@ -204,6 +225,8 @@ python3 /tmp/riscv_drive.py --kernel target/riscv64gc-unknown-none-elf/debug/pag
   (цель M4 — QEMU `virt`, где узел есть всегда).
 * Кэш-обслуживание поверхности не делается (см. выше): под QEMU не нужно, на
   реальном железе — нужно.
+* Сеть: без прерываний, один интерфейс, без TLS/apt; TCP — один
+  active-open-сокет для HTTP/1.0 (см. `../net/README.md`).
 * Вывод вне ASCII на экран не попадает: глифов вне `0x20..0x7E` нет, а
   `write_char` такие байты отбрасывает (тире в баннере `main.rs` на экране не
   видно — это ожидаемо).

@@ -116,6 +116,11 @@ jobs:
         run: python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh
       - name: Boot it with ramfb (the screen path)
         run: python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb
+      # M7 acceptance: a virtio-net NIC on QEMU's user network, DHCP lease at
+      # boot, then `net` and an ICMP echo to the gateway. Deterministic: the
+      # network is QEMU's own slirp, not the runner's internet access.
+      - name: Boot it with a virtio-net NIC (DHCP + ping)
+        run: python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --net
       # M5 acceptance, end to end: a blank virtio-mmio image is formatted by the
       # kernel, mounted at /mnt and written to; the second run boots the very same
       # image and must mount it (no reformat) and read the marker file back. Two

@@ -13,6 +13,7 @@ any expected line is missing.  Used by the `smoke` job in
     qemu-img create -f raw /tmp/ci.img 64M
     python3 .github/smoke.py <elf> --disk /tmp/ci.img --fresh
     python3 .github/smoke.py <elf> --disk /tmp/ci.img
+    python3 .github/smoke.py <elf> --net        # virtio-net: DHCP + ping gateway
 
 `--ramfb` attaches QEMU's ramfb device, so the run also covers the framebuffer
 bring-up (`fw_cfg` -> `etc/ramfb` -> the console's second sink) while staying
@@ -127,6 +128,24 @@ DISK_EXPECTED_FRESH = [
     "SELFTEST ext2 summary: 11/11 passed",
     "halt: powering off",
 ]
+# ── the network mode (M7) ─────────────────────────────────────────────────
+# The DHCP client runs during boot, before the shell; the commands then exercise
+# the lease (`net`), the ARP/ICMP path (`ping` the gateway) and the shell itself.
+NET_COMMANDS = b"net\nping 10.0.2.2\nhalt\n"
+NET_BOOT = [
+    "virtio-net: virtio-net0 at 0x",
+    "net         DHCP ip 10.0.2.15/",
+]
+NET_EXPECTED = NET_BOOT + [
+    "Type 'help' for the command list.",
+    "pagh:rv64> net",
+    "net: virtio-net0 MAC",
+    "ip 10.0.2.15 mask 255.255.255.0 gateway 10.0.2.2",
+    "pagh:rv64> ping 10.0.2.2",
+    "ping: reply from 10.0.2.2",
+    "halt: powering off",
+]
+
 DISK_EXPECTED_EXISTING = [
     "pagh:rv64> cat /mnt/ci/marker.txt",
     "hello-from-ci",
@@ -143,7 +162,7 @@ QEMU = os.environ.get("QEMU", "qemu-system-riscv64")
 BIOS = os.environ.get("PAGH_BIOS", "").strip()
 
 
-def boot(kernel, ramfb=False, disk=None, commands=COMMANDS, timeout=120.0):
+def boot(kernel, ramfb=False, disk=None, commands=COMMANDS, timeout=120.0, net=False):
     """Boot `kernel`, drive the shell, return (reached_halt, powered_off, exit_code, log)."""
     cmd = [
         QEMU, "-machine", "virt", "-m", "256M",
@@ -159,8 +178,19 @@ def boot(kernel, ramfb=False, disk=None, commands=COMMANDS, timeout=120.0):
         cmd += [
             "-drive", "file=%s,format=raw,if=none,id=hd0" % disk,
             "-device", "virtio-blk-device,drive=hd0",
-            "-global", "virtio-mmio.force-legacy=false",
         ]
+    if net:
+        # QEMU's user-mode network: the guest gets 10.0.2.15/24 over DHCP,
+        # 10.0.2.2 is the gateway (and the host's loopback, so a host listener
+        # can be reached) and 10.0.2.3 is the built-in DNS forwarder.
+        cmd += [
+            "-netdev", "user,id=net0",
+            "-device", "virtio-net-device,netdev=net0",
+        ]
+    if disk or net:
+        # Virtio-mmio transports default to the legacy layout; this kernel
+        # speaks modern (version 2) only.
+        cmd += ["-global", "virtio-mmio.force-legacy=false"]
     proc = subprocess.Popen(
         cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, bufsize=0,
@@ -221,18 +251,20 @@ def main():
     args = sys.argv[1:]
     ramfb = "--ramfb" in args
     args = [a for a in args if a != "--ramfb"]
+    net = "--net" in args
+    args = [a for a in args if a != "--net"]
     fresh = "--fresh" in args
     args = [a for a in args if a != "--fresh"]
     disk = None
     if "--disk" in args:
         i = args.index("--disk")
         if i + 1 >= len(args):
-            print("usage: smoke.py <kernel> [--ramfb] [--disk PATH [--fresh]]", file=sys.stderr)
+            print("usage: smoke.py <kernel> [--ramfb] [--net] [--disk PATH [--fresh]]", file=sys.stderr)
             return 2
         disk = args[i + 1]
         args = args[:i] + args[i + 2 :]
     if len(args) != 1:
-        print("usage: smoke.py <kernel> [--ramfb] [--disk PATH [--fresh]]", file=sys.stderr)
+        print("usage: smoke.py <kernel> [--ramfb] [--net] [--disk PATH [--fresh]]", file=sys.stderr)
         return 2
 
     kernel = args[0]
@@ -245,7 +277,15 @@ def main():
         return 2
 
     mode = "ramfb" if ramfb else "serial"
-    if disk:
+    if net:
+        mode += "+net"
+        reached, powered_off, exit_code, log = boot(
+            kernel, ramfb=ramfb, net=True, commands=NET_COMMANDS
+        )
+        expected = list(NET_EXPECTED)
+        if ramfb:
+            expected.insert(0, SCREEN_MARKER[True])
+    elif disk:
         mode += "+disk" + ("+fresh" if fresh else "+existing")
         commands = DISK_COMMANDS_FRESH if fresh else DISK_COMMANDS_EXISTING
         reached, powered_off, exit_code, log = boot(kernel, ramfb=ramfb, disk=disk, commands=commands)

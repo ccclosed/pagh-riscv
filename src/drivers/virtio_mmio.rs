@@ -852,8 +852,10 @@ pub fn init(tree: &Fdt) {
                 break;
             }
             // An empty slot is the normal case on a machine with fewer devices
-            // than transports; QEMU `virt` always reports all eight.
-            Err(Error::Empty) => {}
+            // than transports; QEMU `virt` always reports all eight. Another
+            // virtio device in a window (the network card) is equally normal:
+            // it is that driver's window, not an error of this one.
+            Err(Error::Empty) | Err(Error::NotBlock(_)) => {}
             Err(error) => {
                 crate::kprintln!("virtio-mmio: {:#x}: {}", window.base, error);
             }

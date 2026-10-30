@@ -30,6 +30,7 @@ python3 tools/run.py --shot /tmp/riscv-shell.png
 python3 tools/run.py --keys "help\n" --shot /tmp/riscv-help.png
 python3 tools/run.py --keys "clear\n" --shot /tmp/riscv-clear.png
 python3 tools/run.py --keys "run demo\nrun fault\n" --shot /tmp/riscv-user.png --check-font
+python3 tools/run.py --net --keys "net\nping 10.0.2.2\n" --shot /tmp/riscv-net.png --check-font
 python3 tools/run.py --attach --keys "mem\n" --shot /tmp/riscv-mem.png   # к уже запущенному QEMU
 python3 tools/run.py --help
 ```
@@ -98,6 +99,10 @@ python3 tools/run.py --keys "clear\n" --shot /tmp/riscv-clear.png \
   жива), `run spin` (0.2 s в U-mode, exit 7); снимается
   `python3 tools/run.py --keys "run demo\nrun fault\nrun spin\n" --shot docs/user.png
   --check-font --expect "run: demo exited with code 42" --scan-all`;
+* `docs/net.png` — M7: `net` (MAC + DHCP lease), `ping 10.0.2.2` (свой
+  ARP/ICMP-путь) и `dns`; снимается `python3 tools/run.py --net --keys
+  "net\nping 10.0.2.2\n" --shot docs/net.png --check-font --expect
+  "ping: reply from 10.0.2.2" --scan-all`;
 * статус-бар внизу: слева `pagh OS  RISC-V (RV64)`, справа `ramfb 1280x800`;
 * текст занимает 100×37 клеток, ниже — чёрная полоса, затем бар (раскладка
   x86-версии, см. `src/drivers/README.md`);

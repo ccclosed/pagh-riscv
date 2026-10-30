@@ -312,8 +312,14 @@ def boot(args: argparse.Namespace, serial_path: str, monitor_path: str) -> subpr
         cmd += [
             "-drive", f"file={disk},format=raw,if=none,id=hd0",
             "-device", "virtio-blk-device,drive=hd0",
-            "-global", "virtio-mmio.force-legacy=false",
         ]
+    if getattr(args, "net", False):
+        cmd += [
+            "-netdev", "user,id=net0",
+            "-device", "virtio-net-device,netdev=net0",
+        ]
+    if getattr(args, "disk", None) or getattr(args, "net", False):
+        cmd += ["-global", "virtio-mmio.force-legacy=false"]
     print("+", " ".join(cmd), file=sys.stderr)
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -390,6 +396,11 @@ def main() -> int:
     parser.add_argument("--kernel", default=KERNEL_DEBUG, help=f"kernel ELF (default {KERNEL_DEBUG})")
     parser.add_argument("--release", action="store_true", help=f"use {KERNEL_RELEASE}")
     parser.add_argument("--memory", default="256M", help="guest RAM (default 256M, as run.sh)")
+    parser.add_argument(
+        "--net",
+        action="store_true",
+        help="attach a virtio-net NIC on QEMU's user network (DHCP: 10.0.2.15/24, gw 10.0.2.2)",
+    )
     parser.add_argument(
         "--disk",
         default="",
