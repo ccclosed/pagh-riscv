@@ -161,7 +161,7 @@ SELFTEST heap-vec PASS
 heap: double free of 0x80a73090 ignored
 heap: refusing to free 0x802302b8: not a heap block
 SELFTEST heap-defenses PASS
-SELFTEST SUMMARY: 6/6 passed
+SELFTEST SUMMARY: 7/7 passed
 [selftest] PMM hygiene: free frames 62802 -> 62802
 ```
 
@@ -273,7 +273,7 @@ backspace работает, всё остальное — команды:
 |---|---|
 | `help` | список команд |
 | `mem` | память из device tree **и** статистика PMM и кучи (свободно/всего кадров, диапазон пула, байты кучи) |
-| `selftest` | in-QEMU self-tests: 7 памяти, 3 блочного слоя, 11 ext2/VFS, 4 таймера/PLIC, 5 планировщика, 8 user-mode (`user-run-large-file` — SKIP без `/mnt`, итог 7/8); печатает ledger свободных кадров до и после каждого блока |
+| `selftest` | in-QEMU self-tests: 7 памяти, 4 блока/указателя, 11 ext2/VFS, 4 таймера/PLIC, 5 планировщика, 8 user-mode (`user-run-large-file` — SKIP без `/mnt`, итог 7/8); печатает ledger свободных кадров до и после каждого блока |
 | `disk` | блочное устройство: имя, ёмкость, живая проверка чтения сектора 0 |
 | `ls [path]` | листинг каталога (каталоги с `/`) |
 | `cat <path>` | содержимое файла |

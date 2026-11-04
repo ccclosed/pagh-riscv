@@ -655,8 +655,8 @@ User-страницы кладутся в **ту же** Sv39-карту с `U=1`
 * **Нет SMP**: работает один hart.
 * **Нет host-тестов**: есть in-QEMU selftests (7 памяти, 3 блочного слоя, 11
   ext2/VFS, 4 таймера/PLIC, 5 планировщика, 8 user-mode — с диском 8/8, без
-  `/mnt` 7/8 + SKIP), QEMU-smoke в четырёх режимах (serial, ramfb, диск
-  fresh/existing) и проверка пикселей `tools/font_check.py`; чистая логика
+  `/mnt` 7/8 + SKIP), QEMU-smoke в пяти режимах (serial, ramfb, диск
+  fresh/existing, net) и проверка пикселей `tools/font_check.py`; чистая логика
   (`fdt.rs`) тестами не покрыта.
 * **Инструментов сборки нет**: `run.sh` — единственный лаунчер; в `tools/` только
   шрифт и запуск/скриншот.
