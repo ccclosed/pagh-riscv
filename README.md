@@ -195,7 +195,8 @@ SELFTEST SUMMARY: 7/7 passed
 | Планировщик, потоки ядра (M6a) | готово | контекстный switch (callee-saved ABI), до 8 потоков, round-robin, квант 8 тиков, стек 16 KiB + guard из PMM, вытеснение тиком таймера из trap-контекста (включая вытеснение U-mode), `tasks`/`spawn`/`yield`; exit возвращает кадры | `src/arch/riscv64/switch.rs`, `src/task/` |
 | User mode, syscalls, ELF (M6b) | готово | `sret` в U-mode (`SPP=0`, `SPIE=1`, `SUM=0`, `sscratch`-контракт), `ecall`-диспетчер Linux/RISC-V (`write`/`exit`/`sched_yield`/`getpid`, `sepc+4`, проверка user-указателей, `SUM` вокруг копии), ELF64-загрузчик с откатом кадров и **потоковым чтением** `ImageSource` (заголовок, program headers, сегменты по 4 KiB; без буфера размером с файл), `run <path>` до 1 MiB и фикстуры `demo`/`fault`/`spin`, fault из U убивает только задачу; таймер вытесняет U-mode | `src/user/`, `userland/` |
 | Сеть (M7) | готово | virtio-net (modern, polled) + свой стек: Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP-клиент, DNS-резолвер, `net`/`dhcp`/`ping`/`dns`/`http`; без smoltcp и внешних крейтов | `src/net/`, `src/drivers/virtio_net.rs` |
-| Пакеты, apt | **нет** | нужен TLS-стек (vendored `embedded-tls` + OpenPGP-проверка), как на x86; следующий майлстоун после сети | — |
+| Пакеты (`pkg`) | MVP | нативный установщик: плоский `index` и `.ppkg` с хоста по **plain HTTP** (`http://IP:port/`, QEMU: `10.0.2.2`), потоковая загрузка в `/mnt/pkg` кусками 4 KiB, шлюз «размер + SHA-256 из индекса» **до** разбора `PPKG0001`, `kind=app` → `/mnt/bin/<name>`, `applet-bundle` → `/mnt/bin/paghbox` + симлинки, манифест в `/mnt/pkg/<name>.manifest`; не apt и не TLS | `src/pkg/` |
+| apt / TLS / OpenPGP | **нет** | apt намеренно не подключён, пока нет vendored TLS + проверки подписей; `pkg` — отдельный нативный путь | — |
 | Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 4 блока/указателя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 8 user-mode (`user-run-large-file`: 8/8 с диском, 7/8 + SKIP без `/mnt`) + 11 сети (идемпотентность по ledger'у свободных кадров), QEMU-smoke в шести режимах (serial, ramfb, диск-fresh, диск-existing, net, keyboard) — во всех приложен virtio-tablet, в keyboard ещё и virtio-keyboard, и проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/net/selftest.rs`, `.github/smoke.py`, `tools/` |
 | CI | готово | `fmt`, debug/release build, QEMU-smoke в шести режимах: serial, ramfb, диск-fresh (формат/монтирование/запись), диск-existing (повторная загрузка читает файл), net (DHCP + ping шлюза), keyboard (virtio-keyboard печатает `help`/`halt` через монитор QEMU); во всех приложен virtio-tablet, в keyboard — ещё и virtio-keyboard | `.github/workflows/ci.yml` |
 
@@ -297,6 +298,8 @@ backspace работает, всё остальное — команды:
 | `ping <ip> [n]` | до 4 ICMP echo через свой ARP/IPv4/ICMP-путь; печатает `seq`, время и итог |
 | `dns <name>` | A-запись через DNS-сервер из lease |
 | `http <ip> <port> <path>` | HTTP/1.0 GET через TCP-клиент; ответ печатается в консоль |
+| `pkg repo [URL]` / `pkg index` / `pkg list` | показать/задать репозиторий (по умолчанию `http://10.0.2.2:8000/`), скачать и разобрать индекс, показать пакеты с `[installed]` |
+| `pkg install <name>` / `pkg remove <name>` / `pkg installed` | скачать, проверить размер+SHA-256, установить в `/mnt/bin`; удалить по манифесту; список установленного |
 | `time` | два счётчика: CSR `time` (аппаратный) и тики ядра; uptime, число прерываний таймера, статистика PLIC/UART |
 | `hart` | id hart'а, на котором работает ядро |
 | `echo <text>` | печатает текст (слова через один пробел) |
@@ -309,6 +312,52 @@ backspace работает, всё остальное — команды:
 
 Истории, автодополнения и стрелок нет — это следующий уровень шелла, а не
 забытая деталь.
+
+### Пакеты: `pkg` (нативный установщик)
+
+`pkg` ставит в `/mnt` один статический RV64 ELF из `.ppkg`, скачанного с
+плоского HTTP-репозитория. Это **не apt**: ни Debian-метаданных, ни `.deb`, ни
+solver'а зависимостей, ни сжатия, ни OpenPGP; TLS тоже нет. Репозиторий — это
+файл `index` и каталог `pkg/*.ppkg`; формат описан в `docs/package-format.md`
+репозитория [`pagh-programs`](https://github.com/ccclosed/pagh-programs).
+
+```sh
+# на хосте (в pagh-repo): зеркало для QEMU user network
+./serve.sh                                   # python3 -m http.server 8000 -d .
+
+# в госте, после prompt'а pagh:rv64>
+pkg repo http://10.0.2.2:8000/               # 10.0.2.2 — loopback хоста
+pkg index                                    # pkg: index 1 package(s)
+pkg list                                     # hello 1.0.0 13555 B
+pkg install hello                            # pkg: installed hello 1.0.0
+run /mnt/bin/hello                           # hello from user mode / exited with code 42
+pkg installed                                # pkg: hello 1.0.0
+pkg remove hello                             # pkg: removed hello
+```
+
+**Шлюз — размер и SHA-256.** Пакет пишется в `/mnt/pkg/<name>.ppkg` потоково,
+кусками 4 KiB, и те же байты считаются в SHA-256. Пока счётчик и дайджест не
+совпали с индексом, в `/mnt/bin` не создаётся ничего; при несовпадении
+скачанный файл удаляется. Только после шлюза читаются `PPKG0001`, длины и
+манифест, а payload копируется в `/mnt/bin/<name>` (для `applet-bundle` —
+`paghbox` плюс симлинки из `commands`). Манифест `/mnt/pkg/<name>.manifest`
+пишется последним, и `pkg remove` работает по нему.
+
+Это проверка **целостности**, а не подписи: зеркало, которое отдаёт другой
+пакет с тем же размером и хешем, дизайном не ловится. HTTPS и OpenPGP — следующий
+майлстоун; до него `pkg` честно говорит «only plain http:// is supported
+(there is no TLS yet)» на `https://` и не притворяется apt.
+
+Ограничения MVP: до 64 пакетов в индексе, IPv4-хост в URL (без DNS), один
+пакет за раз, `payload ≤ 8 MiB`, `/mnt` обязателен. `pkg` без аргументов
+печатает usage; `pkg selftest` проверяет SHA-256 по векторам FIPS.
+
+Полный E2E (сборка `.ppkg` из `userland/hello.elf`, HTTP-сервер, QEMU с
+диском, включая отказ испорченному пакету):
+
+```sh
+python3 tools/test_pkg.py
+```
 
 ---
 
@@ -404,10 +453,11 @@ IPv4, ICMP и UDP, а `dhcp`/`dns`/`tcp` — маленькие клиенты. 
 * **Нет журнала/WAL в ext2.** Сбой между двумя записями может оставить операцию
   недоделанной; crash-consistency не заявляется.
 * **Один блочный слот, нет разделов/hot-plug.** Второй диск — изменение дизайна.
-* **Нет TLS и apt.** Сеть есть (M7), но это `http`, а не `https`: TLS-стек и
-  OpenPGP-проверка Debian-метаданных (как на x86) — следующий майлстоун. До него
-  `apt` намеренно не подключается: «скачали и поставили без проверки» — это
-  ровно то, чего fail-closed apt не делает.
+* **Нет TLS, подписей пакетов и apt.** Нативный `pkg` говорит по plain HTTP и
+  проверяет только размер + SHA-256 из индекса: это целостность, а не
+  аутентификация источника. TLS-стек и OpenPGP-проверка подписей — следующий
+  майлстоун; `apt` намеренно не подключается, пока их нет: «скачали и поставили
+  без проверки» — это ровно то, чего fail-closed apt не делает.
 * **TCP-клиент минимальный.** Одно active-open соединение, без
   retransmission-таймера (кроме двух SYN), out-of-order reassembly, congestion
   control и прослушивания портов; IPv6, фрагментация и несколько интерфейсов не

@@ -58,12 +58,15 @@
 | `net/dns.rs` | stub-резолвер A-записей через UDP |
 | `net/tcp.rs` | минимальный active-open TCP-клиент для HTTP/1.0 |
 | `net/selftest.rs` | одиннадцать проверок сети для `selftest` (без NIC) |
+| `pkg/mod.rs` | нативный установщик `pkg`: `repo`/`index`/`list`/`install`/`remove`/`installed`, HTTP поверх `net::tcp`, индекс в фиксированных массивах, шлюз «размер + SHA-256» до разбора `PPKG0001`, `/mnt/pkg/<name>.manifest` |
+| `pkg/sha256.rs` | потоковый SHA-256 (FIPS 180-4) без аллокаций; `selftest()` для `pkg selftest` и `cfg(test)`-векторы |
 | `sync.rs` | один нереентерабельный спинлок |
 
 Подкаталоги документируют себя сами: [`arch/README.md`](arch/README.md),
 [`user/README.md`](user/README.md), [`net/README.md`](net/README.md),
 [`drivers/README.md`](drivers/README.md), [`memory/README.md`](memory/README.md),
-[`fs/README.md`](fs/README.md), [`vfs/README.md`](vfs/README.md).
+[`fs/README.md`](fs/README.md), [`vfs/README.md`](vfs/README.md),
+[`pkg/README.md`](pkg/README.md).
 Устройство `src/memory/**` (PMM, куча, selftest, пределы, чего нет) — в README
 подсистемы; `docs/architecture.md` (разделы 6–7) добавляет к нему то, что нужно
 знать при чтении boot-пути: карту памяти и порядок фаз.
@@ -99,8 +102,10 @@
 
 Ни одного из модулей x86-версии, кроме перечисленных выше: нет `vmm`
 (Sv39 включён, но карта одна — identity; пользовательские страницы живут в ней же
-через бит `U`, отдельного адресного пространства на процесс нет), `pkg/`
-(apt), `security/`, `debug/`, `log.rs`, `provision.rs`, `selftest_lx.rs` (Linux-compat).
+через бит `U`, отдельного адресного пространства на процесс нет), `security/`,
+`debug/`, `log.rs`, `provision.rs`, `selftest_lx.rs` (Linux-compat).
+`pkg/` есть, но это не apt: плоский `.ppkg` по plain HTTP с проверкой размера и
+SHA-256, без TLS, подписей и зависимостей (см. [`pkg/README.md`](pkg/README.md)).
 Нет host-tests: тесты, которые есть, живут внутри ядра — `memory/selftest.rs`,
 `fs/selftest.rs`, `task/selftest.rs`, `user/selftest.rs` и остальные, — команда
 `selftest`. Подробный список — `README.md` → «Чего нет».
@@ -115,6 +120,7 @@
 | smoke (+экран) | `python3 .github/smoke.py <kernel> --ramfb` | то же, с `-device ramfb` |
 | память в госте | команда `selftest` | `SELFTEST SUMMARY: 7/7`, `(block) 4/4` (или 3/4 + skip без диска, включая `input-device`), `ext2 summary: 11/11`, `(arch) 4/4`, `(task) 5/5`, `(user) 8/8` с `/mnt` (или 7/8 + skip `user-run-large-file`), `(net) 11/11` |
 | диск в госте | `qemu-img create` + `-device virtio-blk-device` + `-global virtio-mmio.force-legacy=false` | пустой образ форматируется, `/mnt` монтируется, файл переживает перезагрузку |
+| `pkg` E2E | `python3 tools/test_pkg.py` (порт 8000 свободен; `--release` — release-ядро) | собранный `.ppkg` + HTTP-сервер + QEMU с диском: index/install/run (код 42)/remove и отказ испорченному пакету по SHA-256; логи и pcap в напечатанном каталоге |
 
 Оба профиля: `panic = "abort"` (`Cargo.toml:10-14`), release дополнительно
 `opt-level = "s"`, `lto = true` (`Cargo.toml:15-16`). Panic — это смерть машины:
