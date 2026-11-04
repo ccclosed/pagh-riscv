@@ -37,6 +37,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use crate::arch::riscv64::csr;
 use crate::arch::riscv64::mmu::{PTE_R, PTE_U, PTE_W};
@@ -50,6 +51,9 @@ const SYS_READ: usize = 63;
 const SYS_WRITE: usize = 64;
 const SYS_OPENAT: usize = 56;
 const SYS_CLOSE: usize = 57;
+const SYS_GETDENTS64: usize = 61;
+const SYS_LSEEK: usize = 62;
+const SYS_FSTAT: usize = 80;
 const SYS_EXIT: usize = 93;
 const SYS_SCHED_YIELD: usize = 124;
 const SYS_GETPID: usize = 172;
@@ -66,6 +70,7 @@ const EISDIR: isize = -21;
 const EINVAL: isize = -22;
 const ENOSPC: isize = -28;
 const ENAMETOOLONG: isize = -36;
+const EOVERFLOW: isize = -75;
 const ENOSYS: isize = -38;
 const ENOTSUP: isize = -95;
 
@@ -109,6 +114,12 @@ pub struct Stats {
     pub opens: u64,
     /// `close` calls that released a descriptor.
     pub closes: u64,
+    /// `lseek` calls that moved an offset.
+    pub seeks: u64,
+    /// `fstat` calls that filled a `Stat`.
+    pub fstats: u64,
+    /// Directory records delivered by `getdents64`.
+    pub dirents: u64,
     /// Unknown syscall numbers answered with `-ENOSYS`.
     pub unknown: u64,
     /// Bad user buffers answered with `-EFAULT`.
@@ -123,6 +134,9 @@ static READS: AtomicU64 = AtomicU64::new(0);
 static READ_BYTES: AtomicU64 = AtomicU64::new(0);
 static OPENS: AtomicU64 = AtomicU64::new(0);
 static CLOSES: AtomicU64 = AtomicU64::new(0);
+static SEEKS: AtomicU64 = AtomicU64::new(0);
+static FSTATS: AtomicU64 = AtomicU64::new(0);
+static DIRENTS: AtomicU64 = AtomicU64::new(0);
 static UNKNOWN: AtomicU64 = AtomicU64::new(0);
 static FAULTS: AtomicU64 = AtomicU64::new(0);
 
@@ -138,6 +152,9 @@ pub fn stats() -> Stats {
         read_bytes: READ_BYTES.load(Ordering::Relaxed),
         opens: OPENS.load(Ordering::Relaxed),
         closes: CLOSES.load(Ordering::Relaxed),
+        seeks: SEEKS.load(Ordering::Relaxed),
+        fstats: FSTATS.load(Ordering::Relaxed),
+        dirents: DIRENTS.load(Ordering::Relaxed),
         unknown: UNKNOWN.load(Ordering::Relaxed),
         faults: FAULTS.load(Ordering::Relaxed),
     }
@@ -158,6 +175,20 @@ struct FileHandle {
     node: Arc<dyn VfsNode>,
     offset: u64,
     flags: usize,
+    /// Directory children captured at open time, with the `getdents64` cursor.
+    /// `Some` exactly when the node is a directory and was opened read-only.
+    dir: Option<DirSnapshot>,
+}
+
+/// A directory's entries and how many records have been returned so far.
+///
+/// The VFS has no seekable directory cursor, so the syscall layer snapshots the
+/// children at `openat` (the same thing the x86 shell does) and walks the
+/// snapshot. A directory that changes while it is open is not reflected in the
+/// stream; that is the v1 contract.
+struct DirSnapshot {
+    entries: Vec<Arc<dyn VfsNode>>,
+    index: usize,
 }
 
 enum FdEntry {
@@ -236,7 +267,7 @@ fn set_offset(fd: usize, offset: u64) {
 }
 
 /// Install a node in the first free slot at or above 3.
-fn install(node: Arc<dyn VfsNode>, flags: usize) -> Result<usize, isize> {
+fn install(node: Arc<dyn VfsNode>, flags: usize, dir: Option<DirSnapshot>) -> Result<usize, isize> {
     let mut table = FDS.lock();
     for fd in 3..MAX_FDS {
         if table.slots[fd].is_none() {
@@ -244,6 +275,7 @@ fn install(node: Arc<dyn VfsNode>, flags: usize) -> Result<usize, isize> {
                 node,
                 offset: 0,
                 flags,
+                dir,
             }));
             return Ok(fd);
         }
@@ -267,6 +299,9 @@ pub fn dispatch(frame: &mut TrapFrame) {
         SYS_WRITE => write(frame.a0, frame.a1, frame.a2),
         SYS_OPENAT => openat(frame.a0, frame.a1, frame.a2, frame.a3),
         SYS_CLOSE => close(frame.a0),
+        SYS_LSEEK => lseek(frame.a0, frame.a1, frame.a2),
+        SYS_FSTAT => fstat(frame.a0, frame.a1),
+        SYS_GETDENTS64 => getdents64(frame.a0, frame.a1, frame.a2),
         SYS_EXIT => crate::user::exit_current(frame.a0 as u32),
         SYS_SCHED_YIELD => {
             crate::task::scheduler::yield_now();
@@ -542,9 +577,17 @@ fn openat(dirfd: usize, path_ptr: usize, flags: usize, mode: usize) -> isize {
         Err(error) => return errno(error),
     };
 
+    let mut dir = None;
     if node.is_directory() {
         if access != O_RDONLY || flags & (O_CREAT | O_TRUNC) != 0 {
             return EISDIR;
+        }
+        // Snapshot the children now: the stream `getdents64` returns is the
+        // directory as it was at open, and no VFS call is made while its
+        // records are being encoded.
+        match node.readdir() {
+            Ok(entries) => dir = Some(DirSnapshot { entries, index: 0 }),
+            Err(error) => return errno(error),
         }
     } else if flags & O_TRUNC != 0 {
         match node.truncate(0) {
@@ -554,7 +597,7 @@ fn openat(dirfd: usize, path_ptr: usize, flags: usize, mode: usize) -> isize {
         }
     }
 
-    match install(node, flags) {
+    match install(node, flags, dir) {
         Ok(fd) => {
             OPENS.fetch_add(1, Ordering::Relaxed);
             fd as isize
@@ -581,6 +624,168 @@ fn close(fd: usize) -> isize {
         // by the `take` above.
         None => EBADF,
     }
+}
+
+// ─── lseek / fstat / getdents64 ────────────────────────────────────────────
+
+/// `lseek(fd, offset, whence)`: 0 = SET, 1 = CUR, 2 = END.
+///
+/// Offsets are signed and 64-bit; a negative result is `-EINVAL`, an offset past
+/// `isize::MAX` is `-EOVERFLOW` (the ABI returns the new offset in `a0`).
+/// Seeking is refused on the console (not seekable) and on a directory (its
+/// `getdents64` cursor is the snapshot index, not a byte offset).
+fn lseek(fd: usize, offset: usize, whence: usize) -> isize {
+    let delta = offset as isize as i128;
+    match lookup(fd) {
+        Ok(OpenFd::ConsoleIn) | Ok(OpenFd::ConsoleOut) => EINVAL,
+        Ok(OpenFd::File { node, offset, .. }) => {
+            if node.is_directory() {
+                return EINVAL;
+            }
+            let base = match whence {
+                0 => 0i128,
+                1 => offset as i128,
+                2 => node.size() as i128,
+                _ => return EINVAL,
+            };
+            let new = base + delta;
+            if new < 0 {
+                return EINVAL;
+            }
+            if new > isize::MAX as i128 {
+                return EOVERFLOW;
+            }
+            set_offset(fd, new as u64);
+            SEEKS.fetch_add(1, Ordering::Relaxed);
+            new as isize
+        }
+        Err(error) => error,
+    }
+}
+
+/// `struct Stat` from the ABI: `u32 mode`, `u32 kind`, `u64 size`, `u64 ino`.
+const STAT_SIZE: usize = 24;
+const KIND_FILE: u32 = 0;
+const KIND_DIR: u32 = 1;
+const KIND_SYMLINK: u32 = 2;
+const KIND_OTHER: u32 = 3;
+
+/// `fstat(fd, *Stat)`: fill the native 24-byte structure from the `VfsNode`.
+///
+/// `mode` is the permission bits only. An ext2 node reports its real mode; a
+/// synthetic node (the root, a mount wrapper) has none, so the documented
+/// defaults are 0o755 for a directory, 0o777 for a symlink and 0o644 for a file.
+/// `ino` is `VfsNode::fs_ino` or 0 for a synthetic node. The three console
+/// descriptors answer `kind = OTHER`, size 0, ino 0, mode 0o644.
+fn fstat(fd: usize, pointer: usize) -> isize {
+    let (kind, mode, size, ino) = match lookup(fd) {
+        Ok(OpenFd::ConsoleIn) | Ok(OpenFd::ConsoleOut) => (KIND_OTHER, 0o644u32, 0u64, 0u64),
+        Ok(OpenFd::File { node, .. }) => {
+            let is_dir = node.is_directory();
+            let is_link = node.is_symlink();
+            let kind = if is_dir {
+                KIND_DIR
+            } else if is_link {
+                KIND_SYMLINK
+            } else {
+                KIND_FILE
+            };
+            let declared = (node.mode() & 0o7777) as u32;
+            let mode = if declared != 0 {
+                declared
+            } else if is_dir {
+                0o755
+            } else if is_link {
+                0o777
+            } else {
+                0o644
+            };
+            (kind, mode, node.size(), node.fs_ino())
+        }
+        Err(error) => return error,
+    };
+
+    let mut stat = [0u8; STAT_SIZE];
+    stat[0..4].copy_from_slice(&mode.to_le_bytes());
+    stat[4..8].copy_from_slice(&kind.to_le_bytes());
+    stat[8..16].copy_from_slice(&size.to_le_bytes());
+    stat[16..24].copy_from_slice(&ino.to_le_bytes());
+    if let Err(error) = copy_to_user(pointer, &stat) {
+        return error;
+    }
+    FSTATS.fetch_add(1, Ordering::Relaxed);
+    0
+}
+
+/// Longest `Dirent` this layer can encode: 8-byte header + 255-byte name padded
+/// to 8. ext2's own name limit is the same 255 bytes.
+const DIRENT_MAX: usize = 8 + 256;
+
+/// `getdents64(fd, buf, len)`: encode the directory snapshot as the ABI's
+/// `Dirent` records, 8-byte aligned.
+///
+/// One record is `u64 ino`, `u8 kind`, `u8 name_len`, `u16 reserved`,
+/// `name[name_len]`, then zero padding to an 8-byte boundary. Records are
+/// produced until the next whole record does not fit in the caller's remaining
+/// buffer; no record is ever split. The cursor advances only for records that
+/// were copied, so a short buffer does not lose an entry.
+///
+/// Limitation, stated rather than hidden: if not even one record fits, the
+/// result is 0 — the same value as end-of-directory. The caller must use a
+/// buffer large enough for the longest name (264 bytes); the ABI itself defines
+/// the record this way.
+fn getdents64(fd: usize, buf: usize, len: usize) -> isize {
+    if len == 0 {
+        return 0;
+    }
+    if buf.checked_add(len).is_none() {
+        return fault();
+    }
+    let mut table = FDS.lock();
+    let Some(Some(FdEntry::File(file))) = table.slots.get_mut(fd) else {
+        return EBADF;
+    };
+    let Some(dir) = file.dir.as_mut() else {
+        return ENOTDIR;
+    };
+
+    let mut record = [0u8; DIRENT_MAX];
+    let mut total = 0usize;
+    while dir.index < dir.entries.len() {
+        let entry = &dir.entries[dir.index];
+        let name = entry.name().as_bytes();
+        if name.len() > 255 {
+            return if total > 0 {
+                total as isize
+            } else {
+                ENAMETOOLONG
+            };
+        }
+        let record_len = 8 + ((name.len() + 7) & !7);
+        if record_len > len - total {
+            break;
+        }
+        // `ino`, `kind`, `name_len`, `reserved`; the padding keeps the next
+        // record 8-byte aligned.
+        record[..record_len].fill(0);
+        record[0..8].copy_from_slice(&entry.fs_ino().to_le_bytes());
+        record[8] = if entry.is_directory() {
+            KIND_DIR as u8
+        } else if entry.is_symlink() {
+            KIND_SYMLINK as u8
+        } else {
+            KIND_FILE as u8
+        };
+        record[9] = name.len() as u8;
+        record[12..12 + name.len()].copy_from_slice(name);
+        if let Err(error) = copy_to_user(buf + total, &record[..record_len]) {
+            return if total > 0 { total as isize } else { error };
+        }
+        total += record_len;
+        dir.index += 1;
+        DIRENTS.fetch_add(1, Ordering::Relaxed);
+    }
+    total as isize
 }
 
 // ─── path helper ───────────────────────────────────────────────────────────
