@@ -14,10 +14,17 @@
 //! loader enforced. Every case also compares the free-frame count, because "an
 //! error costs the PMM nothing" is a claim about frames, not about return values.
 //!
+//! The last check is the streaming claim: `/mnt/selftest-large.elf` is the hello
+//! fixture padded with zeros to 100 KiB — more than one 64 KiB heap chunk — and
+//! `run_file` must execute it (`Exit::Code(42)`) without a whole-image buffer
+//! and without leaving frames or heap bytes behind. It prints `SKIP` when no
+//! filesystem is mounted, so the suite still runs on the serial-only boot.
+//!
 //! The scratch buffer is allocated once, before the ledger baseline, and reused
 //! for every case: the heap chunk is part of the harness, not of what the tests
 //! measure, and reusing it keeps `selftest` twice in one boot idempotent.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::arch::riscv64::traps::CAUSE_LOAD_PAGE_FAULT;
@@ -25,6 +32,7 @@ use crate::memory::pmm;
 use crate::user::elf::{self, ElfError, MAX_IMAGE_BYTES};
 use crate::user::syscall;
 use crate::user::{self, Exit, UserError, FAULT_ELF, HELLO_ELF, SPIN_ELF};
+use crate::vfs::{self, VfsError, VfsNode};
 
 /// The fixture's `e_entry`: `user.ld` places `_start` at the bottom of the first
 /// mapped page, 0x1_0000.
@@ -417,8 +425,181 @@ fn user_timer_preempts(_buf: &mut Vec<u8>) -> bool {
     ok
 }
 
-/// Run every check, print `SELFTEST user-<name> PASS|FAIL`, and return how many
-/// passed.
+/// The large-image check's scratch file and its padded size.
+///
+/// 100 KiB is deliberately more than one 64 KiB heap chunk (the old `run
+/// <path>` ceiling) and far more than the hello fixture's few KiB of segments:
+/// the loader must read only what the headers describe, so the zero tail never
+/// becomes an `ElfError`.
+const LARGE_FILE_PATH: &str = "/mnt/selftest-large.elf";
+const LARGE_FILE_NAME: &str = "selftest-large.elf";
+const LARGE_FILE_BYTES: u64 = 100 * 1024;
+
+/// Padding write size. One page: the check must never allocate a file-sized
+/// buffer itself, or it would not prove anything about the loader.
+const LARGE_WRITE_CHUNK: usize = 4096;
+
+/// Outcome of one check. A skip is neither a pass nor a failure and is counted
+/// separately, so a boot without a disk cannot look like full coverage (the
+/// same convention as the block suite).
+enum Outcome {
+    Pass,
+    Fail,
+    Skip(&'static str),
+}
+
+/// Wrap a boolean check in the [`Outcome`] type.
+fn verdict(ok: bool) -> Outcome {
+    if ok {
+        Outcome::Pass
+    } else {
+        Outcome::Fail
+    }
+}
+
+/// Write the hello fixture to the scratch file and pad it to
+/// [`LARGE_FILE_BYTES`] with zeros, one 4 KiB chunk at a time.
+fn write_large_image(file: &Arc<dyn VfsNode>) -> Result<(), &'static str> {
+    match file.write(0, HELLO_ELF) {
+        Ok(written) if written == HELLO_ELF.len() => {}
+        _ => return Err("writing the hello fixture to the scratch file failed"),
+    }
+    let zeros = [0u8; LARGE_WRITE_CHUNK];
+    let mut offset = HELLO_ELF.len() as u64;
+    while offset < LARGE_FILE_BYTES {
+        let take = core::cmp::min(LARGE_WRITE_CHUNK as u64, LARGE_FILE_BYTES - offset) as usize;
+        match file.write(offset, &zeros[..take]) {
+            Ok(written) if written == take => offset += take as u64,
+            Ok(_) => return Err("the scratch file accepted a short padding write"),
+            Err(_) => return Err("writing the image padding failed"),
+        }
+    }
+    if file.size() != LARGE_FILE_BYTES {
+        return Err("the scratch image is not the size that was written");
+    }
+    Ok(())
+}
+
+/// `run <path>` on an image larger than one 64 KiB heap chunk.
+///
+/// The file is the hello fixture followed by zero padding to 100 KiB. Every ELF
+/// header still describes its few KiB of `PT_LOAD` bytes, so a streaming loader
+/// stops at the last segment, ignores the tail and exits 42; a loader that
+/// validated or copied the whole file would fail on the size. The file is
+/// removed on every path (a failed write included), and the PMM and heap
+/// ledgers are compared with the values taken before it was created.
+fn user_run_large_file(_buf: &mut Vec<u8>) -> Outcome {
+    let dir = match vfs::walk("/mnt", true) {
+        Ok(node) if node.is_directory() => node,
+        Ok(_) => {
+            crate::kprintln!("[selftest] user: /mnt is not a directory");
+            return Outcome::Fail;
+        }
+        Err(VfsError::NotFound) => {
+            return Outcome::Skip("no filesystem mounted at /mnt");
+        }
+        Err(error) => {
+            crate::kprintln!("[selftest] user: cannot resolve /mnt: {}", error.as_str());
+            return Outcome::Fail;
+        }
+    };
+
+    // Idempotency: a crashed earlier pass must not turn the next one into
+    // `AlreadyExists` (and must not leave a 100 KiB file on the disk either).
+    match dir.remove(LARGE_FILE_NAME) {
+        Ok(()) | Err(VfsError::NotFound) => {}
+        Err(error) => {
+            crate::kprintln!(
+                "[selftest] user: cannot remove stale {}: {}",
+                LARGE_FILE_PATH,
+                error.as_str()
+            );
+            return Outcome::Fail;
+        }
+    }
+
+    // `dir` is alive on both sides of the measurement, and so is the heap chunk
+    // that backs it; only the scratch file's own allocations should move.
+    let (used_before, mapped_before, _) = crate::heap_stats();
+    let frames_before = frames();
+    let mut ok = true;
+
+    match dir.create_file(LARGE_FILE_NAME) {
+        Ok(file) => {
+            if let Err(reason) = write_large_image(&file) {
+                crate::kprintln!("[selftest] user: {}", reason);
+                ok = false;
+            }
+            // Drop our handle before the loader opens its own: the ledger below
+            // must not include a scratch `Arc` the test forgot.
+            drop(file);
+        }
+        Err(error) => {
+            crate::kprintln!(
+                "[selftest] user: cannot create {}: {}",
+                LARGE_FILE_PATH,
+                error.as_str()
+            );
+            ok = false;
+        }
+    }
+
+    if ok {
+        match user::run_file(LARGE_FILE_PATH) {
+            Ok(Exit::Code(42)) => {}
+            Ok(other) => {
+                crate::kprintln!(
+                    "[selftest] user: the 100 KiB image ended {other}, expected exit code 42"
+                );
+                ok = false;
+            }
+            Err(error) => {
+                crate::kprintln!("[selftest] user: the 100 KiB image failed: {error}");
+                ok = false;
+            }
+        }
+    }
+
+    match dir.remove(LARGE_FILE_NAME) {
+        Ok(()) | Err(VfsError::NotFound) => {}
+        Err(error) => {
+            crate::kprintln!(
+                "[selftest] user: cannot remove {}: {}",
+                LARGE_FILE_PATH,
+                error.as_str()
+            );
+            ok = false;
+        }
+    }
+
+    if frames() != frames_before {
+        crate::kprintln!(
+            "[selftest] user: the large-file run left the PMM at {} (was {})",
+            frames(),
+            frames_before
+        );
+        ok = false;
+    }
+    let (used, mapped, _) = crate::heap_stats();
+    if used != used_before || mapped != mapped_before {
+        crate::kprintln!(
+            "[selftest] user: the large-file run left the heap at {} B used / {} B mapped (was {}/{} B)",
+            used,
+            mapped,
+            used_before,
+            mapped_before
+        );
+        ok = false;
+    }
+    if ok {
+        Outcome::Pass
+    } else {
+        Outcome::Fail
+    }
+}
+
+/// Run every check, print `SELFTEST user-<name> PASS|FAIL|SKIP`, and return how
+/// many passed.
 pub fn run() -> usize {
     // The shell's `spawn` command may have left a demo cohort running. Its
     // threads are legitimate persistent state, but the ledger this suite prints
@@ -442,33 +623,54 @@ pub fn run() -> usize {
         total
     );
 
-    let checks: [(&str, fn(&mut Vec<u8>) -> bool); 7] = [
-        ("user-elf-accept", elf_accept),
-        ("user-elf-reject", elf_rejects),
-        ("user-run-rejects-bad-elf", run_rejects_bad_elf),
-        ("user-hello-roundtrip", user_hello),
-        ("user-fault-isolated", user_fault),
-        ("user-after-fault", user_after_fault),
-        ("user-timer-preempts", user_timer_preempts),
+    let checks: [(&str, fn(&mut Vec<u8>) -> Outcome); 8] = [
+        ("user-elf-accept", |buf| verdict(elf_accept(buf))),
+        ("user-elf-reject", |buf| verdict(elf_rejects(buf))),
+        ("user-run-rejects-bad-elf", |buf| {
+            verdict(run_rejects_bad_elf(buf))
+        }),
+        ("user-hello-roundtrip", |buf| verdict(user_hello(buf))),
+        ("user-fault-isolated", |buf| verdict(user_fault(buf))),
+        ("user-after-fault", |buf| verdict(user_after_fault(buf))),
+        ("user-timer-preempts", |buf| {
+            verdict(user_timer_preempts(buf))
+        }),
+        ("user-run-large-file", user_run_large_file),
     ];
     let mut passed = 0usize;
+    let mut skipped = 0usize;
     for (name, check) in checks {
-        let ok = check(&mut buf);
-        if ok {
-            passed += 1;
+        match check(&mut buf) {
+            Outcome::Pass => {
+                passed += 1;
+                crate::kprintln!("SELFTEST {} PASS", name);
+            }
+            Outcome::Fail => crate::kprintln!("SELFTEST {} FAIL", name),
+            Outcome::Skip(why) => {
+                skipped += 1;
+                crate::kprintln!("SELFTEST {} SKIP ({})", name, why);
+            }
         }
-        crate::kprintln!("SELFTEST {} {}", name, if ok { "PASS" } else { "FAIL" });
     }
 
     // Anything a failed check left exited is reaped here, so even a failing pass
     // hands the pool back the way it found it.
     crate::task::scheduler::reap();
     let (after, _) = pmm::stats();
-    crate::kprintln!(
-        "SELFTEST SUMMARY (user): {}/{} passed",
-        passed,
-        checks.len()
-    );
+    if skipped == 0 {
+        crate::kprintln!(
+            "SELFTEST SUMMARY (user): {}/{} passed",
+            passed,
+            checks.len()
+        );
+    } else {
+        crate::kprintln!(
+            "SELFTEST SUMMARY (user): {}/{} passed, {} skipped",
+            passed,
+            checks.len(),
+            skipped
+        );
+    }
     crate::kprintln!(
         "[selftest] user PMM hygiene: free frames {} -> {}",
         before,
