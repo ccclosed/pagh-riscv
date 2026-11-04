@@ -952,24 +952,40 @@ fn install_verified(
         }
     };
     if result.is_err() {
-        // A failed install must not leave a half-written program behind. The
-        // package file itself is removed by the caller.
-        let _ = bin_dir.remove(manifest.name());
-        if manifest.kind == Kind::AppletBundle {
-            remove_commands(&manifest, bin_dir);
-            let _ = bin_dir.remove("paghbox");
-        }
+        cleanup_install(&manifest, bin_dir);
     }
     result?;
 
+    // The manifest is the install's commit point, so it goes last. If it
+    // cannot be written, the program that was just copied must not stay: a
+    // binary without a manifest would be invisible to `pkg remove`/`installed`.
+    let stored_result = write_stored_manifest(&manifest, package_dir);
+    if stored_result.is_err() {
+        cleanup_install(&manifest, bin_dir);
+    }
+    stored_result?;
+    crate::kprintln!("pkg: installed {} {}", manifest.name(), manifest.version());
+    Ok(())
+}
+
+/// Remove whatever an interrupted install put under `/mnt/bin`. Best effort:
+/// the caller is already returning an error, and a cleanup failure must not
+/// replace it with a second one.
+fn cleanup_install(manifest: &Manifest, bin_dir: &Arc<dyn VfsNode>) {
+    let _ = bin_dir.remove(manifest.name());
+    if manifest.kind == Kind::AppletBundle {
+        remove_commands(manifest, bin_dir);
+        let _ = bin_dir.remove("paghbox");
+    }
+}
+
+fn write_stored_manifest(manifest: &Manifest, package_dir: &Arc<dyn VfsNode>) -> Result<(), Error> {
     let mut stored = [0u8; STORED_MANIFEST_CAPACITY];
     let stored_len = manifest.render(&mut stored)?;
     let mut file_name = [0u8; 48];
     let file_name = manifest_file_name(manifest.name(), &mut file_name)?;
     let node = open_for_write(package_dir, file_name)?;
-    write_all(&node, 0, &stored[..stored_len])?;
-    crate::kprintln!("pkg: installed {} {}", manifest.name(), manifest.version());
-    Ok(())
+    write_all(&node, 0, &stored[..stored_len])
 }
 
 fn install_app(
