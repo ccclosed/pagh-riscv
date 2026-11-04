@@ -26,3 +26,4 @@ build() {
 build hello.rs hello.elf
 build fault.rs fault.elf
 build spin.rs spin.elf
+build argv.rs argv.elf

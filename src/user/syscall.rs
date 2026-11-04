@@ -157,6 +157,9 @@ fn write(fd: usize, buf: usize, len: usize) -> isize {
             core::ptr::copy_nonoverlapping(va as *const u8, chunk.as_mut_ptr(), take);
         }
         crate::console::write_bytes(&chunk[..take]);
+        // The ABI selftest compares the exact line the argv fixture prints; this
+        // records only U-mode `write` bytes and is a no-op on a normal boot.
+        crate::user::capture_append(&chunk[..take]);
         offset += take;
     }
 

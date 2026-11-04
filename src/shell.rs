@@ -247,7 +247,7 @@ fn execute(line: &str, tree: &Fdt, state: &mut State) {
             crate::kprintln!("  ln [-s] <target> <path> create a hard or symbolic link");
             crate::kprintln!("  ramdisk [sectors]      TEST ONLY: format+mount a RAM disk at /mnt");
             crate::kprintln!(
-                "  run <path>             run a static RV64 ELF (<= 1 MiB) from the filesystem"
+                "  run <path> [args...]   run a static RV64 ELF (<= 1 MiB), argv[1..]=args"
             );
             crate::kprintln!(
                 "  run demo|fault|spin    run the embedded hello / fault / timer fixtures"
@@ -1062,35 +1062,52 @@ fn list_tasks() {
 
 // ─── user-mode programs (M6b) ──────────────────────────────────────────────
 
-/// `run <path>` / `run demo` / `run fault` / `run spin`: execute a static RV64
-/// ELF in U-mode.
+/// `run <path> [args...]` / `run demo` / `run fault` / `run spin`: execute a
+/// static RV64 ELF in U-mode.
+///
+/// A path is resolved against the shell's cwd and handed to
+/// `user::run_file_with_argv0`, which streams the image from the VFS: the loader
+/// reads the header, the program-header table and each segment in bounded
+/// chunks, so no file-sized heap buffer exists and an image up to
+/// `MAX_IMAGE_BYTES` (1 MiB) loads even though the heap allocates in 64 KiB
+/// chunks.
+///
+/// Everything after the path is the program's `argv[1..]`, split on whitespace
+/// only — the shell has no quoting or escaping, so an argument cannot contain a
+/// space (documented in `README.md`). `argv[0]` is the path exactly as typed,
+/// not its cwd-resolved form. The environment is `PWD=<cwd>`; the kernel has no
+/// inherited environment to add.
 ///
 /// `demo`, `fault` and `spin` are the embedded fixtures (`src/user/mod.rs`) and
-/// need no filesystem — they are the acceptance runs M6b names. A path is
-/// resolved against the shell's cwd and handed to `user::run_file`, which
-/// streams the image from the VFS: the loader reads the header, the
-/// program-header table and each segment in bounded chunks, so no file-sized
-/// heap buffer exists and an image up to `MAX_IMAGE_BYTES` (1 MiB) loads even
-/// though the heap allocates in 64 KiB chunks.
+/// need no filesystem — they are the acceptance runs M6b names. They keep
+/// `argc = 1` (`argv = [name]`) by contract, so extra words after a fixture name
+/// are ignored rather than silently changing the fixture's entry frame.
 ///
 /// The result line is stable enough for the E2E scripts to grep:
 /// `run: <name> exited with code N` or `run: <name> killed: <reason>`.
 fn cmd_run<'a>(mut args: impl Iterator<Item = &'a str>, state: &mut State) {
     let Some(argument) = args.next() else {
-        crate::kprintln!("run: usage: run <path> | run demo | run fault | run spin");
+        crate::kprintln!("run: usage: run <path> [args...] | run demo | run fault | run spin");
         return;
     };
     match argument {
+        // Fixtures: `argc = 1`, `argv = [name]`; trailing words are not passed.
         "demo" => run_one(crate::user::HELLO_ELF, "demo"),
         "fault" => run_one(crate::user::FAULT_ELF, "fault"),
         "spin" => run_one(crate::user::SPIN_ELF, "spin"),
         path => {
             let full = resolve_arg(state, path);
-            // `run_file` resolves the path again (it owns the VFS lookup) and
-            // returns the same `Exit` the fixtures do. Every error — missing
+            let argv: alloc::vec::Vec<&str> = args.collect();
+            // The ABI's environment is minimal and always carries PWD; there is
+            // no inherited env in this kernel, so the array has exactly one
+            // entry. `pwd` is a local and outlives the call.
+            let pwd = alloc::format!("PWD={}", state.cwd);
+            let env = [pwd.as_str()];
+            // `run_file_with_argv0` opens the resolved path but gives the
+            // program the path as typed in `argv[0]`. Every error — missing
             // path, directory, size outside 1 MiB, source I/O, loader refusal —
             // is one line, and nothing was left mapped by the time it prints.
-            match crate::user::run_file(&full) {
+            match crate::user::run_file_with_argv0(&full, path, &argv, &env) {
                 Ok(exit) => crate::kprintln!("run: {} {}", path, exit),
                 Err(error) => crate::kprintln!("run: {}: {}", full, error),
             }

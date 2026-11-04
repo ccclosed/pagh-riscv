@@ -31,7 +31,7 @@ use crate::arch::riscv64::traps::CAUSE_LOAD_PAGE_FAULT;
 use crate::memory::pmm;
 use crate::user::elf::{self, ElfError, MAX_IMAGE_BYTES};
 use crate::user::syscall;
-use crate::user::{self, Exit, UserError, FAULT_ELF, HELLO_ELF, SPIN_ELF};
+use crate::user::{self, Exit, UserError, ARGV_ELF, FAULT_ELF, HELLO_ELF, SPIN_ELF};
 use crate::vfs::{self, VfsError, VfsNode};
 
 /// The fixture's `e_entry`: `user.ld` places `_start` at the bottom of the first
@@ -283,6 +283,50 @@ fn elf_rejects(buf: &mut Vec<u8>) -> bool {
     ok &= matches!(biased, Err(ElfError::BadBias)) && frames() == before;
 
     ok
+}
+
+/// The entry-stack proof: run the argv fixture with three arguments and a
+/// `PWD=/` environment and require the exact line back, byte for byte.
+///
+/// Capturing the *console bytes* rather than trusting the exit code is what makes
+/// this a test of the layout: the fixture validates `argc`, `argv`, the NULL
+/// terminators, `envp == argv + argc + 1`, `sp == frame base` and 16-byte
+/// alignment internally, prints only when all of that holds, and the selftest
+/// compares the resulting transcript verbatim.
+const ARGV_LINE: &[u8] = b"argv: argc=3 argv[0]=argv.elf argv[1]=alpha argv[2]=beta env[0]=PWD=/\n";
+
+fn user_abi_argv(_buf: &mut Vec<u8>) -> Outcome {
+    let before = frames();
+    user::capture_start();
+    let result = user::run_image_with_args(ARGV_ELF, &["argv.elf", "alpha", "beta"], &["PWD=/"]);
+    let captured = user::capture_stop();
+
+    let mut ok = match result {
+        Ok(Exit::Code(0)) => true,
+        Ok(other) => {
+            crate::kprintln!("[selftest] user: the argv fixture ended {other}");
+            false
+        }
+        Err(error) => {
+            crate::kprintln!("[selftest] user: the argv fixture failed: {error}");
+            false
+        }
+    };
+    if captured.truncated || captured.bytes[..captured.len] != ARGV_LINE[..] {
+        crate::kprintln!(
+            "[selftest] user: argv transcript was {:?}",
+            core::str::from_utf8(&captured.bytes[..captured.len]).unwrap_or("<non-UTF-8>")
+        );
+        ok = false;
+    }
+    if frames() != before {
+        crate::kprintln!(
+            "[selftest] user: the argv run left the ledger at {} (was {before})",
+            frames()
+        );
+        ok = false;
+    }
+    verdict(ok)
 }
 
 /// The shell path's loader refusal: `run_image` must return `UserError::Elf`,
@@ -623,7 +667,8 @@ pub fn run() -> usize {
         total
     );
 
-    let checks: [(&str, fn(&mut Vec<u8>) -> Outcome); 8] = [
+    let checks: [(&str, fn(&mut Vec<u8>) -> Outcome); 9] = [
+        ("user-abi-argv", user_abi_argv),
         ("user-elf-accept", |buf| verdict(elf_accept(buf))),
         ("user-elf-reject", |buf| verdict(elf_rejects(buf))),
         ("user-run-rejects-bad-elf", |buf| {
