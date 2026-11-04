@@ -12,8 +12,15 @@
 //!   processes (only one runs at a time; see `src/user/mod.rs`).
 //! * **Validate before mapping where possible.** Header, program-header table,
 //!   per-segment bounds, flags, alignment, the entry point and the page count are
-//!   all checked against the input buffer and the user window before the first
-//!   frame is allocated. A request that fails here costs the PMM nothing.
+//!   all checked against the [`ImageSource`]'s length and the user window before
+//!   the first frame is allocated. A request that fails here costs the PMM
+//!   nothing.
+//! * **Stream, never buffer.** The image is read through [`ImageSource`] in
+//!   bounded pieces: a 64-byte header, a program-header table bounded by
+//!   [`MAX_PHDRS`], and each `PT_LOAD` segment copied into its already-mapped
+//!   pages in 4 KiB chunks. The loader has no whole-image allocation, which is
+//!   what lets `run <path>` accept an image up to [`MAX_IMAGE_BYTES`] (1 MiB)
+//!   even though the kernel heap hands out 64 KiB chunks.
 //! * **Roll back mapping failures.** Once pages are mapped, an error (an address
 //!   already mapped, an empty frame pool) unwinds every page this call installed
 //!   and returns the frames. The selftest's ledger check is what keeps that
@@ -78,6 +85,97 @@ const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
 
+/// Why a source read failed.
+///
+/// Deliberately small and allocation-free: the loader turns it into
+/// [`ElfError::Source`] or [`ElfError::Truncated`], and the shell prints the
+/// carried string. The VFS adapter maps [`crate::vfs::VfsError`] into
+/// [`SourceError::Io`] with that error's own one-line text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceError {
+    /// The backing store refused the read; the string is its reason.
+    Io(&'static str),
+    /// The requested range starts or ends past the source's own length.
+    OutOfBounds,
+}
+
+impl fmt::Display for SourceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SourceError::Io(reason) => f.write_str(reason),
+            SourceError::OutOfBounds => f.write_str("read past the end of the image"),
+        }
+    }
+}
+
+/// A random-access byte source the loader reads an image from.
+///
+/// The loader never asks for the whole image: it reads the 64-byte ELF header,
+/// the program-header table and then each `PT_LOAD` segment in page-sized
+/// chunks. The embedded fixtures use the [`&[u8]`](ImageSource) implementation;
+/// `src/user/mod.rs` implements this for a VFS file, so `run <path>` streams
+/// from ext2 and never allocates a whole-image buffer.
+///
+/// Contract: `read_at(offset, buf)` returns `Ok(n)` with `n <= buf.len()`; `0`
+/// means end of source; an error means the read failed. A source may return
+/// fewer bytes than `buf.len()` — the loader loops — but it must never claim
+/// more than it wrote. `len()` is used for the cheap bounds checks up front;
+/// every actual read is still checked, and a source that ends early produces
+/// [`ElfError::Truncated`], never a panic.
+pub trait ImageSource {
+    /// Total length of the image in bytes.
+    fn len(&self) -> u64;
+
+    /// Read up to `buf.len()` bytes at `offset`.
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, SourceError>;
+}
+
+impl ImageSource for [u8] {
+    fn len(&self) -> u64 {
+        <[u8]>::len(self) as u64
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, SourceError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let start = usize::try_from(offset).map_err(|_| SourceError::OutOfBounds)?;
+        let end = start
+            .checked_add(buf.len())
+            .ok_or(SourceError::OutOfBounds)?;
+        let source = <[u8]>::get(self, start..end).ok_or(SourceError::OutOfBounds)?;
+        buf.copy_from_slice(source);
+        Ok(source.len())
+    }
+}
+
+/// Fill `buf` from `source` at `offset`, looping over short reads.
+///
+/// A source that ends before `offset + buf.len()` is [`ElfError::Truncated`]; an
+/// I/O failure is [`ElfError::Source`]. This is the only read primitive in the
+/// loader — there is no path that indexes a whole-image slice.
+fn read_exact<S: ImageSource + ?Sized>(
+    source: &S,
+    offset: u64,
+    buf: &mut [u8],
+) -> Result<(), ElfError> {
+    let mut done = 0usize;
+    while done < buf.len() {
+        let at = offset.checked_add(done as u64).ok_or(ElfError::Overflow)?;
+        let result = source.read_at(at, &mut buf[done..]);
+        match result {
+            Ok(0) => return Err(ElfError::Truncated),
+            Ok(read) if read <= buf.len() - done => done += read,
+            // A source that claims more than it was given a buffer for is
+            // broken; refuse it instead of trusting the count.
+            Ok(_) => return Err(ElfError::Source(SourceError::Io("invalid read length"))),
+            Err(SourceError::OutOfBounds) => return Err(ElfError::Truncated),
+            Err(error) => return Err(ElfError::Source(error)),
+        }
+    }
+    Ok(())
+}
+
 /// Why an ELF was refused, or a page could not be installed.
 ///
 /// The variants are the loader's public diagnostic vocabulary: `run` prints
@@ -101,11 +199,16 @@ pub enum ElfError {
     BadMachine,
     /// `e_version`, `e_ehsize` or `e_phentsize` is not what ELF64 requires.
     BadHeader,
-    /// The program-header table does not fit in the buffer.
+    /// The program-header table does not fit in the source.
     ProgramHeadersOutOfBounds,
     /// One `PT_LOAD` header contradicts itself (`filesz > memsz`, bad flags,
-    /// bad alignment) or points past the buffer.
+    /// bad alignment) or points past the source.
     BadSegment,
+    /// The source ended before a range the headers promised (a short file, or a
+    /// read that returned 0 mid-segment).
+    Truncated,
+    /// The source refused a read; the reason is carried in [`SourceError`].
+    Source(SourceError),
     /// No `PT_LOAD` header at all, or more than [`MAX_SEGMENTS`].
     NoLoadableSegment,
     /// The image needs more than [`MAX_IMAGE_PAGES`] or [`MAX_IMAGE_BYTES`].
@@ -141,6 +244,8 @@ impl ElfError {
             ElfError::BadHeader => "malformed ELF header",
             ElfError::ProgramHeadersOutOfBounds => "program headers outside the file",
             ElfError::BadSegment => "malformed PT_LOAD segment",
+            ElfError::Truncated => "image ended before the data its headers promise",
+            ElfError::Source(_) => "reading the image failed",
             ElfError::NoLoadableSegment => "no PT_LOAD segments",
             ElfError::ImageTooLarge => "image is too large for the user window",
             ElfError::SegmentOutsideUserWindow => "segment outside the user windows",
@@ -161,6 +266,7 @@ impl fmt::Display for ElfError {
             ElfError::AddressInUse(address) => {
                 write!(f, "{} at {address:#x}", self.as_str())
             }
+            ElfError::Source(error) => write!(f, "{}: {error}", self.as_str()),
             _ => f.write_str(self.as_str()),
         }
     }
@@ -247,46 +353,54 @@ fn u64_at(bytes: &[u8], offset: usize) -> Option<u64> {
     ]))
 }
 
-/// Load `bytes` at an optional `bias`.
+/// Load the image behind `source` at an optional `bias`.
 ///
 /// `bias` is added to every `p_vaddr` and to `e_entry`; it is how a static PIE
 /// (`ET_DYN`) is placed. `ET_EXEC` files must be loaded with `bias == 0`.
 ///
+/// The image is read in bounded pieces through [`ImageSource`]: the header, the
+/// program-header table, and each segment copied into its mapped pages in 4 KiB
+/// chunks. No whole-image buffer exists, so an image larger than one 64 KiB heap
+/// chunk is loaded normally.
+///
 /// On `Err`, every page mapped by this call has already been unmapped and its
 /// frame returned: the PMM ledger is the same as before the call.
-pub fn load(bytes: &[u8], bias: usize) -> Result<Loaded, ElfError> {
+pub fn load<S: ImageSource + ?Sized>(source: &S, bias: usize) -> Result<Loaded, ElfError> {
     // ── ELF header ────────────────────────────────────────────────────────
-    if bytes.len() < EHDR_SIZE {
+    let source_len = source.len();
+    if source_len < EHDR_SIZE as u64 {
         return Err(ElfError::Short);
     }
-    if bytes.get(0..4) != Some(b"\x7fELF") {
+    let mut ehdr = [0u8; EHDR_SIZE];
+    read_exact(source, 0, &mut ehdr)?;
+    if ehdr.get(0..4) != Some(b"\x7fELF") {
         return Err(ElfError::BadMagic);
     }
-    if bytes.get(4) != Some(&2) {
+    if ehdr.get(4) != Some(&2) {
         return Err(ElfError::BadClass);
     }
-    if bytes.get(5) != Some(&1) {
+    if ehdr.get(5) != Some(&1) {
         return Err(ElfError::BadData);
     }
-    if bytes.get(6) != Some(&1) {
+    if ehdr.get(6) != Some(&1) {
         return Err(ElfError::BadIdentVersion);
     }
 
-    let e_type = u16_at(bytes, 16).ok_or(ElfError::Short)?;
+    let e_type = u16_at(&ehdr, 16).ok_or(ElfError::Short)?;
     if e_type != ET_EXEC && e_type != ET_DYN {
         return Err(ElfError::BadType);
     }
-    if u16_at(bytes, 18).ok_or(ElfError::Short)? != EM_RISCV {
+    if u16_at(&ehdr, 18).ok_or(ElfError::Short)? != EM_RISCV {
         return Err(ElfError::BadMachine);
     }
-    if u32_at(bytes, 20).ok_or(ElfError::Short)? != 1 {
+    if u32_at(&ehdr, 20).ok_or(ElfError::Short)? != 1 {
         return Err(ElfError::BadHeader);
     }
-    let entry_raw = u64_at(bytes, 24).ok_or(ElfError::Short)? as usize;
-    let phoff = u64_at(bytes, 32).ok_or(ElfError::Short)? as usize;
-    let ehsize = u16_at(bytes, 52).ok_or(ElfError::Short)? as usize;
-    let phentsize = u16_at(bytes, 54).ok_or(ElfError::Short)? as usize;
-    let phnum = u16_at(bytes, 56).ok_or(ElfError::Short)? as usize;
+    let entry_raw = u64_at(&ehdr, 24).ok_or(ElfError::Short)? as usize;
+    let phoff = u64_at(&ehdr, 32).ok_or(ElfError::Short)? as usize;
+    let ehsize = u16_at(&ehdr, 52).ok_or(ElfError::Short)? as usize;
+    let phentsize = u16_at(&ehdr, 54).ok_or(ElfError::Short)? as usize;
+    let phnum = u16_at(&ehdr, 56).ok_or(ElfError::Short)? as usize;
     if ehsize != EHDR_SIZE || phentsize != PHDR_SIZE {
         return Err(ElfError::BadHeader);
     }
@@ -297,9 +411,12 @@ pub fn load(bytes: &[u8], bias: usize) -> Result<Loaded, ElfError> {
         .checked_mul(PHDR_SIZE)
         .and_then(|size| phoff.checked_add(size))
         .ok_or(ElfError::Overflow)?;
-    if ph_end > bytes.len() {
+    if ph_end as u64 > source_len {
         return Err(ElfError::ProgramHeadersOutOfBounds);
     }
+    let mut phdrs = [0u8; MAX_PHDRS * PHDR_SIZE];
+    let phdrs_len = phnum * PHDR_SIZE;
+    read_exact(source, phoff as u64, &mut phdrs[..phdrs_len])?;
 
     if e_type == ET_EXEC && bias != 0 {
         return Err(ElfError::BadBias);
@@ -321,20 +438,20 @@ pub fn load(bytes: &[u8], bias: usize) -> Result<Loaded, ElfError> {
     let mut plan_count = 0usize;
 
     for index in 0..phnum {
-        let base = phoff + index * PHDR_SIZE;
-        let p_type = u32_at(bytes, base).ok_or(ElfError::Short)?;
+        let base = index * PHDR_SIZE;
+        let p_type = u32_at(&phdrs, base).ok_or(ElfError::Short)?;
         if p_type != PT_LOAD {
             continue;
         }
         if segment_count == MAX_SEGMENTS {
             return Err(ElfError::NoLoadableSegment);
         }
-        let file_offset = u64_at(bytes, base + 8).ok_or(ElfError::Short)? as usize;
-        let raw_vaddr = u64_at(bytes, base + 16).ok_or(ElfError::Short)? as usize;
-        let filesz = u64_at(bytes, base + 32).ok_or(ElfError::Short)? as usize;
-        let memsz = u64_at(bytes, base + 40).ok_or(ElfError::Short)? as usize;
-        let flags = u32_at(bytes, base + 4).ok_or(ElfError::Short)?;
-        let align = u64_at(bytes, base + 48).ok_or(ElfError::Short)? as usize;
+        let file_offset = u64_at(&phdrs, base + 8).ok_or(ElfError::Short)? as usize;
+        let raw_vaddr = u64_at(&phdrs, base + 16).ok_or(ElfError::Short)? as usize;
+        let filesz = u64_at(&phdrs, base + 32).ok_or(ElfError::Short)? as usize;
+        let memsz = u64_at(&phdrs, base + 40).ok_or(ElfError::Short)? as usize;
+        let flags = u32_at(&phdrs, base + 4).ok_or(ElfError::Short)?;
+        let align = u64_at(&phdrs, base + 48).ok_or(ElfError::Short)? as usize;
 
         if filesz > memsz {
             return Err(ElfError::BadSegment);
@@ -347,7 +464,7 @@ pub fn load(bytes: &[u8], bias: usize) -> Result<Loaded, ElfError> {
             return Err(ElfError::BadSegment);
         }
         let file_end = file_offset.checked_add(filesz).ok_or(ElfError::Overflow)?;
-        if file_end > bytes.len() {
+        if file_end as u64 > source_len {
             return Err(ElfError::BadSegment);
         }
         let vaddr = raw_vaddr.checked_add(bias).ok_or(ElfError::Overflow)?;
@@ -458,7 +575,12 @@ pub fn load(bytes: &[u8], bias: usize) -> Result<Loaded, ElfError> {
         }
     }
 
-    // ── copy file bytes; the rest of every page is already zero ───────────
+    // ── stream the file bytes; the rest of every page is already zero ─────
+    //
+    // One 4 KiB stack buffer serves every segment: each read is bounded by the
+    // page it lands in, so the loader's own footprint does not grow with the
+    // image (a 1 MiB image is 256 chunks of at most 4 KiB, not one 1 MiB Vec).
+    let mut page_buf = [0u8; FRAME_SIZE];
     for segment in &segments[..segment_count] {
         let mut copied = 0usize;
         while copied < segment.filesz {
@@ -467,32 +589,30 @@ pub fn load(bytes: &[u8], bias: usize) -> Result<Loaded, ElfError> {
             let offset_in_page = va - page;
             let available = FRAME_SIZE - offset_in_page;
             let bytes_left = segment.filesz - copied;
-            let chunk = available.min(bytes_left);
+            let take = available.min(bytes_left).min(FRAME_SIZE);
             let source_start = segment.file_offset + copied;
-            let Some(source) = bytes.get(source_start..source_start + chunk) else {
+            if let Err(error) = read_exact(source, source_start as u64, &mut page_buf[..take]) {
                 loaded.release();
-                return Err(ElfError::BadSegment);
-            };
+                return Err(error);
+            }
             let Some(frame) = paging::translate(page) else {
                 loaded.release();
                 return Err(ElfError::Map(paging::MapError::NotMapped(page)));
             };
             // SAFETY: `frame` is the physical base of a page this call mapped,
-            // and the destination range `offset_in_page..offset_in_page+chunk`
-            // lies inside that 4 KiB frame. `source` is a validated subslice of
-            // the caller's buffer; the regions cannot overlap because one is the
-            // ELF buffer and the other is a PMM frame, and nothing else is using
-            // either for the duration of this copy. The frame is still mapped
-            // supervisor-RW in the identity map, which is how this store reaches
-            // it before the user ever runs.
+            // and the destination range `offset_in_page..offset_in_page+take`
+            // lies inside that 4 KiB frame. `page_buf` is a live stack array
+            // disjoint from the PMM frame, and `take <= FRAME_SIZE`; the frame
+            // is still mapped supervisor-RW in the identity map, which is how
+            // this store reaches it before the user ever runs.
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    source.as_ptr(),
+                    page_buf.as_ptr(),
                     (frame + offset_in_page) as *mut u8,
-                    chunk,
+                    take,
                 )
             };
-            copied += chunk;
+            copied += take;
         }
     }
 
