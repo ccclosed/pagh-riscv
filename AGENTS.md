@@ -351,7 +351,7 @@ fuzzing. That is a gap, not a policy — the rule stands:
 
 ## Versioning
 
-Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.7.0`,
+Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.10.0`,
 which `Cargo.lock` mirrors. **The two move together in one commit**: CI builds with
 `--locked`, and cargo refuses to rewrite the lock (`cannot update the lock file …
 because --locked was passed`), so a `Cargo.toml`-only bump fails the build job in
@@ -370,8 +370,13 @@ seconds. Verify locally with `cargo build --locked` after any version change.
   whose manifest still said `0.1.0` (the drift this rule exists to prevent); it is
   left as history, and `0.4.0` is the first tag that matches its manifest (M3/M5/M6a landed after `0.3.0` was written but before it was tagged). `0.5.0` ships M6b; `0.6.0` ships M7 (the network: virtio-net + own stack, DHCP,
   DNS, ICMP, a TCP client); `0.7.0` ships M8 (virtio-input pointer and the
-  software cursor that is part of the console's frame). The same rule applies to both: the tag equals the
-  manifest and the `Cargo.lock` entry, and the release is not optional.
+  software cursor that is part of the console's frame); `0.8.0` ships the
+  streaming `run <path>` (risk #5); `0.9.0` ships the virtio-keyboard; `0.9.1`
+  makes `run.sh` open the window by default; `0.10.0` ships the native userland
+  ABI (argv/envp, 15 syscalls, fd table, brk heap) and the native `pkg` installer
+  (HTTP index + `.ppkg`, size/SHA-256 gate before parsing). The same rule applies
+  to both: the tag equals the manifest and the `Cargo.lock` entry, and the
+  release is not optional.
 
 ## Known gaps (documented, not hidden)
 

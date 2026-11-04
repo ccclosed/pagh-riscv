@@ -543,7 +543,7 @@ User-страницы кладутся в **ту же** Sv39-карту с `U=1`
 | 78 | `readlinkat` | цель ссылки без NUL (`lookup_path`, последняя ссылка не разыменовывается); не ссылка — `-EINVAL` |
 | 101 | `nanosleep` | `Timespec` проверяется, округляется вверх до тика; ждёт `timer::sleep_ticks` с временно разрешёнными прерываниями (иначе тики не идут), `rem` игнорируется |
 | 113 | `clock_gettime` | id 0/1 — тиковое время (`Timespec`, 10 ms); иначе `-EINVAL` |
-| 160 | `uname` | 5×16 B: `pagh`, `pagh-riscv`, `0.10.0-dev`, версия пакета, `riscv64` |
+| 160 | `uname` | 5×16 B: `pagh`, `pagh-riscv`, `0.10.0`, версия пакета, `riscv64` |
 | 214 | `brk` | окно 1 MiB в `0x2000_0000..0x2010_0000`, постранично из PMM, кадры в `RunState`; за окном — `-ENOMEM`, частичный рост откатывается |
 | 93 | `exit` | `Exit::Code(a0)`, `scheduler::exit` — не возвращается |
 | 124 | `sched_yield` | `scheduler::yield_now()`, возврат в U |
@@ -573,7 +573,7 @@ User-страницы кладутся в **ту же** Sv39-карту с `U=1`
 сигналов, `mmap`, динамического ELF и per-process page table. 16 fd, heap ровно
 1 MiB, `getdents64` без записи в буфере отдаёт 0 (неотличимо от конца каталога —
 буфер на 264 B покрывает имя ext2), `openat` игнорирует `mode`, `uname.release`
-намеренно `0.10.0-dev` при `Cargo.toml` 0.9.1 (версию поднимет release-коммит).
+намеренно `0.10.0` при `Cargo.toml` 0.9.1 (версию поднимет release-коммит).
 Подробности — [`../src/user/README.md`](../src/user/README.md) и
 [`../userland/README.md`](../userland/README.md).
 

@@ -958,16 +958,14 @@ fn put_uname_field(buf: &mut [u8; UNAME_SIZE], index: usize, text: &[u8]) {
 
 /// `uname(*Uname)`: system identity for libpagh.
 ///
-/// The release string is the ABI baseline's `0.10.0-dev` even though
-/// `Cargo.toml` is still `0.9.1` on this branch: the version bump is the release
-/// commit's job, and the userland side matches the ABI document, not a build
-/// number. `version` reports the actual package version so the two are not
-/// silently conflated.
+/// The release string is the ABI baseline (`0.10.0`); `version` reports the
+/// package version, so the two are not silently conflated. Both change in the
+/// release commit that bumps `Cargo.toml`.
 fn uname(pointer: usize) -> isize {
     let mut buffer = [0u8; UNAME_SIZE];
     put_uname_field(&mut buffer, 0, b"pagh");
     put_uname_field(&mut buffer, 1, b"pagh-riscv");
-    put_uname_field(&mut buffer, 2, b"0.10.0-dev");
+    put_uname_field(&mut buffer, 2, b"0.10.0");
     put_uname_field(&mut buffer, 3, env!("CARGO_PKG_VERSION").as_bytes());
     put_uname_field(&mut buffer, 4, b"riscv64");
     if let Err(error) = copy_to_user(pointer, &buffer) {
