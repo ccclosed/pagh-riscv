@@ -58,9 +58,13 @@ const CONNECT_TICKS: u64 = 300;
 /// those (200 ms, 400 ms, …) must fit inside one bounded step. Three seconds
 /// was enough for a single segment exchange and not for a 13 KiB package.
 const DATA_TICKS: u64 = 1000;
-/// Poll iterations before a step is declared stuck (bounds a machine whose clock
-/// does not advance).
-const STEP_ITERATIONS: u64 = 8_000_000;
+/// Poll iterations allowed **while the tick clock is not advancing**. The cap
+/// exists only so a machine whose timer never fires cannot spin forever; when
+/// ticks do advance, the tick deadline is the bound. Counting every iteration
+/// instead made the data timeout shorter than the 10 s it claims: the release
+/// kernel polled 8 M times in under 3 s and abandoned a download whose retrans-
+/// mission was still in flight.
+const STEP_ITERATIONS: u64 = 2_000_000;
 
 /// Connection state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,8 +327,9 @@ pub fn on_segment(src: Ipv4, dst: Ipv4, segment: &[u8]) {
 /// Wait for the socket to reach a state satisfying `done`, polling the NIC.
 /// `ticks` is the bound in 10 ms timer ticks; there is no blocking sleep.
 fn wait_for(done: impl Fn(&Socket) -> bool, ticks: u64) -> bool {
-    let deadline = timer::ticks().saturating_add(ticks);
-    let mut iterations = 0u64;
+    let start = timer::ticks();
+    let deadline = start.saturating_add(ticks);
+    let mut stalled = 0u64;
     loop {
         poll();
         {
@@ -336,10 +341,17 @@ fn wait_for(done: impl Fn(&Socket) -> bool, ticks: u64) -> bool {
                 return false;
             }
         }
-        if timer::ticks() >= deadline || iterations >= STEP_ITERATIONS {
+        let now = timer::ticks();
+        if now >= deadline {
             return false;
         }
-        iterations += 1;
+        if now == start {
+            // The clock is not moving: bound the spin, not the nominal wait.
+            stalled += 1;
+            if stalled >= STEP_ITERATIONS {
+                return false;
+            }
+        }
         core::hint::spin_loop();
     }
 }
