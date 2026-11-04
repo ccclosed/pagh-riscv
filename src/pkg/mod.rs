@@ -58,14 +58,16 @@ const NAME_CAPACITY: usize = 32;
 const VERSION_CAPACITY: usize = 16;
 const SHA_CAPACITY: usize = 65;
 const URL_CAPACITY: usize = 96;
-/// Longest index line the parser accepts (the fields above plus six tabs).
-const INDEX_LINE_CAPACITY: usize = 256;
+/// Longest index line the parser accepts. The five stored fields occupy about
+/// 250 bytes; the `kind`/`commands` columns are not stored, but a bundle can
+/// list many commands, so the line buffer is generous (it is stack, not heap).
+const INDEX_LINE_CAPACITY: usize = 2048;
 /// Manifest bytes read into one stack buffer. The format has no explicit
 /// ceiling; 2 KiB is generous for the keys the installer reads.
 const MANIFEST_CAPACITY: usize = 2048;
-const COMMANDS_CAPACITY: usize = 256;
+const COMMANDS_CAPACITY: usize = 512;
 /// Command names honoured from one `applet-bundle` manifest.
-const MAX_COMMANDS: usize = 16;
+const MAX_COMMANDS: usize = 32;
 /// A stored manifest is a small text file under `/mnt/pkg`.
 const STORED_MANIFEST_CAPACITY: usize = 512;
 /// Stream chunk: the same 4 KiB the shell's `cat`/`cp` use and the TCP client's
@@ -1000,7 +1002,9 @@ fn install_bundle(
     let mut count = 0;
     for command in manifest.commands() {
         count += 1;
-        if count > MAX_COMMANDS || !valid_name(command) {
+        // `paghbox` is the bundle's own payload; a link with that name would
+        // replace the program with a self-referential symlink.
+        if count > MAX_COMMANDS || !valid_name(command) || command == "paghbox" {
             return Err(Error::BadManifest);
         }
         // Reinstalling replaces the old link instead of failing on it.
