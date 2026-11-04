@@ -589,6 +589,67 @@ impl FramebufferWriter {
     /// it explicitly: [`Self::clear`] marks the whole surface, [`Self::scroll`]
     /// the whole text area. A new drawing primitive that bypasses `put_pixel`
     /// would show as a stale rectangle.
+    /// Read one pixel back from the shadow surface.
+    ///
+    /// The cursor overlay needs the pixels it is about to cover so that moving
+    /// the arrow restores the text underneath. The surface stores XRGB as
+    /// `[B, G, R, X]`, which is what [`Self::put_pixel`] writes.
+    fn get_pixel(&self, x: usize, y: usize) -> u32 {
+        if x >= self.width || y >= self.height || self.bpp < 3 {
+            return 0;
+        }
+        let offset = y * self.pitch + x * self.bpp;
+        // SAFETY: `offset` is inside `pitch * height == SURFACE_BYTES`, the
+        // surface this writer owns; reads are side-effect free.
+        unsafe {
+            let p = (self.back as *const u8).add(offset);
+            (core::ptr::read_volatile(p) as u32)
+                | ((core::ptr::read_volatile(p.add(1)) as u32) << 8)
+                | ((core::ptr::read_volatile(p.add(2)) as u32) << 16)
+        }
+    }
+
+    /// Put the arrow at `(x, y)`, saving what it covers and pushing only the
+    /// arrow's rectangle to the device.
+    fn overlay_draw(&mut self, cursor: &mut Cursor) {
+        let x = cursor.x.min(self.width.saturating_sub(CURSOR_W));
+        let y = cursor.y.min(self.height.saturating_sub(CURSOR_H));
+        cursor.x = x;
+        cursor.y = y;
+        for row in 0..CURSOR_H {
+            for col in 0..CURSOR_W {
+                let px = x + col;
+                let py = y + row;
+                cursor.saved[row * CURSOR_W + col] = self.get_pixel(px, py);
+                let colour = match ARROW[row].as_bytes().get(col).copied() {
+                    Some(b'#') => Some(CURSOR_BORDER),
+                    Some(b'o') => Some(CURSOR_FILL),
+                    _ => None,
+                };
+                if let Some(colour) = colour {
+                    self.put_pixel(px, py, colour);
+                }
+            }
+        }
+        cursor.have_saved = true;
+        self.flush_rect(x, y, CURSOR_W, CURSOR_H);
+    }
+
+    /// Restore the pixels the arrow covered and push that rectangle.
+    fn overlay_erase(&mut self, cursor: &mut Cursor) {
+        if !cursor.have_saved {
+            return;
+        }
+        let (x, y) = (cursor.x, cursor.y);
+        for row in 0..CURSOR_H {
+            for col in 0..CURSOR_W {
+                self.put_pixel(x + col, y + row, cursor.saved[row * CURSOR_W + col]);
+            }
+        }
+        cursor.have_saved = false;
+        self.flush_rect(x, y, CURSOR_W, CURSOR_H);
+    }
+
     fn flush(&mut self) -> bool {
         let Some((x0, y0, x1, y1)) = self.dirty.take() else {
             return false;
@@ -803,15 +864,77 @@ impl fmt::Write for FramebufferWriter {
     }
 }
 
+// ─── software cursor overlay ───────────────────────────────────────────────
+
+/// The arrow's cell. Same shape as the x86 console's cursor, and for the same
+/// reason: there is no hardware cursor plane on `ramfb`, so the pixels are
+/// painted into the shadow surface and pushed with the frame.
+const CURSOR_W: usize = 12;
+const CURSOR_H: usize = 19;
+
+const CURSOR_BORDER: u32 = 0x000000;
+const CURSOR_FILL: u32 = 0xFFFFFF;
+
+/// Arrow shape: `#` black border, `o` white fill, ` ` transparent.
+const ARROW: [&str; CURSOR_H] = [
+    "#",
+    "##",
+    "#o#",
+    "#oo#",
+    "#ooo#",
+    "#oooo#",
+    "#ooooo#",
+    "#oooooo#",
+    "#ooooooo#",
+    "#oooooooo#",
+    "#ooooo#####",
+    "#oo#oo#",
+    "#o# #oo#",
+    "##  #oo#",
+    "#    #oo#",
+    "      #oo#",
+    "      #oo#",
+    "       #o#",
+    "       ##",
+];
+
+/// The overlay's own state: where the arrow is, whether it is on, and the
+/// pixels it covers (saved so erasing restores the text underneath instead of
+/// painting a hole).
+struct Cursor {
+    x: usize,
+    y: usize,
+    enabled: bool,
+    have_saved: bool,
+    saved: [u32; CURSOR_W * CURSOR_H],
+}
+
+impl Cursor {
+    const fn new() -> Self {
+        Cursor {
+            x: 0,
+            y: 0,
+            enabled: false,
+            have_saved: false,
+            saved: [0; CURSOR_W * CURSOR_H],
+        }
+    }
+}
+
 /// The console handle: the writer behind one lock, plus the frame boundary.
 struct FbWriter {
     inner: Spinlock<Option<FramebufferWriter>>,
+    /// The software cursor. Separate lock from the writer: the overlay is drawn
+    /// on every frame, and a lock ordering of "writer, then cursor" is kept
+    /// everywhere so the two cannot deadlock.
+    cursor: Spinlock<Cursor>,
 }
 
 impl FbWriter {
     const fn new() -> Self {
         FbWriter {
             inner: Spinlock::new(None),
+            cursor: Spinlock::new(Cursor::new()),
         }
     }
 
@@ -824,7 +947,12 @@ impl FbWriter {
     /// `write_str` is a fragment of a formatted call, and the frame boundary is
     /// [`Self::write_fmt_now`].
     fn write_str(&self, s: &str) {
-        if let Some(writer) = self.inner.lock().as_mut() {
+        let mut inner = self.inner.lock();
+        let mut cursor = self.cursor.lock();
+        if let Some(writer) = inner.as_mut() {
+            if cursor.enabled && cursor.have_saved {
+                writer.overlay_erase(&mut cursor);
+            }
             writer.write_string(s);
         }
     }
@@ -837,10 +965,72 @@ impl FbWriter {
     /// exactly how a boot log ends up looking truncated.
     fn write_fmt_now(&self, args: fmt::Arguments) {
         use core::fmt::Write;
-        if let Some(writer) = self.inner.lock().as_mut() {
+        self.paint_frame(|writer| {
             let _ = writer.write_fmt(args);
             writer.flush();
+        });
+    }
+
+    /// Run `draw` as one frame with the software cursor kept on top.
+    ///
+    /// The overlay is part of the frame, not a separate layer the device can
+    /// composite: before the text is drawn the previously-covered pixels are
+    /// restored (so a character written under the arrow is not lost), and after
+    /// the frame is flushed the arrow is painted again and its rectangle pushed.
+    /// Readers of the screen therefore never see a frame without the cursor, and
+    /// never see stale arrow pixels left behind by a move.
+    fn paint_frame<R>(&self, draw: impl FnOnce(&mut FramebufferWriter) -> R) -> Option<R> {
+        let mut inner = self.inner.lock();
+        let mut cursor = self.cursor.lock();
+        let writer = inner.as_mut()?;
+        if cursor.enabled && cursor.have_saved {
+            writer.overlay_erase(&mut cursor);
         }
+        let result = draw(writer);
+        if cursor.enabled {
+            writer.overlay_draw(&mut cursor);
+        }
+        Some(result)
+    }
+
+    /// Move the overlay to `(x, y)` and push the two small rectangles it left
+    /// and now occupies. No-op until [`Self::cursor_enable`] says a pointer
+    /// device exists — a machine without one must not grow an arrow.
+    fn cursor_move_to(&self, x: usize, y: usize) {
+        let mut inner = self.inner.lock();
+        let mut cursor = self.cursor.lock();
+        let Some(writer) = inner.as_mut() else {
+            return;
+        };
+        if !cursor.enabled {
+            return;
+        }
+        writer.overlay_erase(&mut cursor);
+        cursor.x = x.min(writer.width.saturating_sub(CURSOR_W));
+        cursor.y = y.min(writer.height.saturating_sub(CURSOR_H));
+        writer.overlay_draw(&mut cursor);
+    }
+
+    /// Turn the overlay on (a pointer device was found): the arrow appears at
+    /// the screen centre and is part of every following frame.
+    fn cursor_enable(&self) {
+        let mut inner = self.inner.lock();
+        let mut cursor = self.cursor.lock();
+        if cursor.enabled {
+            return;
+        }
+        cursor.enabled = true;
+        let Some(writer) = inner.as_mut() else {
+            return;
+        };
+        cursor.x = writer.width / 2;
+        cursor.y = writer.height / 2;
+        writer.overlay_draw(&mut cursor);
+    }
+
+    /// Whether the overlay is part of the frame.
+    fn cursor_enabled(&self) -> bool {
+        self.cursor.lock().enabled
     }
 
     /// Append bytes that are not necessarily UTF-8 (a user program's `write`
@@ -848,12 +1038,12 @@ impl FbWriter {
     /// and cell placement as `write_str`; the flush makes one `write` syscall one
     /// visible frame, the same boundary a `kprint!` has.
     fn write_bytes(&self, bytes: &[u8]) {
-        if let Some(writer) = self.inner.lock().as_mut() {
+        self.paint_frame(|writer| {
             for &byte in bytes {
                 writer.write_byte(byte);
             }
             writer.flush();
-        }
+        });
     }
 }
 
@@ -948,4 +1138,39 @@ pub fn write_bytes(bytes: &[u8]) {
 /// next newline.
 pub fn _print(args: fmt::Arguments) {
     FB_WRITER.write_fmt_now(args);
+}
+
+/// The framebuffer's dimensions in pixels, or `(0, 0)` when no screen is live.
+///
+/// The input driver needs this to scale absolute device coordinates into pixels;
+/// it is read from the live writer so a machine whose screen failed to come up
+/// reports zero and the pointer is simply not started.
+pub fn dimensions() -> (usize, usize) {
+    let guard = FB_WRITER.inner.lock();
+    match guard.as_ref() {
+        Some(writer) => (writer.width, writer.height),
+        None => (0, 0),
+    }
+}
+
+/// Turn the software cursor on. Called when a pointer device is found; without
+/// one the screen never grows an arrow, so a serial-only or mouse-less boot is
+/// pixel-identical to the previous milestones.
+pub fn cursor_enable() {
+    FB_WRITER.cursor_enable();
+}
+
+/// Whether the software cursor is part of the frame.
+pub fn cursor_enabled() -> bool {
+    FB_WRITER.cursor_enabled()
+}
+
+/// Move the software cursor to `(x, y)` (framebuffer pixels, top-left origin).
+///
+/// The overlay erases its old position, saves the pixels at the new one and
+/// pushes both rectangles; text printed later is drawn under the arrow, never
+/// through it. A machine without a framebuffer or without `cursor_enable`
+/// silently ignores the call.
+pub fn cursor_move_to(x: usize, y: usize) {
+    FB_WRITER.cursor_move_to(x, y);
 }

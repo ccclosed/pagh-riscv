@@ -31,11 +31,12 @@
 | `drivers/uart.rs` | NS16550: приём по прерыванию PLIC в кольцо, передача polled, запасной polled-путь |
 | `drivers/fw_cfg.rs` | QEMU fw_cfg: селектор/данные + DMA |
 | `drivers/ramfb.rs` | конфигурация устройства ramfb |
-| `drivers/framebuffer.rs` | текстовый экран: тень, шрифт покрытия, статус-бар |
+| `drivers/framebuffer.rs` | текстовый экран: тень, шрифт покрытия, статус-бар, software-курсор как часть кадра |
 | `drivers/block.rs` | шов блочного слоя: трейт `BlockDevice`, один слот реестра, RAM-диск `MemBlock` |
 | `drivers/virtio_mmio.rs` | virtio-blk на mmio-транспорте (modern, version 2), polled; окна — из DTB |
 | `drivers/virtio_net.rs` | virtio-net (modern, две очереди, polled): MAC, RX/TX-кольца, кадры |
-| `drivers/selftest.rs` | проверки блочного слоя (RAM round-trip + read-only реального диска) |
+| `drivers/virtio_input.rs` | virtio-input (tablet/mouse): абсолютные оси из `CFG_ABS_INFO`, события → координаты указателя, polled |
+| `drivers/selftest.rs` | проверки блочного слоя и указателя (RAM round-trip, read-only диск, input-device) |
 | `fs/mod.rs` | фасад ФС: ext2, политика формата, in-QEMU тесты |
 | `fs/ext2/` | ext2: суперблок/группы/inode/dirent/alloc/symlink, mount, read/write, rename, mkfs |
 | `fs/format_policy.rs` | единственное решение, которое может стереть данные: пусто ли устройство |
@@ -85,6 +86,7 @@
 | 11a | `timer::init`: первый дедлайн через SBI, затем `sie.STIE` | `main.rs`, `arch/riscv64/timer.rs` | `sie` = 0 до готового compare-регистра |
 | 11b | `plic::init` (DBT-база/source) → `uart::enable_rx_interrupt()` → `sie.SEIE` | `main.rs`, `arch/riscv64/plic.rs`, `drivers/uart.rs` | контроллер разводит линию раньше, чем UART её поднимает |
 | 12 | `virtio_mmio::init(&tree)`: перебор окон из DTB, регистрация диска (нет диска — строка в лог) | `main.rs`, `drivers/virtio_mmio.rs` | нужна карта (MMIO) и ловушки (сломанное окно) |
+| 12a | `virtio_input::init(&tree)`: указатель (tablet/mouse), очередь событий, включение курсора при живом экране | `main.rs`, `drivers/virtio_input.rs` | тот же список окон и карта; нет устройства — строка в лог |
 | 13 | `vfs::init()` + `init_fs()`: смонтировать `/mnt`, пустое устройство — отформатировать | `main.rs::init_fs` | куча уже есть (монтирование аллоцирует); без диска — строка и дальше |
 | 13a | `net::init(&tree)`: проба virtio-net + DHCP-клиент (нет NIC — строка в лог) | `main.rs`, `src/net/`, `drivers/virtio_net.rs` | нужны DTB (окна транспорта), таймер (дедлайны DHCP) и куча (кольца) |
 | 14 | `shell::run(tree)`: задача 0; команда `run` — вход в U-mode (M6b) | `main.rs`, `shell.rs` | планировщик, таймер и user-mode уже подняты; shell не возвращается |
@@ -111,7 +113,7 @@
 | release | `cargo build --locked --release` | `target/riscv64gc-unknown-none-elf/release/pagh` |
 | smoke (serial) | `python3 .github/smoke.py <kernel>` | exit 0 + серийный лог |
 | smoke (+экран) | `python3 .github/smoke.py <kernel> --ramfb` | то же, с `-device ramfb` |
-| память в госте | команда `selftest` | `SELFTEST SUMMARY: 7/7`, `(block) 3/3` (или 2/3 + skip без диска), `ext2 summary: 11/11`, `(arch) 4/4`, `(task) 5/5`, `(user) 7/7`, `(net) 11/11` |
+| память в госте | команда `selftest` | `SELFTEST SUMMARY: 7/7`, `(block) 4/4` (или 3/4 + skip без диска, включая `input-device`), `ext2 summary: 11/11`, `(arch) 4/4`, `(task) 5/5`, `(user) 7/7`, `(net) 11/11` |
 | диск в госте | `qemu-img create` + `-device virtio-blk-device` + `-global virtio-mmio.force-legacy=false` | пустой образ форматируется, `/mnt` монтируется, файл переживает перезагрузку |
 
 Оба профиля: `panic = "abort"` (`Cargo.toml:10-14`), release дополнительно

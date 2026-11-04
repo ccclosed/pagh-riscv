@@ -18,6 +18,11 @@
 # DISK=/path/to/image attaches a virtio-mmio block device (M5). A missing image
 # is created blank (64 MiB); the kernel formats it on boot only if it is blank,
 # mounts it at /mnt, and from then on the image is a normal ext2 filesystem.
+#
+# A virtio-tablet is attached by default: `virt` has no PS/2 controller, so the
+# pointer arrives as a virtio-input device and the kernel draws a software cursor
+# over the console. NO_MOUSE=1 boots without it, which is the absent path the
+# driver logs (`virtio-input: no device`).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -76,6 +81,13 @@ fi
 # client work out of the box (10.0.2.15/24, gateway 10.0.2.2, DNS 10.0.2.3).
 # NO_NET=1 boots a machine without a network card, which is the absent path the
 # driver logs (and the smoke test's no-NIC modes rely on).
+# The pointer: a virtio-tablet (absolute coordinates) on the same virtio-mmio
+# transport list as the disk and the NIC. NO_MOUSE=1 is the absent path.
+MOUSE_ARGS=()
+if [[ "${NO_MOUSE:-0}" != "1" ]]; then
+  MOUSE_ARGS=(-device virtio-tablet-device)
+fi
+
 NET_ARGS=()
 if [[ "${NO_NET:-0}" != "1" ]]; then
   NET_ARGS=(
@@ -92,6 +104,7 @@ exec qemu-system-riscv64 \
   -device ramfb \
   -global virtio-mmio.force-legacy=false \
   "${DISK_ARGS[@]}" \
+  "${MOUSE_ARGS[@]}" \
   "${NET_ARGS[@]}" \
   "${DISPLAY_ARGS[@]}" \
   -serial mon:stdio \

@@ -82,6 +82,10 @@ pub fn run(tree: Fdt) -> ! {
             // of `wfi` is the price; the UART ring is drained non-blockingly.
             crate::task::scheduler::pump();
             crate::net::poll();
+            // The pointer is polled with the rest of the idle work: the input
+            // device has no routed interrupt (the PLIC serves the UART), so the
+            // shell's 100 Hz idle wake-up is what keeps the cursor moving.
+            crate::drivers::virtio_input::poll();
             let byte = match uart::try_get_byte() {
                 Some(byte) => byte,
                 None => {

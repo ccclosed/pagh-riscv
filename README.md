@@ -31,7 +31,7 @@ ICMP, a minimal TCP client) and — since M6b — **user mode**: a static ELF ru
 the `U` bit set, enters through `sret`, talks to the kernel through an `ecall`
 ABI and is killed (not the machine) when it faults. **All of these are verified on
 a live boot**; what is genuinely missing — per-process page tables, a journal,
-SMP, networking — is listed plainly in [Чего нет](#чего-нет). The documentation is deliberately checkable: every claim in
+SMP, TLS/apt — is listed plainly in [Чего нет](#чего-нет). The documentation is deliberately checkable: every claim in
 [`docs/architecture.md`](docs/architecture.md) cites the file and line it comes from,
 and the CI smoke test asserts the exact boot log this README shows.
 
@@ -39,7 +39,9 @@ and the CI smoke test asserts the exact boot log this README shows.
 cargo build                              # riscv64gc-unknown-none-elf, pinned nightly
 ./run.sh                                 # serial console; Ctrl-A X to leave
 DISK=/tmp/pagh.img ./run.sh              # + virtio-диск: пустой образ будет отформатирован и смонтирован в /mnt
+NO_MOUSE=1 ./run.sh                      # без virtio-tablet: путь «указателя нет»
 python3 tools/run.py --keys "help\n" --shot /tmp/shot.png --check-font   # screen + font
+python3 tools/run.py --mouse 900 300 --shot /tmp/cursor.png             # + software-курсор в (900,300)
 ```
 
 Docs: [architecture](docs/architecture.md) · [roadmap](docs/roadmap.md) ·
@@ -51,6 +53,14 @@ Docs: [architecture](docs/architecture.md) · [roadmap](docs/roadmap.md) ·
 ## Скриншот
 
 ![Консоль pagh-riscv: команда help на экране 1280×800](docs/shell.png)
+
+Указатель M8: `virtio-input` tablet на virtio-mmio, курсор — software-слой в
+теневом буфере. Позиция ниже задана командой
+`python3 tools/run.py --mouse 900 300 --shot …`: стрелка стоит ровно в
+запрошенном пикселе, а текст под ней печатается обычным образом (курсор
+перерисовывается поверх кадра, не «замораживая» клетку).
+
+![software-курсор в (900, 300)](docs/cursor.png)
 
 Диск M5: virtio-mmio-устройство найдено через DTB, пустой образ отформатирован,
 ext2 смонтирован в `/mnt`; `ls`/`cat`/`stat` работают, `disk` показывает ёмкость и
@@ -171,8 +181,9 @@ SELFTEST SUMMARY: 6/6 passed
 | Device tree | готово | пять вопросов: `/memory`, `timebase-frequency`, окна `virtio,mmio`, PLIC `reg`, UART `interrupts`; ошибка разбора фатальна | `src/fdt.rs` |
 | Ловушки | готово | `stvec` → `trap_entry` (обмен `sscratch` различает U/S), диспетчер: прерывания возвращаются, исключение из S-mode печатает и паркует hart, исключение из U-mode завершает только задачу | `src/arch/riscv64/traps.rs`, `src/user/mod.rs` |
 | Консоль | готово | NS16550 по `0x1000_0000`, 8N1; приём — по прерыванию PLIC в кольцевой буфер (polled-путь остаётся запасным), передача по-прежнему polled; один текстовый поток — два стока | `src/drivers/uart.rs`, `src/console.rs` |
-| Экран | готово | ramfb 1280×800, stride 5120, сетка 100×37, шрифт покрытия 8×18, статус-бар; кадр отдаётся на каждый `kprint!` | `src/drivers/{fw_cfg,ramfb,framebuffer}.rs` |
-| Шелл | готово | редактор строки (строки длиннее 128 байт отклоняются целиком, а не обрезаются), `wfi`-ожидание ввода; команды памяти/диска/ФС/сети, `run <path>`, `run demo` / `run fault` / `run spin`, `sleep`, `time`, `halt` (полный список — в таблице ниже) | `src/shell.rs`, `src/user/mod.rs`, `src/net/` |
+| Экран | готово | ramfb 1280×800, stride 5120, сетка 100×37, шрифт покрытия 8×18, статус-бар; кадр отдаётся на каждый `kprint!`; software-курсор — часть кадра (см. строку «Мышь») | `src/drivers/{fw_cfg,ramfb,framebuffer}.rs` |
+| Мышь и курсор (M8) | готово | virtio-input (tablet с абсолютными координатами предпочтителен, mouse с относительными тоже поддержан) на том же virtio-mmio; курсор 12×19 рисуется в теневом буфере как часть кадра: прячет/восстанавливает пиксели под собой, остаётся сверху и после печати, и под печатью. Опроса из idle-цикла шелла достаточно (100 Гц); своего прерывания у устройства нет | `src/drivers/virtio_input.rs`, `src/drivers/framebuffer.rs` |
+| Шелл | готово | редактор строки (строки длиннее 128 байт отклоняются целиком, а не обрезаются), idle-цикл на 100 Гц, в котором опрашиваются UART-кольцо, сеть и указатель; команды памяти/диска/ФС/сети, `run <path>`, `run demo` / `run fault` / `run spin`, `sleep`, `time`, `halt` (полный список — в таблице ниже) | `src/shell.rs`, `src/user/mod.rs`, `src/net/`, `src/drivers/virtio_input.rs` |
 | Физическая память (PMM) | готово | битовая карта 4 KiB-кадров окна 8 GiB (покрывает QEMU `virt` с RAM выше 4 GiB), `set = свободен`, выделение одиночное и непрерывным блоком | `src/memory/pmm.rs` |
 | Куча ядра, `alloc` | готово | `#[global_allocator]` поверх PMM-кадров: чанки по 64 KiB, free-list, целиком свободный чанк возвращается в PMM; `Vec` проверен `selftest` | `src/memory/{heap,selftest}.rs` |
 | Страницы (Sv39) | готово | identity-карта 4 KiB-страниц, `satp` включён: `[RAM base, __kernel_end)` RWX, выше — RW **без X**, страницы устройств RW без U; таблицы берутся из PMM, пустые возвращаются при `unmap`. User-страницы живут в этой же карте с `U=1`; отдельного `satp` на процесс нет | `src/memory/paging.rs`, `src/arch/riscv64/mmu.rs`, `src/user/elf.rs` |
@@ -185,8 +196,8 @@ SELFTEST SUMMARY: 6/6 passed
 | User mode, syscalls, ELF (M6b) | готово | `sret` в U-mode (`SPP=0`, `SPIE=1`, `SUM=0`, `sscratch`-контракт), `ecall`-диспетчер Linux/RISC-V (`write`/`exit`/`sched_yield`/`getpid`, `sepc+4`, проверка user-указателей, `SUM` вокруг копии), ELF64-загрузчик с откатом кадров, `run <path>` и фикстуры `demo`/`fault`/`spin`, fault из U убивает только задачу; таймер вытесняет U-mode | `src/user/`, `userland/` |
 | Сеть (M7) | готово | virtio-net (modern, polled) + свой стек: Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP-клиент, DNS-резолвер, `net`/`dhcp`/`ping`/`dns`/`http`; без smoltcp и внешних крейтов | `src/net/`, `src/drivers/virtio_net.rs` |
 | Пакеты, apt | **нет** | нужен TLS-стек (vendored `embedded-tls` + OpenPGP-проверка), как на x86; следующий майлстоун после сети | — |
-| Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 3 блочного слоя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 7 user-mode + 11 сети (идемпотентность по ledger'у свободных кадров), QEMU-smoke уже в пяти режимах (serial, ramfb, диск-fresh, диск-existing, net) и проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/net/selftest.rs`, `.github/smoke.py`, `tools/` |
-| CI | готово | `fmt`, debug/release build, QEMU-smoke (serial, ramfb, и приёмка M5: пустой диск → формат/монтирование/запись, повторная загрузка того же образа читает файл) | `.github/workflows/ci.yml` |
+| Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 4 блока/указателя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 7 user-mode + 11 сети (идемпотентность по ledger'у свободных кадров), QEMU-smoke в пяти режимах (serial, ramfb, диск-fresh, диск-existing, net) — во всех приложен virtio-tablet, и проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/net/selftest.rs`, `.github/smoke.py`, `tools/` |
+| CI | готово | `fmt`, debug/release build, QEMU-smoke в пяти режимах: serial, ramfb, диск-fresh (формат/монтирование/запись), диск-existing (повторная загрузка читает файл), net (DHCP + ping шлюза); каждый режим подключает virtio-tablet | `.github/workflows/ci.yml` |
 
 ---
 
@@ -229,6 +240,7 @@ virtio-net-device`, ядро получает `10.0.2.15/24` по DHCP, шлюз
 | `BIOS` | — (QEMU `-bios default`) | внешняя прошивка, например `BIOS=/path/opensbi.bin` |
 | `DISK` | — | образ virtio-mmio диска; отсутствующий создаётся пустым (64 MiB), пустой форматируется ядром и монтируется в `/mnt` |
 | `NO_NET` | `0` | `1` — не подключать virtio-net (проверка отсутствия NIC и старых сценариев) |
+| `NO_MOUSE` | `0` | `1` — не подключать virtio-tablet (проверка отсутствия указателя: курсора нет, всё остальное работает) |
 
 Выход из QEMU — `Ctrl-A`, затем `X`. Изнутри гостя: команда `halt` (SBI SRST,
 машина действительно выключается, QEMU завершается с кодом 0).
@@ -437,6 +449,7 @@ src/drivers/fw_cfg.rs          QEMU fw_cfg: селектор/данные + DMA
 src/drivers/ramfb.rs           конфигурация устройства ramfb
 src/drivers/framebuffer.rs     текстовый экран: тень, шрифт, статус-бар
 src/drivers/virtio_net.rs      virtio-net: две очереди, polled, MAC, RX/TX-кадры
+src/drivers/virtio_input.rs    virtio-input: tablet/mouse, события → координаты указателя
 src/console.rs                 kprint!/kprintln!: UART + экран
 src/shell.rs                   редактор строки и команды
 src/sync.rs                    один нереентерабельный спинлок

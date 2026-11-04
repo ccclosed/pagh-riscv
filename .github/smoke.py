@@ -60,6 +60,9 @@ EXPECTED = [
     # `-m` and with whatever the kernel reserves, but the line must be there.
     "pmm         ",
     " frames free (",
+    # The pointer device (virtio-tablet) is attached by every smoke mode; the
+    # line proves the input driver found it before the shell starts.
+    "virtio-input: tablet at 0x",
     "Type 'help' for the command list.",
     "pagh:rv64> mem",
     "memory 0x80000000..0x90000000 (256 MiB)",
@@ -169,6 +172,9 @@ def boot(kernel, ramfb=False, disk=None, commands=COMMANDS, timeout=120.0, net=F
         "-bios", BIOS if BIOS else "default",
         "-kernel", kernel,
         "-display", "none", "-monitor", "none", "-serial", "stdio", "-no-reboot",
+        # The kernel speaks modern virtio only; the pointer is on every mode.
+        "-global", "virtio-mmio.force-legacy=false",
+        "-device", "virtio-tablet-device",
     ]
     if ramfb:
         cmd += ["-device", "ramfb"]
@@ -187,10 +193,6 @@ def boot(kernel, ramfb=False, disk=None, commands=COMMANDS, timeout=120.0, net=F
             "-netdev", "user,id=net0",
             "-device", "virtio-net-device,netdev=net0",
         ]
-    if disk or net:
-        # Virtio-mmio transports default to the legacy layout; this kernel
-        # speaks modern (version 2) only.
-        cmd += ["-global", "virtio-mmio.force-legacy=false"]
     proc = subprocess.Popen(
         cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, bufsize=0,
@@ -292,10 +294,18 @@ def main():
         # Boot markers that come before the banner, so they must be expected
         # before the shared block; the banner and everything after it are shared.
         banner_at = EXPECTED.index(BANNER)
+        # The boot order on a disk boot is: ... pmm, virtio-blk probe line,
+        # virtio-input line, fs device line, (format line), ext2 mount, banner.
+        # The tablet marker lives inside EXPECTED (every mode attaches the
+        # pointer), so the disk probe line has to be spliced in before it and the
+        # rest of DISK_BOOT_PREFIX after it.
+        tablet_at = EXPECTED.index("virtio-input: tablet at 0x")
         expected = (
             [SCREEN_MARKER[ramfb]]
-            + EXPECTED[:banner_at]          # banner .. pmm, before the devices
-            + DISK_BOOT_PREFIX              # virtio-blk probe
+            + EXPECTED[:tablet_at]          # banner .. pmm, before the devices
+            + [DISK_BOOT_PREFIX[0]]         # virtio-blk probe
+            + [EXPECTED[tablet_at]]         # virtio-input probe
+            + [DISK_BOOT_PREFIX[1]]         # fs device line
             + (DISK_FRESH_BOOT if fresh else [])   # format line, when formatting
             + DISK_MOUNTED                  # ext2 mount
             + [EXPECTED[banner_at]]         # "Type 'help' ..."

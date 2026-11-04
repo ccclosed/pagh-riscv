@@ -43,17 +43,19 @@ python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb --
 `Ctrl-A X` to leave). It always passes `-device ramfb`, so the screen exists too:
 off-screen by default (`-display none`, which is what lets `screendump` work
 headless), in a QEMU window with `./run.sh --window`. `PROFILE=release`, `MEMORY=…`,
-`BIOS=…` cover the variants, and `DISK=/tmp/pagh.img` attaches the virtio-mmio
-disk (a missing image is created blank and the kernel formats it on boot); what
+`BIOS=…` cover the variants, `DISK=/tmp/pagh.img` attaches the virtio-mmio
+disk (a missing image is created blank and the kernel formats it on boot) and
+`NO_MOUSE=1` boots without the virtio-tablet (the pointer-absent path); what
 `run.sh` does not take as an argument it takes from the environment, and an
 unknown argument is rejected, not ignored. Two in-guest checks that are not part of CI:
 
 ```sh
 # at the `pagh:rv64>` prompt
-selftest                                        # in-QEMU suites: 7 mem + 3 block + 11 fs + 4 arch/timer + 5 task + ledgers
+selftest                                        # in-QEMU suites: 7 mem + 4 block/pointer + 11 fs + 4 arch/timer + 5 task + 7 user + 11 net + ledgers
 # from the host
 python3 tools/run.py --keys "help\n" --shot /tmp/shot.png --check-font --scan-all
 python3 tools/run.py --disk /tmp/pagh.img --keys "ls /mnt\n" --shot /tmp/fs.png
+python3 tools/run.py --mouse 900 300 --shot /tmp/cursor.png   # software cursor at (900,300)
 ```
 
 `rustup target add riscv64gc-unknown-none-elf` once; the nightly is pinned in
@@ -88,7 +90,7 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
   `[dependencies]` empty). Modules: `main.rs` (boot phases, global allocator, panic
   handler), `arch/riscv64/{boot,csr,sbi,traps,mmu}.rs`, `fdt.rs`,
   `memory/{pmm,heap,selftest}.rs` (+ `src/memory/README.md`),
-  `drivers/{uart,fw_cfg,ramfb,framebuffer,block,virtio_mmio,virtio_net,selftest}.rs`
+  `drivers/{uart,fw_cfg,ramfb,framebuffer,block,virtio_mmio,virtio_net,virtio_input,selftest}.rs`
   (+ `src/drivers/README.md`), `fs/{ext2,format_policy,selftest}.rs`
   (+ `src/fs/README.md`), `vfs/mod.rs` (+ `src/vfs/README.md`),
   `task/{mod,scheduler,selftest}.rs` (+ `src/task/README.md`),
@@ -162,8 +164,11 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
    shell, hart parking before Rust. M3 adds two: the timer and the PLIC after the
    trap vector is installed (`sie` must stay 0 until both compare register and
    controller are ready, and the PLIC must route the UART line before the UART
-   raises it), and M5 adds two more: the block driver after the map and traps (it
-   reads MMIO), the filesystem after the driver and the heap (mounting allocates).
+   raises it), M5 adds two more: the block driver after the map and traps (it
+   reads MMIO), the filesystem after the driver and the heap (mounting allocates),
+   and M7/M8 add the NIC and the pointer after the block driver — both virtio-mmio
+   devices on the same mapped windows, both optional, neither may move before the
+   map exists.
 8. **`.bss` is not zeroed by `_start`.** The kernel relies on the loader zero-filling
    the NOBITS `PT_LOAD` (QEMU does). Three things stand on that: the boot stack, the
    `BOOT_HART_ID` static, and the PMM bitmap's polarity ("a set bit means **free**",
@@ -285,10 +290,11 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
 
 ## Testing philosophy
 
-What exists: the in-QEMU suites (shell `selftest`: 7 memory + 3 block + 11 ext2/VFS
+What exists: the in-QEMU suites (shell `selftest`: 7 memory + 4 block/pointer + 11 ext2/VFS
 + 4 interrupt/timer + 5 scheduler + 7 user-mode + 11 network checks, idempotent,
 each group prints a free-frame ledger), the headless QEMU smoke driver in five
-modes (serial, ramfb, disk-fresh, disk-existing, `--net`) including the M5
+modes (serial, ramfb, disk-fresh, disk-existing, `--net`) — every mode attaches a
+virtio-tablet and the boot log must carry `virtio-input: tablet at 0x…` — including the M5
 format/mount/persist acceptance and the M7 DHCP/ping acceptance, and the pixel
 check that proves a screenshot is really the committed font. The network
 acceptance is deterministic: QEMU's slirp answers DHCP and ICMP to `10.0.2.2`
@@ -331,7 +337,7 @@ adversarial fuzzing. That is a gap, not a policy — the rule stands:
 
 ## Versioning
 
-Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.6.0`,
+Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.7.0`,
 which `Cargo.lock` mirrors. **The two move together in one commit**: CI builds with
 `--locked`, and cargo refuses to rewrite the lock (`cannot update the lock file …
 because --locked was passed`), so a `Cargo.toml`-only bump fails the build job in
@@ -349,7 +355,8 @@ seconds. Verify locally with `cargo build --locked` after any version change.
   it. Tags must never run ahead of `Cargo.toml`. Note: `0.2.0` was tagged on a commit
   whose manifest still said `0.1.0` (the drift this rule exists to prevent); it is
   left as history, and `0.4.0` is the first tag that matches its manifest (M3/M5/M6a landed after `0.3.0` was written but before it was tagged). `0.5.0` ships M6b; `0.6.0` ships M7 (the network: virtio-net + own stack, DHCP,
-  DNS, ICMP, a TCP client). The same rule applies to both: the tag equals the
+  DNS, ICMP, a TCP client); `0.7.0` ships M8 (virtio-input pointer and the
+  software cursor that is part of the console's frame). The same rule applies to both: the tag equals the
   manifest and the `Cargo.lock` entry, and the release is not optional.
 
 ## Known gaps (documented, not hidden)
@@ -365,6 +372,8 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
 | TCP is one active-open client (HTTP/1.0), not a general stack | no listening sockets, out-of-order reassembly, congestion control or multiple connections |
 | The NIC is polled and the stack is synchronous | network progress happens while a command or the shell's idle loop polls; an IRQ-driven NIC is a later milestone |
 | Interrupt handlers cannot allocate or print | put work in normal context; bump a counter and read it from `time`/`selftest` |
+| The pointer has **no IRQ**: it is polled from the shell's idle loop | a long-running command (or a blocking wait that does not poll) freezes the cursor; do not put cursor movement in a place that never returns to the idle loop |
+| Clicks/selection are not consumed: `BTN_LEFT` is read and stored, nothing acts on it | mouse-driven editing/selection is a UI milestone, not a driver change |
 | One address space, one ASID: user pages carry `U=1` in the kernel's single Sv39 tree | two user programs are not isolated from each other; no per-process `satp`, no `brk`/`mmap`, no `fork`/`exec`/signals; `run <path>` reads one 64 KiB heap chunk at most |
 | The filesystem has **no journal** (M5 deliberately skipped the x86 WAL) | a power cut between two writes can leave an operation half-applied; do not claim crash consistency |
 | One block device slot, no partitions/hot-plug | a second disk is a design change, not a registration |
@@ -375,3 +384,14 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
 | 15 compiler warnings remain (unused diagnostic helpers, `trap_entry as usize`, …) | do not add more; warning-cleanup PRs are welcome |
 | No `LICENSE` file although `Cargo.toml` says MIT | do not add a license your work does not own |
 | `src/memory/paging.rs` owns the only page table; `src/arch/riscv64/mmu.rs` is encoding only | do not map over the kernel image or drop the identity map while a device holds a physical address |
+28. **The software cursor is frame content.** It is erased before text is drawn and
+    repainted after the frame flush; only its 12x19 rectangle is pushed
+    (`flush_rect`). Drawing under the arrow outside that path leaves a stale
+    arrow or a hole. Input moves the pointer only through
+    `framebuffer::cursor_move_to`; the arrow never reaches the device on its own.
+29. **The pointer is polled, and its absence is normal.** `virtio_input::poll()` runs
+    from the shell's idle loop next to `net::poll()` and the UART ring; there is no
+    routed IRQ for it. A blocking wait that never returns to that loop freezes the
+    cursor (and the network). A boot without a pointer device is a valid
+    configuration (`NO_MOUSE=1`, serial-only CI): one log line, no cursor, nothing
+    else changes.

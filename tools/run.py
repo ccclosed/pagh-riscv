@@ -276,6 +276,52 @@ class Monitor:
             pass
 
 
+def qmp_move_pointer(path: str, x: int, y: int) -> None:
+    """Move the guest's virtio-tablet pointer to framebuffer pixel `(x, y)`.
+
+    QEMU's absolute pointer events use the device's 0..0x7fff range; the tablet
+    maps that onto the screen, so pixels are converted here. The shell polls the
+    input device from its idle loop, so the caller must let the guest run for a
+    moment after this returns before taking the screenshot.
+    """
+    import json
+    import socket as _socket
+
+    deadline = time.time() + 15
+    sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    while True:
+        try:
+            sock.connect(path)
+            break
+        except OSError:
+            if time.time() > deadline:
+                die(f"cannot connect to QMP socket {path!r}")
+            time.sleep(0.2)
+    sock.settimeout(10)
+    _ = sock.recv(65536)  # QMP greeting
+
+    def send(obj) -> dict:
+        sock.sendall((json.dumps(obj) + "\n").encode())
+        buf = b""
+        while b"\n" not in buf:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        return json.loads(buf.split(b"\n", 1)[0] or b"{}")
+
+    send({"execute": "qmp_capabilities"})
+
+    def event(axis: str, pixels: int, extent: int) -> dict:
+        raw = 0 if extent <= 1 else min(0x7FFF, max(0, pixels) * 0x7FFF // (extent - 1))
+        return {"type": "abs", "data": {"axis": axis, "value": raw}}
+
+    send({"execute": "input-send-event", "arguments": {"events": [
+        event("x", x, 1280), event("y", y, 800),
+    ]}})
+    sock.close()
+
+
 def boot(args: argparse.Namespace, serial_path: str, monitor_path: str) -> subprocess.Popen:
     """Start QEMU headless, with the serial and monitor sockets this tool uses."""
     kernel = pathlib.Path(args.kernel)
@@ -302,9 +348,20 @@ def boot(args: argparse.Namespace, serial_path: str, monitor_path: str) -> subpr
         # lost between QEMU starting and this tool arriving.
         "-serial", f"unix:{serial_path},server=on,wait=on",
         "-monitor", f"unix:{monitor_path},server=on,wait=off",
+        # The pointer: virtio-input tablet, so a screenshot can include the
+        # software cursor at a chosen position (`--mouse X Y`). `virt` has no
+        # PS/2 and the kernel refuses the legacy transport, so both flags are
+        # part of the screen's bring-up here.
+        "-global", "virtio-mmio.force-legacy=false",
+        "-device", "virtio-tablet-device",
         "-display", "none",
         "-no-reboot",
     ]
+    qmp_path = serial_path + "-qmp"
+    if getattr(args, "mouse", None):
+        if os.path.exists(qmp_path):
+            os.unlink(qmp_path)
+        cmd += ["-qmp", f"unix:{qmp_path},server=on,wait=off"]
     if getattr(args, "disk", None):
         disk = pathlib.Path(args.disk)
         if not disk.exists():
@@ -318,8 +375,6 @@ def boot(args: argparse.Namespace, serial_path: str, monitor_path: str) -> subpr
             "-netdev", "user,id=net0",
             "-device", "virtio-net-device,netdev=net0",
         ]
-    if getattr(args, "disk", None) or getattr(args, "net", False):
-        cmd += ["-global", "virtio-mmio.force-legacy=false"]
     print("+", " ".join(cmd), file=sys.stderr)
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -397,6 +452,13 @@ def main() -> int:
     parser.add_argument("--release", action="store_true", help=f"use {KERNEL_RELEASE}")
     parser.add_argument("--memory", default="256M", help="guest RAM (default 256M, as run.sh)")
     parser.add_argument(
+        "--mouse",
+        nargs=2,
+        type=int,
+        metavar=("X", "Y"),
+        help="move the virtio-tablet pointer to framebuffer pixel (X, Y) before the screenshot",
+    )
+    parser.add_argument(
         "--net",
         action="store_true",
         help="attach a virtio-net NIC on QEMU's user network (DHCP: 10.0.2.15/24, gw 10.0.2.2)",
@@ -468,6 +530,13 @@ def main() -> int:
             serial.drain(args.settle)
         elif args.settle:
             serial.drain(args.settle)
+
+        if getattr(args, "mouse", None):
+            mx, my = args.mouse
+            qmp_move_pointer(serial_path + "-qmp", mx, my)
+            # A few idle wake-ups so the guest drains the input queue and moves
+            # the cursor before the frame is captured.
+            serial.drain(max(args.settle, 0.6))
 
         monitor = Monitor(monitor_path, timeout=args.timeout)
         monitor.screendump(shot)

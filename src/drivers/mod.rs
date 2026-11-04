@@ -15,5 +15,6 @@ pub mod fw_cfg;
 pub mod ramfb;
 pub mod selftest;
 pub mod uart;
+pub mod virtio_input;
 pub mod virtio_mmio;
 pub mod virtio_net;

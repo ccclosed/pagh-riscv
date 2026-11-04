@@ -48,9 +48,10 @@ enum Outcome {
 /// Run every routine, print the verdicts, and return how many passed.
 pub fn run() -> usize {
     let (used_before, mapped_before, chunks_before) = crate::heap_stats();
-    let checks: [(&str, fn() -> Outcome); 2] = [
+    let checks: [(&str, fn() -> Outcome); 3] = [
         ("block-memblock", memblock_roundtrip),
         ("block-device", registered_device_read_only),
+        ("input-device", pointer_device),
     ];
 
     let mut passed = 0usize;
@@ -214,6 +215,52 @@ fn memblock_roundtrip() -> Outcome {
     } else {
         Outcome::Fail
     }
+}
+
+/// Is a pointer device present and does it have a sane state?
+///
+/// The cursor is moved by the shell's idle poll, not from a selftest (a test that
+/// waited for a real mouse report would hang on a machine with no user), so this
+/// routine checks the half that can be checked offline: a device was found at
+/// boot, its probe succeeded, and the state it reports is inside the screen.
+/// A headless boot (no `virtio-tablet` attached, e.g. a serial-only CI run)
+/// reports SKIP rather than pretending the check passed.
+fn pointer_device() -> Outcome {
+    if !crate::drivers::virtio_input::present() {
+        return Outcome::Skip("no pointer device (headless boot or no virtio-tablet)");
+    }
+    let Some(state) = crate::drivers::virtio_input::state() else {
+        crate::kprintln!("[selftest] input: present but reports no state");
+        return Outcome::Fail;
+    };
+    let (width, height) = crate::drivers::framebuffer::dimensions();
+    if width == 0 || height == 0 {
+        // A serial-only boot can still have the device; without a screen the
+        // coordinates have nowhere to map. That is a valid configuration.
+        crate::kprintln!(
+            "[selftest] input: {} present, no framebuffer to point at",
+            crate::drivers::virtio_input::kind_name()
+        );
+        return Outcome::Pass;
+    }
+    if state.x >= width || state.y >= height {
+        crate::kprintln!(
+            "[selftest] input: state ({}, {}) outside the {}x{} screen",
+            state.x,
+            state.y,
+            width,
+            height
+        );
+        return Outcome::Fail;
+    }
+    crate::kprintln!(
+        "[selftest] input: {} at ({}, {}), left={}",
+        crate::drivers::virtio_input::kind_name(),
+        state.x,
+        state.y,
+        state.left
+    );
+    Outcome::Pass
 }
 
 /// Read-only checks against the registered device, when there is one.

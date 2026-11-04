@@ -95,6 +95,10 @@ python3 tools/run.py --keys "clear\n" --shot /tmp/riscv-clear.png \
 * `docs/shell.png` — консоль с `help` (снимается тем же `run.py`, см. выше);
 * `docs/fs.png` — `DISK`-образ: `ls /mnt`, `disk`, `cat`, `stat`;
 * `docs/tasks.png` — `spawn 3`, `tasks`, `yield 48`: таблица потоков и счётчики;
+* `docs/user.png` — `run demo`, `run fault`, `run spin`: user mode и изоляция падений;
+* `docs/net.png` — `net`, `dhcp`, `ping`, `dns`: сеть на virtio-net;
+* `docs/cursor.png` — software-курсор: `tools/run.py --mouse 900 300 --shot …`
+  (QMP `input-send-event` в абсолютных осях virtio-tablet);
 * `docs/user.png` — M6b: `run demo` (hello + exit 42), `run fault` (killed, машина
   жива), `run spin` (0.2 s в U-mode, exit 7); снимается
   `python3 tools/run.py --keys "run demo\nrun fault\nrun spin\n" --shot docs/user.png

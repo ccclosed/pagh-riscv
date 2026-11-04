@@ -248,6 +248,12 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     // kernel is still a kernel without one.
     drivers::virtio_mmio::init(&tree);
 
+    // The pointer, after the disk: it is another virtio-mmio device on the same
+    // transport list, needs the same mapped windows, and is just as optional.
+    // Its presence turns the software cursor on; absence leaves the console
+    // exactly as it was.
+    drivers::virtio_input::init(&tree);
+
     // The VFS root (a synthetic, kernel-owned directory) and then the mounted
     // filesystem. Phase order matters: the driver above has registered its
     // device, the heap is up (mounting allocates), and the shell's file commands
