@@ -749,9 +749,18 @@ fn cmd_index() {
         index.count = 0;
     }
 
+    // The index lives at `<repo>/index`, so it goes through the same path join
+    // as a package URL: a repository served under a prefix must work too.
+    let mut path = [0u8; PATH_CAPACITY];
+    let path_len = match request_path(&endpoint, "index", &mut path) {
+        Ok(length) => length,
+        Err(error) => return report("index", error),
+    };
+    let path = text(&path[..path_len]);
+
     let mut parser = IndexParser::new();
     let result =
-        http_get(&endpoint, "index", |chunk| parser.feed(chunk)).and_then(|()| parser.finish());
+        http_get(&endpoint, path, |chunk| parser.feed(chunk)).and_then(|()| parser.finish());
     match result {
         Ok(()) => {
             let count = {
