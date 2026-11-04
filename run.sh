@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # Boot pagh-riscv under QEMU's `virt` machine with the generic OpenSBI firmware.
 #
-#   ./run.sh              serial console in this terminal; the screen is rendered
-#                         off-screen by QEMU (ramfb), so `screendump` and the
-#                         screenshot tools work even here
-#   ./run.sh --window     the same machine with a QEMU window showing pagh's
-#                         framebuffer (needs a display; Ctrl-A X quits)
-#   ./run.sh --headless   explicit form of the default: no window
+#   ./run.sh              opens the QEMU window when a display is available
+#                         (Wayland/X11), otherwise stays on the serial console
+#   ./run.sh --window     force the QEMU window (needs a display; Ctrl-A X quits)
+#   ./run.sh --headless   force serial-only: no window, the screen is rendered
+#                         off-screen (ramfb), so `screendump` and the screenshot
+#                         tools still work
 #
-# The serial line is the keyboard: `virt` has no PS/2 controller, so typing here
-# is typing into the guest's shell.
+# Two consoles, one guest: the serial line in this terminal and the QEMU window
+# are both live. `virt` has no PS/2 controller, so the window's keys and the
+# serial bytes both arrive as virtio-input/serial input; click the QEMU window
+# (its title is `pagh-riscv`) and type there, or type here.
 #
 # QEMU ships the firmware as `-bios default`; a system copy of
 # opensbi-riscv64-generic-fw_dynamic.bin is used when present, and an external
@@ -26,7 +28,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-WINDOW=0
+# auto = window when a display is reachable, serial-only otherwise. An explicit
+# flag always wins, because a headless CI/ssh run must not try to open a window.
+WINDOW=auto
 for arg in "$@"; do
   case "$arg" in
     --window) WINDOW=1 ;;
@@ -34,6 +38,13 @@ for arg in "$@"; do
     *) echo "run.sh: unknown argument '$arg' (want --window or --headless)" >&2; exit 2 ;;
   esac
 done
+if [[ "$WINDOW" == auto ]]; then
+  if [[ -n "${WAYLAND_DISPLAY:-}" || -n "${DISPLAY:-}" ]]; then
+    WINDOW=1
+  else
+    WINDOW=0
+  fi
+fi
 
 PROFILE=${PROFILE:-debug}
 if [[ "$PROFILE" == release ]]; then
@@ -61,6 +72,11 @@ fi
 DISPLAY_ARGS=(-display none)
 if ((WINDOW)); then
   DISPLAY_ARGS=(-display gtk)
+fi
+if ((WINDOW)); then
+  echo "run.sh: QEMU window 'pagh-riscv' — click it and type there; the serial console in this terminal also works (Ctrl-A X quits)" >&2
+else
+  echo "run.sh: serial console only — pass --window to open the framebuffer window" >&2
 fi
 
 # A virtio-mmio disk, when DISK names one. `force-legacy=false` is what makes
@@ -102,6 +118,7 @@ if [[ "${NO_NET:-0}" != "1" ]]; then
 fi
 
 exec qemu-system-riscv64 \
+  -name pagh-riscv \
   -machine virt \
   "${BIOS_ARGS[@]}" \
   -m "$MEMORY" \

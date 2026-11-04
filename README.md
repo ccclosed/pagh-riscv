@@ -37,7 +37,7 @@ and the CI smoke test asserts the exact boot log this README shows.
 
 ```sh
 cargo build                              # riscv64gc-unknown-none-elf, pinned nightly
-./run.sh                                 # serial console; Ctrl-A X to leave
+./run.sh                                 # QEMU-окно при наличии дисплея, иначе serial; Ctrl-A X — выход
 DISK=/tmp/pagh.img ./run.sh              # + virtio-диск: пустой образ будет отформатирован и смонтирован в /mnt
 NO_MOUSE=1 ./run.sh                      # без virtio-tablet: путь «указателя нет»
 python3 tools/run.py --keys "help\n" --shot /tmp/shot.png --check-font   # screen + font
@@ -206,7 +206,7 @@ SELFTEST SUMMARY: 7/7 passed
 ```sh
 rustup target add riscv64gc-unknown-none-elf   # nightly запинен в rust-toolchain.toml
 cargo build                                    # debug-ядро, линкуется linker.ld
-./run.sh                                       # QEMU virt + OpenSBI, serial в терминал
+./run.sh                                       # QEMU virt + OpenSBI: окно и serial-консоль одновременно
 ```
 
 `run.sh` — канонический способ запуска (Linux/QEMU). Он собирает ядро и выполняет
@@ -221,7 +221,9 @@ qemu-system-riscv64 -machine virt -m 256M -device ramfb \
 `-device ramfb` — это и есть экран: у машины `virt` нет VGA, а ядро находит
 устройство через `fw_cfg`. По умолчанию поверхность рисуется **off-screen**
 (`-display none`), поэтому `screendump` и `tools/run.py` работают без графической
-сессии; `./run.sh --window` показывает то же самое окном QEMU. `run.sh` подключает
+сессии. `./run.sh` при наличии дисплея (`DISPLAY`/`WAYLAND_DISPLAY`) открывает
+окно QEMU с заголовком `pagh-riscv`, а `--headless` оставляет только serial;
+`run.sh` подключает
 и клавиатуру (`-device virtio-keyboard-device`): у `virt` нет PS/2, поэтому ввод
 из окна идёт как virtio-input и попадает в тот же шелл, что и serial — можно
 пользоваться любым из двух. Если запустить QEMU без `-device ramfb`, ядро остаётся
@@ -236,8 +238,8 @@ virtio-net-device`, ядро получает `10.0.2.15/24` по DHCP, шлюз
 
 | Аргумент / переменная | По умолчанию | Смысл |
 |---|---|---|
-| `--window` | выключено | показать экран окном QEMU (`-display gtk`) |
-| `--headless` | включено | явная форма поведения по умолчанию: рисовать off-screen |
+| `--window` | авто: включено при наличии дисплея | показать экран окном QEMU (`-display gtk`) |
+| `--headless` | авто: выключено при наличии дисплея | serial-only: рисовать off-screen |
 | `PROFILE` | `debug` | `release` — собрать и запустить release-ядро |
 | `MEMORY` | `256M` | объём RAM у `virt` |
 | `BIOS` | — (QEMU `-bios default`) | внешняя прошивка, например `BIOS=/path/opensbi.bin` |

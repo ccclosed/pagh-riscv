@@ -42,8 +42,9 @@ python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb --
 
 `./run.sh` boots the kernel interactively (QEMU `virt` + OpenSBI, serial on stdio;
 `Ctrl-A X` to leave). It always passes `-device ramfb`, so the screen exists too:
-off-screen by default (`-display none`, which is what lets `screendump` work
-headless), in a QEMU window with `./run.sh --window`. `PROFILE=release`, `MEMORY=…`,
+in a QEMU window by default when a display is reachable (`DISPLAY` or
+`WAYLAND_DISPLAY`), serial-only with `--headless` (the shell renders off-screen,
+which is what lets `screendump` work headless). `PROFILE=release`, `MEMORY=…`,
 `BIOS=…` cover the variants, `DISK=/tmp/pagh.img` attaches the virtio-mmio
 disk (a missing image is created blank and the kernel formats it on boot) and
 `NO_MOUSE=1` boots without the virtio-tablet (the pointer-absent path); what
@@ -78,7 +79,7 @@ path "for parity".
 
 ```text
 kernel-build    -> cargo (target from .cargo/config.toml, linker.ld, -Tlinker.ld)
-kernel-run      -> run.sh                  # Linux/QEMU launcher; ramfb on, --window for a window
+kernel-run      -> run.sh                  # Linux/QEMU launcher; window by default, --headless for serial
 kernel-screen   -> tools/run.py            # boots with ramfb, screendump, font check
 kernel-smoke    -> .github/smoke.py        # headless QEMU driver used by CI (serial/ramfb/disk)
 kernel-selftest -> the shell's `selftest`  # in-QEMU memory + block + filesystem checks
