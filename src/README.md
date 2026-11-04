@@ -48,10 +48,10 @@
 | `task/mod.rs` | фасад планировщика |
 | `task/scheduler.rs` | таблица потоков, ready-queue, квант, стеки из PMM, `tick`/`yield`/`exit`/`reap`, вытеснение таймером |
 | `task/selftest.rs` | пять проверок планировщика для `selftest` |
-| `user/mod.rs` | `run_image`: ELF → user-стек → задача → `sret` в U-mode → reap; `on_fault`; встроенные hello/fault/spin |
-| `user/elf.rs` | ELF64-загрузчик: валидация до первого кадра, `PT_LOAD` с `U=1`, откат кадров, `Loaded`/`ElfError` |
-| `user/syscall.rs` | `ecall`-диспетчер Linux/RISC-V: `write`/`exit`/`sched_yield`/`getpid`, проверка user-указателей, `sepc+4` |
-| `user/selftest.rs` | семь проверок user-mode для `selftest` |
+| `user/mod.rs` | `run_image`/`run_file`: ELF → user-стек → SysV-кадр `argc/argv/envp` → задача → `sret` в U-mode → reap; `brk`-heap, `on_fault`, capture для ABI-теста; встроенные hello/fault/spin/argv/abi |
+| `user/elf.rs` | ELF64-загрузчик: валидация до первого кадра, `PT_LOAD` с `U=1`, потоковые сегменты кусками ≤ 512 B, откат кадров, `Loaded`/`ElfError` |
+| `user/syscall.rs` | native ABI: `read`/`write`/`openat`/`close`/`lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/`readlinkat`/`exit`/`sched_yield`/`getpid`; fd-таблица на прогон, `copy_from_user`/`copy_to_user`, `sepc+4` |
+| `user/selftest.rs` | десять проверок user-mode для `selftest` (argv-строка, все syscall'ы ABI, ELF-матрица, fault, таймер, 100 KiB) |
 | `net/mod.rs` | сетевой стек: состояние, ARP-кэш, `poll()`, диспетчер ARP/IPv4/ICMP/UDP/TCP, `ping`, DHCP-конфигурация |
 | `net/wire.rs` | чистые форматы Ethernet/ARP/IPv4/ICMP/UDP/TCP/DHCP/DNS и контрольные суммы (без устройства и часов) |
 | `net/dhcp.rs` | DHCP-клиент DISCOVER/OFFER/REQUEST/ACK |

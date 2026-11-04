@@ -76,7 +76,10 @@ ext2 смонтирован в `/mnt`; `ls`/`cat`/`stat` работают, `disk
 User mode M6b: `run demo` исполняет статический ELF в U-mode (`write`,
 `sched_yield`, `exit(42)`), `run fault` намеренно падает по load page fault —
 ядро печатает причину и **оставляет машину живой**, `run spin` крутится в U-mode
-0.2 с, чтобы таймер успел вытеснить задачу, и выходит с кодом 7.
+0.2 с, чтобы таймер успел вытеснить задачу, и выходит с кодом 7. Native ABI для
+libpagh: `run <path> [args...]` передаёт `argc`/`argv`/`envp`, а `read`/`openat`/
+`fstat`/`getdents64`/`brk`/`clock_gettime`/`uname`/`readlinkat` проверены
+встроенным `userland/abi.elf` в `selftest`.
 
 ![user mode: run demo, run fault, run spin](docs/user.png)
 
@@ -132,6 +135,9 @@ pagh:rv64> echo smoke ok
 smoke ok
 pagh:rv64> nosuchcmd
 nosuchcmd: unknown command (try 'help')
+pagh:rv64> run demo alpha beta
+hello from user mode
+run: demo exited with code 42
 pagh:rv64> help
 commands:
   help          this list
@@ -193,10 +199,10 @@ SELFTEST SUMMARY: 7/7 passed
 | Файловая система (ext2) | готово | чтение/запись файлов (direct + single/double indirect), truncate, каталоги, create/unlink/mkdir/rmdir/rename, симлинки; совместимо с образом хостового `mkfs.ext2 -t ext2`; форматируется только пустое устройство (MBR/GPT/чужие данные — отказ с причиной); журнала/WAL нет | `src/fs/ext2/`, `src/fs/format_policy.rs` |
 | VFS | готово | `VfsNode`, синтетический корень, монтирование в `/mnt`, два примитива разрешения путей (`lookup_path` без последней симлинки / `walk` с переходом и бюджетом) | `src/vfs/mod.rs` |
 | Планировщик, потоки ядра (M6a) | готово | контекстный switch (callee-saved ABI), до 8 потоков, round-robin, квант 8 тиков, стек 16 KiB + guard из PMM, вытеснение тиком таймера из trap-контекста (включая вытеснение U-mode), `tasks`/`spawn`/`yield`; exit возвращает кадры | `src/arch/riscv64/switch.rs`, `src/task/` |
-| User mode, syscalls, ELF (M6b) | готово | `sret` в U-mode (`SPP=0`, `SPIE=1`, `SUM=0`, `sscratch`-контракт), `ecall`-диспетчер Linux/RISC-V (`write`/`exit`/`sched_yield`/`getpid`, `sepc+4`, проверка user-указателей, `SUM` вокруг копии), ELF64-загрузчик с откатом кадров и **потоковым чтением** `ImageSource` (заголовок, program headers, сегменты по 4 KiB; без буфера размером с файл), `run <path>` до 1 MiB и фикстуры `demo`/`fault`/`spin`, fault из U убивает только задачу; таймер вытесняет U-mode | `src/user/`, `userland/` |
+| User mode, syscalls, ELF, native ABI (M6b) | готово | `sret` в U-mode (`SPP=0`, `SPIE=1`, `SUM=0`, `sscratch`-контракт); вход `a0=argc`, `a1=argv`, SysV-кадр `argc/argv/envp` с `argv[0]` как набран и `PWD=<cwd>`; `ecall`-диспетчер: `read`/`write`/`openat`/`close`/`lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/`readlinkat`/`exit`/`sched_yield`/`getpid`, `sepc+4`, таблица 16 fd на прогон, `copy_from_user`/`copy_to_user` с проверкой `U/R/W` и `SUM` вокруг копии, heap-окно 1 MiB с возвратом кадров; ELF64-загрузчик с откатом кадров и **потоковым чтением** `ImageSource` (сегменты кусками ≤ 512 B, без буфера размером с файл), `run <path> [args...]` до 1 MiB и фикстуры `demo`/`fault`/`spin`/`argv`/`abi`; fault из U убивает только задачу; таймер вытесняет U-mode | `src/user/`, `userland/` |
 | Сеть (M7) | готово | virtio-net (modern, polled) + свой стек: Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP-клиент, DNS-резолвер, `net`/`dhcp`/`ping`/`dns`/`http`; без smoltcp и внешних крейтов | `src/net/`, `src/drivers/virtio_net.rs` |
 | Пакеты, apt | **нет** | нужен TLS-стек (vendored `embedded-tls` + OpenPGP-проверка), как на x86; следующий майлстоун после сети | — |
-| Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 4 блока/указателя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 8 user-mode (`user-run-large-file`: 8/8 с диском, 7/8 + SKIP без `/mnt`) + 11 сети (идемпотентность по ledger'у свободных кадров), QEMU-smoke в шести режимах (serial, ramfb, диск-fresh, диск-existing, net, keyboard) — во всех приложен virtio-tablet, в keyboard ещё и virtio-keyboard, и проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/net/selftest.rs`, `.github/smoke.py`, `tools/` |
+| Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 4 блока/указателя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 10 user-mode (`user-run-large-file` и `user-abi-syscalls`: 10/10 с диском, 8/10 + 2 SKIP без `/mnt`) + 11 сети (идемпотентность по ledger'у свободных кадров), QEMU-smoke в шести режимах (serial, ramfb, диск-fresh, диск-existing, net, keyboard) — во всех приложен virtio-tablet, в keyboard ещё и virtio-keyboard, и проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/net/selftest.rs`, `.github/smoke.py`, `tools/` |
 | CI | готово | `fmt`, debug/release build, QEMU-smoke в шести режимах: serial, ramfb, диск-fresh (формат/монтирование/запись), диск-existing (повторная загрузка читает файл), net (DHCP + ping шлюза), keyboard (virtio-keyboard печатает `help`/`halt` через монитор QEMU); во всех приложен virtio-tablet, в keyboard — ещё и virtio-keyboard | `.github/workflows/ci.yml` |
 
 ---
@@ -264,10 +270,48 @@ M6b вживую (те же команды понимает шелл):
 ```sh
 # после prompt'а pagh:rv64>
 run demo        # hello from user mode + run: demo exited with code 42
+run demo a b    # то же: у фикстуры по контракту argc=1, лишние слова не мешают
 run fault       # [user] fault killed: load page fault ... ; шелл жив
 run spin        # 0.2 s в U-mode (таймер вытесняет) -> exit 7
-selftest        # + SELFTEST user-*: 8/8 с /mnt (без диска 7/8 + SKIP)
+selftest        # + SELFTEST user-*: 10/10 с /mnt (без диска 8/10 + 2 SKIP)
 ```
+
+### Native ABI для libpagh
+
+`run <path> [args...]` входит в U-mode по контракту
+`pagh-api/docs/abi.md`: `a0 = argc`, `a1 = argv`, `sp` выровнен на 16 байт и
+указывает на SysV-кадр `[argc][argv0..][NULL][env0..][NULL][строки]`.
+`argv[0]` — путь **как набран** в шелле, окружение — `PWD=<cwd>`; `envp`
+программа восстанавливает из `sp` (`argv + argc + 1`), отдельного регистра под
+него нет. Аргументы после пути делятся по пробелам: кавычек и экранирования в
+шелле нет, поэтому аргумент с пробелом передать нельзя. У встроенных фикстур
+`argc = 1` (`argv = [demo]`), лишние слова после `run demo` игнорируются.
+
+| nr | вызов | семантика |
+|---:|---|---|
+| 63 | `read` | fd 0 — консоль: UART-кольцо, затем virtio-клавиатура, иначе `-EAGAIN` (ядро **никогда не блокирует**); файл — с offset; каталог — `-EISDIR` |
+| 64 | `write` | fd 1/2 — консоль; файл — по offset, `O_APPEND` пишет в конец; fd 0 — `-EBADF` |
+| 56 | `openat` | `dirfd` игнорируется, путь только абсолютный; `O_RDONLY/WRONLY/RDWR`, `O_CREAT`, `O_TRUNC`, `O_APPEND`; `mode` принимается и **игнорируется** (в VFS нет `set_mode`, ext2 даёт 0o644) |
+| 57 | `close` | освобождает дескриптор; 0/1/2 тоже можно закрыть — до конца прогона |
+| 62 | `lseek` | SET/CUR/END, знаковый 64-битный offset; консоль и каталог — `-EINVAL` |
+| 80 | `fstat` | нативный `Stat` (24 B): режим, тип, размер, ino из `VfsNode`; синтетические узлы — 0o755/0o644 |
+| 61 | `getdents64` | снимок детей каталога на `openat`, записи `Dirent` (12 B заголовок + имя, выравнивание 8); курсор двигается только за скопированные записи |
+| 214 | `brk` | окно 1 MiB по фиксированному адресу (см. ниже); `brk(0)` — текущий break; возвращаемое значение всегда выровнено вверх на страницу, рост/сжатие постранично, за окном — `-ENOMEM` |
+| 113 | `clock_gettime` | id 0/1 — тиковое время ядра (`Timespec`, разрешение 10 ms), другие id — `-EINVAL` |
+| 101 | `nanosleep` | `Timespec` проверяется и округляется **вверх** до тика; `rem` игнорируется; ждёт в `wfi` с разрешёнными прерываниями |
+| 160 | `uname` | 5×16 байт: `pagh`, `pagh-riscv`, `0.10.0-dev`, версия пакета, `riscv64` |
+| 78 | `readlinkat` | цель символической ссылки без NUL; не ссылка — `-EINVAL` |
+| 172 | `getpid` | id текущей задачи |
+| 124 | `sched_yield` | добровольное переключение |
+| 93 | `exit` | `Exit::Code(a0)`, не возвращается |
+
+Пределы и отличия, которые важно знать userland'у: 16 дескрипторов включая
+0/1/2 (кончились — `-ENOSPC`); путь ≤ 256 байт с NUL; `argv`+`env` ≤ 64 строк и
+≤ 16 KiB; heap — ровно 1 MiB в `0x2000_0000..0x2010_0000`, кадры под него
+возвращаются в PMM после прогона (включая fault); `mmap`/`fork`/`exec` нет.
+`getdents64` при буфере меньше одной записи возвращает 0 — как конец каталога;
+буфер на 264 байта покрывает самое длинное имя ext2. Неизвестный номер —
+`-ENOSYS`; плохой указатель — `-EFAULT`, а не page fault.
 
 ### Как управлять шеллом
 
@@ -278,7 +322,7 @@ backspace работает, всё остальное — команды:
 |---|---|
 | `help` | список команд |
 | `mem` | память из device tree **и** статистика PMM и кучи (свободно/всего кадров, диапазон пула, байты кучи) |
-| `selftest` | in-QEMU self-tests: 7 памяти, 4 блока/указателя, 11 ext2/VFS, 4 таймера/PLIC, 5 планировщика, 8 user-mode (`user-run-large-file` — SKIP без `/mnt`, итог 7/8); печатает ledger свободных кадров до и после каждого блока |
+| `selftest` | in-QEMU self-tests: 7 памяти, 4 блока/указателя, 11 ext2/VFS, 4 таймера/PLIC, 5 планировщика, 10 user-mode (без `/mnt` два SKIP — `user-run-large-file` и `user-abi-syscalls`, итог 8/10); печатает ledger свободных кадров до и после каждого блока |
 | `disk` | блочное устройство: имя, ёмкость, живая проверка чтения сектора 0 |
 | `ls [path]` | листинг каталога (каталоги с `/`) |
 | `cat <path>` | содержимое файла |
@@ -290,8 +334,8 @@ backspace работает, всё остальное — команды:
 | `cp <src> <dst>` / `mv <src> <dst>` | копировать / переименовать |
 | `ln [-s] <target> <path>` | жёсткая или символическая ссылка |
 | `ramdisk [sectors]` | **только для тестов**: отформатировать RAM-диск и смонтировать его в `/mnt` |
-| `run <path>` | исполнить статический RV64 ELF из VFS в U-mode: файл читается **потоково** (ELF-заголовок, program headers и сегменты по 4 KiB), без буфера размером с файл; образ ≤ 1 MiB, один user-образ за раз |
-| `run demo` / `run fault` / `run spin` | встроенные фикстуры: hello (exit 42), падение по load page fault (задача убита, машина жива), 0.2 s спина в U-mode (exit 7) |
+| `run <path> [args...]` | исполнить статический RV64 ELF из VFS в U-mode: файл читается **потоково** (ELF-заголовок, program headers и сегменты кусками ≤ 512 B), без буфера размером с файл; `args` уходят в `argv[1..]`, `argv[0]` — путь как набран; образ ≤ 1 MiB, один user-образ за раз |
+| `run demo` / `run fault` / `run spin` | встроенные фикстуры: hello (exit 42), падение по load page fault (задача убита, машина жива), 0.2 s спина в U-mode (exit 7); `argc = 1`, лишние слова игнорируются |
 | `net` | MAC, `ip/mask`, gateway, DNS и срок DHCP-lease |
 | `dhcp` | повторить DHCP-обмен (DISCOVER/OFFER/REQUEST/ACK) и напечатать новый lease |
 | `ping <ip> [n]` | до 4 ICMP echo через свой ARP/IPv4/ICMP-путь; печатает `seq`, время и итог |
@@ -391,13 +435,18 @@ IPv4, ICMP и UDP, а `dhcp`/`dns`/`tcp` — маленькие клиенты. 
 значит её нет в коде.
 
 * **Нет адресного пространства на процесс.** Sv39 включён, но карта одна:
-  identity для RAM, плюс user-окно с `U=1` (образ и стек) в той же таблице.
+  identity для RAM, плюс user-окно с `U=1` (образ, стек, heap) в той же таблице.
   `satp.ASID = 0`, VMM/mprotect/разделяемых страниц нет; два user-процесса друг
   от друга не защищены — только юзер от ядра. `run_image` держит «одна программа
   за раз».
+* **Нет `mmap`, `mprotect`, `fork`/`exec`, сигналов и динамического ELF.**
+  `brk` есть, но это одно фиксированное окно 1 MiB (`0x2000_0000`), а не общий
+  менеджер памяти; `read(0)` неблокирующий (`-EAGAIN`), `getdents64` отдаёт
+  снимок каталога на момент `openat`, `openat(... O_CREAT)` игнорирует `mode`
+  (в VFS нет `set_mode`).
 * **Нет `fork`/`exec`, сигналов и динамического ELF.** Загрузчик понимает только
   статические `ET_EXEC`/`ET_DYN` без интерпретатора; userland — голые `ecall`.
-  `run <path>` читает файл *ядром* потоково, частями не больше 4 KiB, и грузит
+  `run <path>` читает файл *ядром* потоково, частями не больше 512 B, и грузит
   его в user-окно; предел образа — 1 MiB (`MAX_IMAGE_BYTES`), одновременно
   исполняется один user-образ, отдельного адресного пространства процесса и
   отображения `/mnt` в него нет.
@@ -441,14 +490,14 @@ src/memory/heap.rs             куча: free-list поверх чанков п�
 src/memory/selftest.rs         in-QEMU self-tests памяти (selftest)
 src/user/mod.rs                run_image: ELF -> user-стек -> задача -> sret в U-mode
 src/user/elf.rs                ELF64-загрузчик: валидация, PT_LOAD с U=1, откат кадров
-src/user/syscall.rs            ecall-диспетчер: write/exit/sched_yield/getpid, sepc+4
-src/user/selftest.rs           in-QEMU self-tests user mode (7 проверок)
+src/user/syscall.rs            ecall-диспетчер: read/write/openat/close/lseek/fstat/getdents64/brk/time/uname/readlinkat
+src/user/selftest.rs           in-QEMU self-tests user mode (10 проверок)
 src/net/mod.rs                 сетевой стек: poll, ARP-кэш, диспетчер кадров, ping
 src/net/wire.rs                чистые форматы Ethernet/ARP/IPv4/ICMP/UDP/TCP/DHCP/DNS
 src/net/{dhcp,dns,tcp}.rs      DHCP-клиент, DNS-резолвер, минимальный TCP-клиент
 src/net/selftest.rs            in-QEMU self-tests сети (11 проверок)
 src/net/README.md              дизайн стека: опрос, wire, DHCP/DNS/TCP, чего нет
-userland/{hello,fault,spin}.rs статические RV64-фикстуры + user.ld + build.sh
+userland/{hello,fault,spin,argv,abi}.rs статические RV64-фикстуры + user.ld + build.sh
 userland/README.md             как пересобрать и что доказывает каждая фикстура
 src/memory/README.md           дизайн памяти: кадры, куча, чего нет
 src/drivers/uart.rs            NS16550, polled

@@ -167,7 +167,11 @@ pub extern "C" fn argv_main(argc: usize, argv: *const *const u8, sp: usize) -> i
         code = 6;
     } else if sp & 0xf != 0 {
         code = 7;
-    } else if unsafe { *(sp as *const usize) } != argc {
+    } else if
+        // SAFETY: `sp` is the frame base the kernel passed in `a2`, 16-byte
+        // aligned and pointing at the `argc` word.
+        unsafe { *(sp as *const usize) } != argc
+    {
         code = 8;
     } else if argv as usize != sp + core::mem::size_of::<usize>()
         || envp as usize != sp + (argc + 2) * core::mem::size_of::<usize>()

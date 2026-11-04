@@ -76,6 +76,11 @@ EXPECTED = [
     "smoke ok",
     "pagh:rv64> nosuchcmd",
     "nosuchcmd: unknown command (try 'help')",
+    # `run` with arguments: the fixtures keep argc=1 by contract, so trailing
+    # words must be accepted and ignored rather than changing the entry frame.
+    "pagh:rv64> run demo alpha beta",
+    "hello from user mode",
+    "run: demo exited with code 42",
     "pagh:rv64> help",
     "commands:",
     "  help          this list",
@@ -99,7 +104,8 @@ SCREEN_MARKER = {
 
 # Sent as one write, after the banner: the shell is line-based and its UART has
 # a FIFO, so a burst is fine once the kernel is listening.
-COMMANDS = b"mem\nhart\ntime\necho smoke ok\nnosuchcmd\nhelp\nhalt\n"
+COMMANDS = (b"mem\nhart\ntime\necho smoke ok\nnosuchcmd\n"
+            b"run demo alpha beta\nhelp\nhalt\n")
 
 # ── the disk mode (M5) ─────────────────────────────────────────────────────
 # `--disk PATH` attaches a virtio-mmio block device and then behaves differently
