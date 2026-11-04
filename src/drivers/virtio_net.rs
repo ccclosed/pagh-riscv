@@ -438,35 +438,45 @@ impl Rx {
         }
     }
 
-    /// Drain every completed receive buffer into the frame ring, re-posting the
-    /// descriptor immediately so the device never runs out of buffers.
+    /// Move completed receive buffers into the frame ring, re-posting each
+    /// descriptor as soon as its frame has been copied.
+    ///
+    /// The loop **stops when the frame ring is full** and leaves the remaining
+    /// used entries where they are. Consuming them anyway (the earlier shape)
+    /// silently dropped every frame past the eighth in a burst: a 13 KiB HTTP
+    /// response is exactly such a burst, and TCP then spent retransmission
+    /// timers recovering segments the driver had already acknowledged to the
+    /// virtqueue. Stopping is safe: `recv_frame` pops one frame and drains the
+    /// next used entry on the following call, so the ring is a bounded queue,
+    /// not a loss point.
     fn drain(&mut self, base: usize) {
-        while let Some((id, len)) = self.queue.take_used(base) {
+        while self.count < FRAME_SLOTS as u8 {
+            let Some((id, len)) = self.queue.take_used(base) else {
+                break;
+            };
             let index = id as usize;
             if index < RX_BUFFERS && (len as usize) > NET_HEADER_BYTES {
                 let frame_len = (len as usize - NET_HEADER_BYTES).min(MAX_FRAME_BYTES);
-                if self.count < FRAME_SLOTS as u8 {
-                    let slot = self.tail as usize;
-                    let base = slot * MAX_FRAME_BYTES;
-                    let source = self.buffer(index) + NET_HEADER_BYTES;
-                    // SAFETY: `source` points into this NIC's receive buffer
-                    // `index`; `frame_len` is capped at the buffer's usable bytes
-                    // and at `MAX_FRAME_BYTES`, and `base + frame_len` stays inside
-                    // the flat frame ring (`FRAME_SLOTS * MAX_FRAME_BYTES`).
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            source as *const u8,
-                            self.frames.as_mut_ptr().add(base),
-                            frame_len,
-                        );
-                    }
-                    self.lens[slot] = frame_len as u16;
-                    self.tail = ((slot + 1) % FRAME_SLOTS) as u8;
-                    self.count += 1;
+                let slot = self.tail as usize;
+                let offset = slot * MAX_FRAME_BYTES;
+                let source = self.buffer(index) + NET_HEADER_BYTES;
+                // SAFETY: `source` points into this NIC's receive buffer
+                // `index`; `frame_len` is capped at the buffer's usable bytes
+                // and at `MAX_FRAME_BYTES`, and `offset + frame_len` stays inside
+                // the flat frame ring (`FRAME_SLOTS * MAX_FRAME_BYTES`).
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        source as *const u8,
+                        self.frames.as_mut_ptr().add(offset),
+                        frame_len,
+                    );
                 }
+                self.lens[slot] = frame_len as u16;
+                self.tail = ((slot + 1) % FRAME_SLOTS) as u8;
+                self.count += 1;
             }
-            // Re-post the descriptor whether or not the frame was kept: the
-            // device owns the buffer until it is published again.
+            // The buffer is free once its frame is copied (or it was too small
+            // to be a frame); re-post it so the device can use it again.
             write_desc(
                 self.queue.desc,
                 index as u16,
