@@ -254,11 +254,16 @@ fn pointer_device() -> Outcome {
         return Outcome::Fail;
     }
     crate::kprintln!(
-        "[selftest] input: {} at ({}, {}), left={}",
+        "[selftest] input: {} at ({}, {}), left={}, keyboard={}",
         crate::drivers::virtio_input::kind_name(),
         state.x,
         state.y,
-        state.left
+        state.left,
+        if crate::drivers::virtio_input::keyboard_present() {
+            "present"
+        } else {
+            "absent"
+        }
     );
     Outcome::Pass
 }

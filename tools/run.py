@@ -357,6 +357,8 @@ def boot(args: argparse.Namespace, serial_path: str, monitor_path: str) -> subpr
         "-display", "none",
         "-no-reboot",
     ]
+    if getattr(args, "keyboard", False):
+        cmd += ["-device", "virtio-keyboard-device"]
     qmp_path = serial_path + "-qmp"
     if getattr(args, "mouse", None):
         if os.path.exists(qmp_path):
@@ -451,6 +453,11 @@ def main() -> int:
     parser.add_argument("--kernel", default=KERNEL_DEBUG, help=f"kernel ELF (default {KERNEL_DEBUG})")
     parser.add_argument("--release", action="store_true", help=f"use {KERNEL_RELEASE}")
     parser.add_argument("--memory", default="256M", help="guest RAM (default 256M, as run.sh)")
+    parser.add_argument(
+        "--keyboard",
+        action="store_true",
+        help="attach a virtio-keyboard (the kernel console in a QEMU window; run.sh attaches one by default)",
+    )
     parser.add_argument(
         "--mouse",
         nargs=2,

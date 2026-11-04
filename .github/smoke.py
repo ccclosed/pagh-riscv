@@ -14,6 +14,7 @@ any expected line is missing.  Used by the `smoke` job in
     python3 .github/smoke.py <elf> --disk /tmp/ci.img --fresh
     python3 .github/smoke.py <elf> --disk /tmp/ci.img
     python3 .github/smoke.py <elf> --net        # virtio-net: DHCP + ping gateway
+    python3 .github/smoke.py <elf> --keyboard   # virtio-keyboard: type help/halt via QMP
 
 `--ramfb` attaches QEMU's ramfb device, so the run also covers the framebuffer
 bring-up (`fw_cfg` -> `etc/ramfb` -> the console's second sink) while staying
@@ -42,6 +43,7 @@ The full serial log is printed either way, so a CI failure is readable.
 
 import os
 import select
+import socket
 import subprocess
 import sys
 import time
@@ -249,19 +251,158 @@ def boot(kernel, ramfb=False, disk=None, commands=COMMANDS, timeout=120.0, net=F
     return reached, powered_off, exit_code, log.decode("utf-8", "replace")
 
 
+def keyboard_boot(kernel, timeout=120.0):
+    """Boot with a virtio-keyboard and type `help` / `halt` through the monitor.
+
+    This is the QEMU-window input path in a headless test: the guest's keyboard
+    is a virtio-mmio input device (there is no PS/2 on `virt`), so the keys are
+    delivered by QEMU's input layer rather than by the serial line. The monitor
+    is the only way to inject them, which is why this mode starts its own QEMU
+    instead of reusing [`boot`].
+
+    The serial line is a unix socket rather than stdio on purpose: with
+    `-serial stdio` the guest's output stopped mid-command when the monitor was
+    injecting keys, while the same guest on a socket stays responsive. The
+    socket is also what the other drivers in this repository use.
+
+    Returns `(ok, log)`.
+    """
+    tag = os.getpid()
+    mon = "/tmp/pagh-smoke-keyboard-%d.mon" % tag
+    ser = "/tmp/pagh-smoke-keyboard-%d.ser" % tag
+    for path in (mon, ser):
+        if os.path.exists(path):
+            os.unlink(path)
+    cmd = [
+        QEMU, "-machine", "virt", "-m", "256M",
+        "-bios", BIOS if BIOS else "default",
+        "-kernel", kernel,
+        "-display", "none", "-no-reboot",
+        "-global", "virtio-mmio.force-legacy=false",
+        "-device", "ramfb",
+        "-device", "virtio-tablet-device",
+        "-device", "virtio-keyboard-device",
+        "-serial", "unix:%s,server=on,wait=on" % ser,
+        "-monitor", "unix:%s,server=on,wait=off" % mon,
+    ]
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    log = bytearray()
+
+    def connect(path, deadline):
+        while time.time() < deadline:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.connect(path)
+                return sock
+            except OSError:
+                sock.close()
+                time.sleep(0.1)
+        return None
+
+    serial = None
+    try:
+        deadline = time.time() + timeout
+        serial = connect(ser, deadline)
+        if serial is None:
+            return False, ""
+        serial.setblocking(False)
+        fd = serial.fileno()
+
+        def pump_until(marker, limit=None):
+            end = time.time() + (limit if limit is not None else timeout)
+            while time.time() < end:
+                ready, _, _ = select.select([fd], [], [], 0.2)
+                if ready:
+                    try:
+                        chunk = serial.recv(4096)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        return False
+                    log.extend(chunk)
+                    if marker in log.decode("utf-8", "replace"):
+                        return True
+                elif proc.poll() is not None:
+                    return False
+            return False
+
+        if not pump_until(BANNER):
+            return False, log.decode("utf-8", "replace")
+        time.sleep(0.5)
+
+        monitor = connect(mon, time.time() + 15)
+        if monitor is None:
+            return False, log.decode("utf-8", "replace")
+        monitor.setblocking(False)
+
+        def hmp(command):
+            monitor.sendall((command + "\n").encode())
+            time.sleep(0.25)
+            try:
+                monitor.recv(65536)
+            except BlockingIOError:
+                pass
+
+        def typed(text):
+            for ch in text:
+                hmp("sendkey " + ("spc" if ch == " " else ch))
+            hmp("sendkey ret")
+
+        typed("help")
+        if not pump_until("commands:", 20):
+            return False, log.decode("utf-8", "replace")
+        typed("halt")
+        end = time.time() + timeout
+        while time.time() < end and proc.poll() is None:
+            ready, _, _ = select.select([fd], [], [], 0.2)
+            if ready:
+                try:
+                    chunk = serial.recv(65536)
+                except BlockingIOError:
+                    continue
+                if chunk:
+                    log.extend(chunk)
+        exit_code = proc.poll()
+        if exit_code is None:
+            proc.kill()
+            exit_code = proc.wait()
+        text = log.decode("utf-8", "replace")
+        ok = (
+            "virtio-input: keyboard at 0x" in text
+            and "commands:" in text
+            and HALT in text
+            and exit_code == 0
+        )
+        return ok, text
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        if serial is not None:
+            serial.close()
+        for path in (mon, ser):
+            if os.path.exists(path):
+                os.unlink(path)
+
+
 def main():
     args = sys.argv[1:]
     ramfb = "--ramfb" in args
     args = [a for a in args if a != "--ramfb"]
     net = "--net" in args
     args = [a for a in args if a != "--net"]
+    keyboard = "--keyboard" in args
+    args = [a for a in args if a != "--keyboard"]
     fresh = "--fresh" in args
     args = [a for a in args if a != "--fresh"]
     disk = None
     if "--disk" in args:
         i = args.index("--disk")
         if i + 1 >= len(args):
-            print("usage: smoke.py <kernel> [--ramfb] [--net] [--disk PATH [--fresh]]", file=sys.stderr)
+            print("usage: smoke.py <kernel> [--ramfb] [--net] [--keyboard] [--disk PATH [--fresh]]", file=sys.stderr)
             return 2
         disk = args[i + 1]
         args = args[:i] + args[i + 2 :]
@@ -277,6 +418,15 @@ def main():
         print("SMOKE: no disk image at %s (create it first: qemu-img create -f raw ...)" % disk,
               file=sys.stderr)
         return 2
+
+    if keyboard:
+        ok, log = keyboard_boot(kernel)
+        print(log, end="" if log.endswith("\n") else "\n")
+        if not ok:
+            print("SMOKE: FAIL (keyboard)", file=sys.stderr)
+            return 1
+        print("SMOKE: PASS (keyboard) — virtio-keyboard typed help and halt, QEMU exited 0")
+        return 0
 
     mode = "ramfb" if ramfb else "serial"
     if net:

@@ -18,7 +18,7 @@
 | `block.rs` | шов блочного слоя: трейт `BlockDevice` + один слот реестра + RAM-диск `MemBlock` | сектор 512 Б; короткий трансфер — `Err`, а не EOF |
 | `virtio_mmio.rs` | virtio-blk на mmio-транспорте (modern, version 2), polled | окна транспорта — из DTB; `-global virtio-mmio.force-legacy=false` |
 | `virtio_net.rs` | virtio-net на том же транспорте: две очереди (RX/TX), polled | negotiate `VIRTIO_F_VERSION_1` + `MRG_RXBUF`; заголовок 12 байт; кадры копируются в ring |
-| `virtio_input.rs` | virtio-input (tablet/mouse) → координаты указателя | абсолютные оси из `CFG_ABS_INFO`; события в 8-байтных буферах; polled из idle-цикла |
+| `virtio_input.rs` | virtio-input: pointer (tablet/mouse) и keyboard | capabilities различают устройства; оси из `CFG_ABS_INFO`; EV_KEY → US-раскладка; polled из idle-цикла |
 | `selftest.rs` | проверки блочного слоя для шелл-команды `selftest` | диск только читается; запись проверяется на `MemBlock` |
 
 Фасад — [`mod.rs`](mod.rs); точка входа в экран — `framebuffer::init()`, которую
@@ -236,7 +236,7 @@ virtqueue, адреса — identity-map), но два кольца: RX (0) и T
   `write_char` такие байты отбрасывает (тире в баннере `main.rs` на экране не
   видно — это ожидаемо).
 
-## `virtio_input.rs` — указатель и курсор (M8)
+## `virtio_input.rs` — указатель, клавиатура и курсор (M8)
 
 У `virt` нет PS/2, поэтому мышь приходит как **virtio-input** на том же
 virtio-mmio (device id 18). Драйвер:
@@ -248,6 +248,13 @@ virtio-mmio (device id 18). Драйвер:
   `BTN_LEFT`) — устройство фильтрует поток по этой битовой карте;
 * держит очередь 0 заполненной 8-байтными буферами: consumed-дескриптор
   публикуется обратно сразу, поэтому шторм событий не опустошает ring;
+* различает **клавиатуру** по тем же возможностям: у QEMU оба устройства имеют
+  device id 18, поэтому классификация идёт по битовым картам (`EV_ABS` → tablet,
+  `EV_REL` → mouse, иначе `EV_KEY` → keyboard); клавиатура подписывается на все
+  коды `EV_KEY`;
+* переводит коды в байты US-раскладкой (буквы/цифры/символы, shift, caps,
+  backspace, enter, tab) и складывает их в кольцо на 128 байт; `try_key()` забирает
+  байт из шелла, так что окно QEMU — такая же консоль, как serial;
 * не имеет прерывания: `poll()` вызывается из idle-цикла шелла вместе с сетью,
   100 Гц хватает для текстовой консоли.
 
@@ -265,9 +272,12 @@ python3 tools/font_check.py --screenshot /tmp/riscv-shell.png \
     --find --expect "Type 'help'"                              # diff = 0
 python3 tools/run.py --keys "help\n" --shot /tmp/riscv-help.png --check-font --scan-all
 python3 tools/run.py --mouse 900 300 --shot /tmp/riscv-cursor.png     # software-курсор
+python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb --keyboard
+# ^ загружает virtio-keyboard и печатает help/halt клавишами через монитор QEMU
 ```
 
-`run.py` подключает virtio-tablet по умолчанию; `--mouse X Y` двигает указатель
+`run.py` подключает virtio-tablet по умолчанию (`--keyboard` добавляет клавиатуру);
+`--mouse X Y` двигает указатель
 через QMP (`input-send-event`, абсолютные оси) и даёт гостю несколько idle-тактов
 до `screendump`. Без устройства (`NO_MOUSE=1 ./run.sh`) курсора нет, а в логе
 одна строка `virtio-input: no device` — это проверенный путь отсутствия.

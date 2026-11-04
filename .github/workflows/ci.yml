@@ -116,6 +116,13 @@ jobs:
         run: python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh
       - name: Boot it with ramfb (the screen path)
         run: python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb
+      # M8 input acceptance: the window has no PS/2, so keys arrive as a
+      # virtio-input keyboard. The guest must type `help` and `halt` from monitor
+      # key events (the same path the QEMU window uses) and power off.
+      - name: Type into the guest through a virtio-keyboard
+        run: >-
+          python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh
+          --ramfb --keyboard
       # M7 acceptance: a virtio-net NIC on QEMU's user network, DHCP lease at
       # boot, then `net` and an ICMP echo to the gateway. Deterministic: the
       # network is QEMU's own slirp, not the runner's internet access.

@@ -88,6 +88,11 @@ if [[ "${NO_MOUSE:-0}" != "1" ]]; then
   MOUSE_ARGS=(-device virtio-tablet-device)
 fi
 
+# The keyboard: `virt` has no PS/2 controller, so keys from the QEMU window
+# arrive as a virtio-input keyboard. Serial input still works too; the shell
+# reads both in its idle loop, so either console is usable at any time.
+KEYBOARD_ARGS=(-device virtio-keyboard-device)
+
 NET_ARGS=()
 if [[ "${NO_NET:-0}" != "1" ]]; then
   NET_ARGS=(
@@ -105,6 +110,7 @@ exec qemu-system-riscv64 \
   -global virtio-mmio.force-legacy=false \
   "${DISK_ARGS[@]}" \
   "${MOUSE_ARGS[@]}" \
+  "${KEYBOARD_ARGS[@]}" \
   "${NET_ARGS[@]}" \
   "${DISPLAY_ARGS[@]}" \
   -serial mon:stdio \

@@ -35,7 +35,7 @@
 | `drivers/block.rs` | шов блочного слоя: трейт `BlockDevice`, один слот реестра, RAM-диск `MemBlock` |
 | `drivers/virtio_mmio.rs` | virtio-blk на mmio-транспорте (modern, version 2), polled; окна — из DTB |
 | `drivers/virtio_net.rs` | virtio-net (modern, две очереди, polled): MAC, RX/TX-кольца, кадры |
-| `drivers/virtio_input.rs` | virtio-input (tablet/mouse): абсолютные оси из `CFG_ABS_INFO`, события → координаты указателя, polled |
+| `drivers/virtio_input.rs` | virtio-input: pointer (tablet/mouse) и keyboard (US-раскладка); polled из idle-цикла |
 | `drivers/selftest.rs` | проверки блочного слоя и указателя (RAM round-trip, read-only диск, input-device) |
 | `fs/mod.rs` | фасад ФС: ext2, политика формата, in-QEMU тесты |
 | `fs/ext2/` | ext2: суперблок/группы/inode/dirent/alloc/symlink, mount, read/write, rename, mkfs |
@@ -86,7 +86,7 @@
 | 11a | `timer::init`: первый дедлайн через SBI, затем `sie.STIE` | `main.rs`, `arch/riscv64/timer.rs` | `sie` = 0 до готового compare-регистра |
 | 11b | `plic::init` (DBT-база/source) → `uart::enable_rx_interrupt()` → `sie.SEIE` | `main.rs`, `arch/riscv64/plic.rs`, `drivers/uart.rs` | контроллер разводит линию раньше, чем UART её поднимает |
 | 12 | `virtio_mmio::init(&tree)`: перебор окон из DTB, регистрация диска (нет диска — строка в лог) | `main.rs`, `drivers/virtio_mmio.rs` | нужна карта (MMIO) и ловушки (сломанное окно) |
-| 12a | `virtio_input::init(&tree)`: указатель (tablet/mouse), очередь событий, включение курсора при живом экране | `main.rs`, `drivers/virtio_input.rs` | тот же список окон и карта; нет устройства — строка в лог |
+| 12a | `virtio_input::init(&tree)`: указатель (tablet/mouse) и клавиатура, очереди событий, включение курсора при живом экране | `main.rs`, `drivers/virtio_input.rs` | тот же список окон и карта; нет устройств — строка в лог |
 | 13 | `vfs::init()` + `init_fs()`: смонтировать `/mnt`, пустое устройство — отформатировать | `main.rs::init_fs` | куча уже есть (монтирование аллоцирует); без диска — строка и дальше |
 | 13a | `net::init(&tree)`: проба virtio-net + DHCP-клиент (нет NIC — строка в лог) | `main.rs`, `src/net/`, `drivers/virtio_net.rs` | нужны DTB (окна транспорта), таймер (дедлайны DHCP) и куча (кольца) |
 | 14 | `shell::run(tree)`: задача 0; команда `run` — вход в U-mode (M6b) | `main.rs`, `shell.rs` | планировщик, таймер и user-mode уже подняты; shell не возвращается |

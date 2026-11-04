@@ -182,8 +182,8 @@ SELFTEST SUMMARY: 7/7 passed
 | Ловушки | готово | `stvec` → `trap_entry` (обмен `sscratch` различает U/S), диспетчер: прерывания возвращаются, исключение из S-mode печатает и паркует hart, исключение из U-mode завершает только задачу | `src/arch/riscv64/traps.rs`, `src/user/mod.rs` |
 | Консоль | готово | NS16550 по `0x1000_0000`, 8N1; приём — по прерыванию PLIC в кольцевой буфер (polled-путь остаётся запасным), передача по-прежнему polled; один текстовый поток — два стока | `src/drivers/uart.rs`, `src/console.rs` |
 | Экран | готово | ramfb 1280×800, stride 5120, сетка 100×37, шрифт покрытия 8×18, статус-бар; кадр отдаётся на каждый `kprint!`; software-курсор — часть кадра (см. строку «Мышь») | `src/drivers/{fw_cfg,ramfb,framebuffer}.rs` |
-| Мышь и курсор (M8) | готово | virtio-input (tablet с абсолютными координатами предпочтителен, mouse с относительными тоже поддержан) на том же virtio-mmio; курсор 12×19 рисуется в теневом буфере как часть кадра: прячет/восстанавливает пиксели под собой, остаётся сверху и после печати, и под печатью. Опроса из idle-цикла шелла достаточно (100 Гц); своего прерывания у устройства нет | `src/drivers/virtio_input.rs`, `src/drivers/framebuffer.rs` |
-| Шелл | готово | редактор строки (строки длиннее 128 байт отклоняются целиком, а не обрезаются), idle-цикл на 100 Гц, в котором опрашиваются UART-кольцо, сеть и указатель; команды памяти/диска/ФС/сети, `run <path>`, `run demo` / `run fault` / `run spin`, `sleep`, `time`, `halt` (полный список — в таблице ниже) | `src/shell.rs`, `src/user/mod.rs`, `src/net/`, `src/drivers/virtio_input.rs` |
+| Мышь, клавиатура и курсор (M8) | готово | virtio-input на том же virtio-mmio: **tablet** (абсолютные оси, диапазон из `CFG_ABS_INFO`) или mouse как fallback, и **keyboard** (US-раскладка, shift/caps/backspace/enter/tab) — оба устройства QEMU `virt` выставляет отдельными virtio-mmio-узлами с одним device id, драйвер различает их по битовым картам возможностей. Курсор 12×19 — часть кадра; клавиатурные байты шелл читает из idle-цикла рядом с UART, поэтому окно QEMU становится полноценной консолью. Опроса из idle-цикла достаточно (100 Гц); своего прерывания у устройств нет | `src/drivers/virtio_input.rs`, `src/drivers/framebuffer.rs` |
+| Шелл | готово | редактор строки (строки длиннее 128 байт отклоняются целиком, а не обрезаются), idle-цикл на 100 Гц, в котором опрашиваются UART-кольцо, сеть, указатель и клавиатура; одна и та же консоль работает и через serial, и через окно QEMU; команды памяти/диска/ФС/сети, `run <path>`, `run demo` / `run fault` / `run spin`, `sleep`, `time`, `halt` (полный список — в таблице ниже) | `src/shell.rs`, `src/user/mod.rs`, `src/net/`, `src/drivers/virtio_input.rs` |
 | Физическая память (PMM) | готово | битовая карта 4 KiB-кадров окна 8 GiB (покрывает QEMU `virt` с RAM выше 4 GiB), `set = свободен`, выделение одиночное и непрерывным блоком | `src/memory/pmm.rs` |
 | Куча ядра, `alloc` | готово | `#[global_allocator]` поверх PMM-кадров: чанки по 64 KiB, free-list, целиком свободный чанк возвращается в PMM; `Vec` проверен `selftest` | `src/memory/{heap,selftest}.rs` |
 | Страницы (Sv39) | готово | identity-карта 4 KiB-страниц, `satp` включён: `[RAM base, __kernel_end)` RWX, выше — RW **без X**, страницы устройств RW без U; таблицы берутся из PMM, пустые возвращаются при `unmap`. User-страницы живут в этой же карте с `U=1`; отдельного `satp` на процесс нет | `src/memory/paging.rs`, `src/arch/riscv64/mmu.rs`, `src/user/elf.rs` |
@@ -196,8 +196,8 @@ SELFTEST SUMMARY: 7/7 passed
 | User mode, syscalls, ELF (M6b) | готово | `sret` в U-mode (`SPP=0`, `SPIE=1`, `SUM=0`, `sscratch`-контракт), `ecall`-диспетчер Linux/RISC-V (`write`/`exit`/`sched_yield`/`getpid`, `sepc+4`, проверка user-указателей, `SUM` вокруг копии), ELF64-загрузчик с откатом кадров и **потоковым чтением** `ImageSource` (заголовок, program headers, сегменты по 4 KiB; без буфера размером с файл), `run <path>` до 1 MiB и фикстуры `demo`/`fault`/`spin`, fault из U убивает только задачу; таймер вытесняет U-mode | `src/user/`, `userland/` |
 | Сеть (M7) | готово | virtio-net (modern, polled) + свой стек: Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP-клиент, DNS-резолвер, `net`/`dhcp`/`ping`/`dns`/`http`; без smoltcp и внешних крейтов | `src/net/`, `src/drivers/virtio_net.rs` |
 | Пакеты, apt | **нет** | нужен TLS-стек (vendored `embedded-tls` + OpenPGP-проверка), как на x86; следующий майлстоун после сети | — |
-| Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 4 блока/указателя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 8 user-mode (`user-run-large-file`: 8/8 с диском, 7/8 + SKIP без `/mnt`) + 11 сети (идемпотентность по ledger'у свободных кадров), QEMU-smoke в пяти режимах (serial, ramfb, диск-fresh, диск-existing, net) — во всех приложен virtio-tablet, и проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/net/selftest.rs`, `.github/smoke.py`, `tools/` |
-| CI | готово | `fmt`, debug/release build, QEMU-smoke в пяти режимах: serial, ramfb, диск-fresh (формат/монтирование/запись), диск-existing (повторная загрузка читает файл), net (DHCP + ping шлюза); каждый режим подключает virtio-tablet | `.github/workflows/ci.yml` |
+| Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 4 блока/указателя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 8 user-mode (`user-run-large-file`: 8/8 с диском, 7/8 + SKIP без `/mnt`) + 11 сети (идемпотентность по ledger'у свободных кадров), QEMU-smoke в шести режимах (serial, ramfb, диск-fresh, диск-existing, net, keyboard) — во всех приложен virtio-tablet, в keyboard ещё и virtio-keyboard, и проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/net/selftest.rs`, `.github/smoke.py`, `tools/` |
+| CI | готово | `fmt`, debug/release build, QEMU-smoke в шести режимах: serial, ramfb, диск-fresh (формат/монтирование/запись), диск-existing (повторная загрузка читает файл), net (DHCP + ping шлюза), keyboard (virtio-keyboard печатает `help`/`halt` через монитор QEMU); во всех приложен virtio-tablet, в keyboard — ещё и virtio-keyboard | `.github/workflows/ci.yml` |
 
 ---
 
@@ -221,8 +221,11 @@ qemu-system-riscv64 -machine virt -m 256M -device ramfb \
 `-device ramfb` — это и есть экран: у машины `virt` нет VGA, а ядро находит
 устройство через `fw_cfg`. По умолчанию поверхность рисуется **off-screen**
 (`-display none`), поэтому `screendump` и `tools/run.py` работают без графической
-сессии; `./run.sh --window` показывает то же самое окном QEMU. Если запустить QEMU
-без `-device ramfb`, ядро остаётся serial-консолью и честно печатает
+сессии; `./run.sh --window` показывает то же самое окном QEMU. `run.sh` подключает
+и клавиатуру (`-device virtio-keyboard-device`): у `virt` нет PS/2, поэтому ввод
+из окна идёт как virtio-input и попадает в тот же шелл, что и serial — можно
+пользоваться любым из двух. Если запустить QEMU без `-device ramfb`, ядро остаётся
+serial-консолью и честно печатает
 `framebuffer  ramfb: no such fw_cfg item — serial console only`.
 
 Сеть включена по умолчанию: `run.sh` добавляет `-netdev user -device

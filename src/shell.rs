@@ -85,7 +85,7 @@ pub fn run(tree: Fdt) -> ! {
             // device has no routed interrupt (the PLIC serves the UART), so the
             // shell's 100 Hz idle wake-up is what keeps the cursor moving.
             crate::drivers::virtio_input::poll();
-            let byte = match uart::try_get_byte() {
+            let byte = match uart::try_get_byte().or_else(crate::drivers::virtio_input::try_key) {
                 Some(byte) => byte,
                 None => {
                     timer::sleep_ticks(1);

@@ -565,15 +565,138 @@ struct Input {
     pending_y: Option<u32>,
 }
 
-/// The one pointer device the kernel knows about; `None` on a mouse-less boot.
+/// The one pointer device the kernel knows about; `None` on a pointer-less boot.
 static DEVICE: Spinlock<Option<Input>> = Spinlock::new(None);
+
+/// Linux input-event keycodes this driver translates. Only the keys a text
+/// console needs are named; everything else is ignored (a full keymap is a
+/// keyboard-layout project, not a console one).
+const KEY_BACKSPACE: u16 = 14;
+const KEY_TAB: u16 = 15;
+const KEY_ENTER: u16 = 28;
+const KEY_LEFTCTRL: u16 = 29;
+const KEY_LEFTSHIFT: u16 = 42;
+const KEY_RIGHTSHIFT: u16 = 54;
+const KEY_SPACE: u16 = 57;
+const KEY_CAPSLOCK: u16 = 58;
+const KEY_RIGHTCTRL: u16 = 97;
+
+/// How many translated bytes the keyboard ring holds. A human types far slower
+/// than the shell's 100 Hz idle poll, so this is a safety margin, not a buffer
+/// for burst traffic.
+const KEY_RING: usize = 128;
+
+/// The probed keyboard: its queue and the modifier state between events.
+struct Keyboard {
+    base: usize,
+    queue: Queue,
+    shift: bool,
+    caps: bool,
+    ctrl: bool,
+    keys: [u8; KEY_RING],
+    head: usize,
+    tail: usize,
+}
+
+/// The one keyboard the kernel knows about; `None` on a keyboard-less boot.
+static KEYBOARD: Spinlock<Option<Keyboard>> = Spinlock::new(None);
+
+/// What one transport window turned out to be.
+enum Probed {
+    Pointer(Input),
+    Keyboard(Keyboard),
+}
+
+impl Keyboard {
+    fn new(base: usize, queue: Queue) -> Self {
+        Keyboard {
+            base,
+            queue,
+            shift: false,
+            caps: false,
+            ctrl: false,
+            keys: [0; KEY_RING],
+            head: 0,
+            tail: 0,
+        }
+    }
+
+    /// Queue one translated byte; a full ring drops the byte (the alternative —
+    /// blocking the idle loop — would freeze the cursor and the network).
+    fn push(&mut self, byte: u8) {
+        let next = (self.head + 1) % KEY_RING;
+        if next != self.tail {
+            self.keys[self.head] = byte;
+            self.head = next;
+        }
+    }
+
+    fn pop(&mut self) -> Option<u8> {
+        if self.tail == self.head {
+            return None;
+        }
+        let byte = self.keys[self.tail];
+        self.tail = (self.tail + 1) % KEY_RING;
+        Some(byte)
+    }
+
+    /// Translate one input event. Modifier keys change state on press/release;
+    /// every other key produces a byte on press (and on autorepeat, so holding a
+    /// key repeats like a terminal).
+    fn handle(&mut self, event: &Event) {
+        if event.kind != EV_KEY {
+            return;
+        }
+        let pressed = event.value != 0;
+        let repeat = event.value == 2;
+        match event.code {
+            KEY_LEFTSHIFT | KEY_RIGHTSHIFT => {
+                self.shift = pressed;
+                return;
+            }
+            KEY_LEFTCTRL | KEY_RIGHTCTRL => {
+                self.ctrl = pressed;
+                return;
+            }
+            KEY_CAPSLOCK => {
+                if pressed && !repeat {
+                    self.caps = !self.caps;
+                }
+                return;
+            }
+            _ => {}
+        }
+        if !pressed && !repeat {
+            return;
+        }
+        match event.code {
+            KEY_ENTER => self.push(b'\r'),
+            KEY_BACKSPACE => self.push(0x7f),
+            KEY_TAB => self.push(b'\t'),
+            KEY_SPACE => self.push(b' '),
+            // Ctrl is tracked but only Ctrl+C has a consumer in the shell; keep
+            // it out of the byte stream (the shell ignores control bytes).
+            _ if self.ctrl => {}
+            code => {
+                if let Some(byte) = key_to_ascii(code, self.shift, self.caps) {
+                    self.push(byte);
+                }
+            }
+        }
+    }
+}
 
 /// Whether a pointer device was found (the cursor is enabled iff this is true).
 pub fn present() -> bool {
     DEVICE.lock().is_some()
 }
 
-/// The device kind's name, for the boot log and `selftest`.
+/// Whether a keyboard device was found.
+pub fn keyboard_present() -> bool {
+    KEYBOARD.lock().is_some()
+}
+
+/// The pointer device's name, for the boot log and `selftest`.
 pub fn kind_name() -> &'static str {
     match DEVICE.lock().as_ref().map(|input| input.kind) {
         Some(Kind::Tablet { .. }) => "tablet",
@@ -591,55 +714,71 @@ pub fn state() -> Option<MouseState> {
     })
 }
 
-/// Drain the device's queue and apply the events to the pointer state.
-///
-/// Called from the shell's idle loop (and by the selftest). Returns how many
-/// events were consumed; the cursor itself is moved only on `SYN_REPORT`, so a
-/// repaint costs one overlay move per pointer report, not one per event.
+/// The next byte typed on the keyboard, if any. The shell's idle loop consumes
+/// these exactly like UART bytes, which is what makes the QEMU window a usable
+/// console instead of a display for the serial terminal.
+pub fn try_key() -> Option<u8> {
+    KEYBOARD.lock().as_mut().and_then(|keyboard| keyboard.pop())
+}
+
+/// Drain both device queues: pointer events move the cursor, key events fill the
+/// keyboard ring. Called from the shell's idle loop.
 pub fn poll() -> usize {
     let mut events = [Event {
         kind: 0,
         code: 0,
         value: 0,
     }; 32];
+    let mut total = 0usize;
+
+    // Pointer first: its events are coalesced on SYN_REPORT into one move.
     let mut moved: Option<(usize, usize)> = None;
-    let count;
     {
         let mut guard = DEVICE.lock();
-        let Some(input) = guard.as_mut() else {
-            return 0;
-        };
-        count = input.queue.drain(input.base, &mut events);
-        for event in &events[..count] {
-            match (event.kind, event.code) {
-                (EV_ABS, ABS_X) => input.pending_x = Some(event.value),
-                (EV_ABS, ABS_Y) => input.pending_y = Some(event.value),
-                (EV_REL, REL_X) => input.x = input.x.saturating_add(event.value as i32),
-                (EV_REL, REL_Y) => input.y = input.y.saturating_sub(event.value as i32),
-                (EV_KEY, BTN_LEFT) => input.left = event.value != 0,
-                (EV_SYN, SYN_REPORT) => {
-                    if let (Some(raw_x), Some(raw_y)) = (input.pending_x, input.pending_y) {
-                        input.pending_x = None;
-                        input.pending_y = None;
-                        if let Kind::Tablet { x, y } = input.kind {
-                            let (w, h) = input.screen;
-                            input.x = scale_axis(raw_x, x, w);
-                            input.y = scale_axis(raw_y, y, h);
+        if let Some(input) = guard.as_mut() {
+            let count = input.queue.drain(input.base, &mut events);
+            total += count;
+            for event in &events[..count] {
+                match (event.kind, event.code) {
+                    (EV_ABS, ABS_X) => input.pending_x = Some(event.value),
+                    (EV_ABS, ABS_Y) => input.pending_y = Some(event.value),
+                    (EV_REL, REL_X) => input.x = input.x.saturating_add(event.value as i32),
+                    (EV_REL, REL_Y) => input.y = input.y.saturating_sub(event.value as i32),
+                    (EV_KEY, BTN_LEFT) => input.left = event.value != 0,
+                    (EV_SYN, SYN_REPORT) => {
+                        if let (Some(raw_x), Some(raw_y)) = (input.pending_x, input.pending_y) {
+                            input.pending_x = None;
+                            input.pending_y = None;
+                            if let Kind::Tablet { x, y } = input.kind {
+                                let (w, h) = input.screen;
+                                input.x = scale_axis(raw_x, x, w);
+                                input.y = scale_axis(raw_y, y, h);
+                            }
                         }
+                        let (w, h) = input.screen;
+                        input.x = input.x.clamp(0, w.saturating_sub(1) as i32);
+                        input.y = input.y.clamp(0, h.saturating_sub(1) as i32);
+                        moved = Some((input.x as usize, input.y as usize));
                     }
-                    let (w, h) = input.screen;
-                    input.x = input.x.clamp(0, w.saturating_sub(1) as i32);
-                    input.y = input.y.clamp(0, h.saturating_sub(1) as i32);
-                    moved = Some((input.x as usize, input.y as usize));
+                    _ => {}
                 }
-                _ => {}
             }
         }
     }
     if let Some((x, y)) = moved {
         framebuffer::cursor_move_to(x, y);
     }
-    count
+
+    // Then the keyboard: its events are translated in place and queued as bytes.
+    let mut guard = KEYBOARD.lock();
+    if let Some(keyboard) = guard.as_mut() {
+        let count = keyboard.queue.drain(keyboard.base, &mut events);
+        total += count;
+        for event in &events[..count] {
+            keyboard.handle(event);
+        }
+    }
+    total
 }
 
 /// Map an absolute device coordinate to a framebuffer pixel.
@@ -657,24 +796,104 @@ fn scale_axis(raw: u32, axis: Axis, pixels: usize) -> i32 {
     ((value * last + span / 2) / span) as i32
 }
 
-/// Probe every transport window the device tree reported and bring up the first
-/// pointer device found.
+/// US-layout keycode → ASCII, for the keys a console uses. Shift swaps the
+/// symbol row; Caps Lock affects letters only (as on every terminal).
 ///
-/// Returns whether a device is present. Absence is not an error (a headless CI
-/// boot has none): it logs one line and leaves the cursor off.
+/// This is deliberately a table, not a layout engine: one console layout is a
+/// documented limitation, and every array here is checked by the compiler.
+fn key_to_ascii(code: u16, shift: bool, caps: bool) -> Option<u8> {
+    // Unshifted - shifted pairs for the number/symbol rows.
+    const ROWS: [(u16, u8, u8); 13] = [
+        (2, b'1', b'!'),
+        (3, b'2', b'@'),
+        (4, b'3', b'#'),
+        (5, b'4', b'$'),
+        (6, b'5', b'%'),
+        (7, b'6', b'^'),
+        (8, b'7', b'&'),
+        (9, b'8', b'*'),
+        (10, b'9', b'('),
+        (11, b'0', b')'),
+        (12, b'-', b'_'),
+        (13, b'=', b'+'),
+        (41, b'`', b'~'),
+    ];
+    if let Some(&(_, plain, shifted)) = ROWS.iter().find(|(key, _, _)| *key == code) {
+        return Some(if shift { shifted } else { plain });
+    }
+    const PUNCT: [(u16, u8, u8); 9] = [
+        (26, b'[', b'{'),
+        (27, b']', b'}'),
+        (39, b';', b':'),
+        (40, b'\'', b'"'),
+        (43, b'\\', b'|'),
+        (51, b',', b'<'),
+        (52, b'.', b'>'),
+        (53, b'/', b'?'),
+        (86, b'\\', b'|'), // the extra key between Shift and Z on ISO boards
+    ];
+    if let Some(&(_, plain, shifted)) = PUNCT.iter().find(|(key, _, _)| *key == code) {
+        return Some(if shift { shifted } else { plain });
+    }
+    const LETTERS: [(u16, u8); 26] = [
+        (16, b'q'),
+        (17, b'w'),
+        (18, b'e'),
+        (19, b'r'),
+        (20, b't'),
+        (21, b'y'),
+        (22, b'u'),
+        (23, b'i'),
+        (24, b'o'),
+        (25, b'p'),
+        (30, b'a'),
+        (31, b's'),
+        (32, b'd'),
+        (33, b'f'),
+        (34, b'g'),
+        (35, b'h'),
+        (36, b'j'),
+        (37, b'k'),
+        (38, b'l'),
+        (44, b'z'),
+        (45, b'x'),
+        (46, b'c'),
+        (47, b'v'),
+        (48, b'b'),
+        (49, b'n'),
+        (50, b'm'),
+    ];
+    LETTERS
+        .iter()
+        .find(|(key, _)| *key == code)
+        .map(|&(_, letter)| {
+            if shift ^ caps {
+                letter.to_ascii_uppercase()
+            } else {
+                letter
+            }
+        })
+}
+
+/// Probe every transport window the device tree reported and bring up every
+/// input device found (one pointer and one keyboard; QEMU exposes them as two
+/// virtio-mmio devices with the same device id).
+///
+/// Returns whether at least one device is present. Absence is not an error (a
+/// headless CI boot has none): it logs one line and leaves the console on serial.
 pub fn init(tree: &Fdt) -> bool {
     let mut windows = [VirtioMmio::NONE; crate::fdt::MAX_VIRTIO_MMIO];
     let count = tree.virtio_mmio(&mut windows);
     let (width, height) = framebuffer::dimensions();
-    // The device is still probed on a machine without a screen (a serial-only
-    // boot): the log line and the state are useful, and the cursor is simply
-    // not enabled — `framebuffer::cursor_enable` is a no-op without a writer.
-    // The screen dimensions are only needed to scale absolute coordinates, so
-    // `(0, 0)` disables the cursor, not the driver.
+    // Devices are still probed on a machine without a screen (a serial-only
+    // boot): the log line and the state are useful, and the cursor is simply not
+    // enabled. The screen dimensions are only needed to scale absolute
+    // coordinates, so `(0, 0)` disables the cursor, not the driver.
 
+    let mut found = false;
     for window in &windows[..count] {
         match probe(window.base, (width, height)) {
-            Ok(input) => {
+            Ok(Probed::Pointer(input)) => {
                 match input.kind {
                     Kind::Tablet { x, y } => crate::kprintln!(
                         "virtio-input: tablet at {:#x}, abs X {}..{}, Y {}..{}",
@@ -696,7 +915,12 @@ pub fn init(tree: &Fdt) -> bool {
                 if width != 0 && height != 0 {
                     framebuffer::cursor_enable();
                 }
-                return true;
+                found = true;
+            }
+            Ok(Probed::Keyboard(keyboard)) => {
+                crate::kprintln!("virtio-input: keyboard at {:#x}", window.base);
+                *KEYBOARD.lock() = Some(keyboard);
+                found = true;
             }
             // An empty slot is the normal case on a machine with fewer devices
             // than transports; only a device that exists but cannot be used is
@@ -707,12 +931,28 @@ pub fn init(tree: &Fdt) -> bool {
             }
         }
     }
-    crate::kprintln!("virtio-input: no device");
-    false
+    if !found {
+        crate::kprintln!("virtio-input: no device");
+    }
+    found
 }
 
-/// Probe one transport window for an input device with usable pointer axes.
-fn probe(base: usize, screen: (usize, usize)) -> Result<Input, Error> {
+/// Subscribe to every code of `event_type` (the keyboard wants them all; the
+/// pointer subscribes only to the axes and the button it consumes).
+fn cfg_subscribe_all(base: usize, event_type: u16) -> Result<(), Error> {
+    cfg_select(base, CFG_EV_BITS, event_type as u8);
+    let size = cfg_size(base);
+    if size == 0 || size > CFG_BITMAP_MAX {
+        return Err(Error::NotPointer);
+    }
+    for i in 0..size {
+        write8(base, CONFIG + CFG_DATA + i, 0xff);
+    }
+    Ok(())
+}
+
+/// Probe one transport window for an input device we can use.
+fn probe(base: usize, screen: (usize, usize)) -> Result<Probed, Error> {
     if read32(base, MAGIC_VALUE) != MAGIC {
         return Err(Error::NotVirtioMmio);
     }
@@ -750,30 +990,27 @@ fn probe(base: usize, screen: (usize, usize)) -> Result<Input, Error> {
         return Err(Error::DeviceFailed(readback));
     }
 
-    // Which pointer does this device provide? A tablet (absolute axes) is
-    // preferred because its position needs no accumulation; a mouse (relative)
-    // is accepted as a fallback.
+    // Classify the device: absolute axes = tablet, relative axes = mouse,
+    // otherwise EV_KEY capability = keyboard. QEMU gives both input devices the
+    // same virtio id, so the capability bitmaps are the only discriminator.
     let abs_x = cfg_abs_info(base, ABS_X);
     let abs_y = cfg_abs_info(base, ABS_Y);
-    let kind = match (abs_x, abs_y) {
-        (Some(x), Some(y)) => Kind::Tablet { x, y },
-        _ => {
-            if !cfg_has_event_bits(base, EV_REL) {
-                return Err(Error::NotPointer);
-            }
-            Kind::Mouse
-        }
-    };
-    // Subscribe to the events this driver consumes; the device drops the rest.
-    match kind {
-        Kind::Tablet { .. } => {
-            cfg_subscribe(base, EV_ABS, &[ABS_X, ABS_Y])?;
-        }
-        Kind::Mouse => {
-            cfg_subscribe(base, EV_REL, &[REL_X, REL_Y])?;
-        }
+    let is_pointer = abs_x.is_some() && abs_y.is_some();
+    let is_mouse = !is_pointer && cfg_has_event_bits(base, EV_REL);
+    let is_keyboard = !is_pointer && !is_mouse && cfg_has_event_bits(base, EV_KEY);
+    if !is_pointer && !is_mouse && !is_keyboard {
+        return Err(Error::NotPointer);
     }
-    cfg_subscribe(base, EV_KEY, &[BTN_LEFT])?;
+
+    if is_pointer {
+        cfg_subscribe(base, EV_ABS, &[ABS_X, ABS_Y])?;
+        cfg_subscribe(base, EV_KEY, &[BTN_LEFT])?;
+    } else if is_mouse {
+        cfg_subscribe(base, EV_REL, &[REL_X, REL_Y])?;
+        cfg_subscribe(base, EV_KEY, &[BTN_LEFT])?;
+    } else {
+        cfg_subscribe_all(base, EV_KEY)?;
+    }
 
     write32(base, QUEUE_SEL, QUEUE_INDEX);
     let max = read32(base, QUEUE_NUM_MAX).min(u16::MAX as u32) as u16;
@@ -796,7 +1033,18 @@ fn probe(base: usize, screen: (usize, usize)) -> Result<Input, Error> {
         return Err(Error::DeviceFailed(read32(base, STATUS)));
     }
 
-    Ok(Input {
+    if is_keyboard {
+        return Ok(Probed::Keyboard(Keyboard::new(base, queue)));
+    }
+    let kind = if is_pointer {
+        Kind::Tablet {
+            x: abs_x.unwrap(),
+            y: abs_y.unwrap(),
+        }
+    } else {
+        Kind::Mouse
+    };
+    Ok(Probed::Pointer(Input {
         base,
         kind,
         queue,
@@ -806,7 +1054,7 @@ fn probe(base: usize, screen: (usize, usize)) -> Result<Input, Error> {
         left: false,
         pending_x: None,
         pending_y: None,
-    })
+    }))
 }
 
 /// The interrupt-layer selftest hook: is a pointer device present and sane?

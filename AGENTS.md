@@ -37,6 +37,7 @@ python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb   
 qemu-img create -f raw /tmp/ci.img 64M
 python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb --disk /tmp/ci.img --fresh
 python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb --disk /tmp/ci.img
+python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb --keyboard  # type help/halt
 ```
 
 `./run.sh` boots the kernel interactively (QEMU `virt` + OpenSBI, serial on stdio;
@@ -292,8 +293,8 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
 
 What exists: the in-QEMU suites (shell `selftest`: 7 memory + 4 block/pointer + 11 ext2/VFS
 + 4 interrupt/timer + 5 scheduler + 8 user-mode + 11 network checks, idempotent,
-each group prints a free-frame ledger), the headless QEMU smoke driver in five
-modes (serial, ramfb, disk-fresh, disk-existing, `--net`) — every mode attaches a
+each group prints a free-frame ledger), the headless QEMU smoke driver in six
+modes (serial, ramfb, disk-fresh, disk-existing, `--net`, `--keyboard`) — every mode attaches a
 virtio-tablet and the boot log must carry `virtio-input: tablet at 0x…` — including the M5
 format/mount/persist acceptance and the M7 DHCP/ping acceptance, and the pixel
 check that proves a screenshot is really the committed font. The network
@@ -372,7 +373,8 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
 | TCP is one active-open client (HTTP/1.0), not a general stack | no listening sockets, out-of-order reassembly, congestion control or multiple connections |
 | The NIC is polled and the stack is synchronous | network progress happens while a command or the shell's idle loop polls; an IRQ-driven NIC is a later milestone |
 | Interrupt handlers cannot allocate or print | put work in normal context; bump a counter and read it from `time`/`selftest` |
-| The pointer has **no IRQ**: it is polled from the shell's idle loop | a long-running command (or a blocking wait that does not poll) freezes the cursor; do not put cursor movement in a place that never returns to the idle loop |
+| The pointer/keyboard have **no IRQ**: both are polled from the shell's idle loop | a long-running command (or a blocking wait that does not poll) freezes the cursor and drops typed bytes; do not put input polling in a place that never returns to the idle loop |
+| The keyboard translates **US layout only** and ignores arrows/Home/End/dead keys | a program needing another layout or key semantics needs a keymap layer, not a driver tweak |
 | Clicks/selection are not consumed: `BTN_LEFT` is read and stored, nothing acts on it | mouse-driven editing/selection is a UI milestone, not a driver change |
 | One address space, one ASID: user pages carry `U=1` in the kernel's single Sv39 tree | two user programs are not isolated from each other; no per-process `satp`, no `brk`/`mmap`, no `fork`/`exec`/signals; `run <path>` streams from the VFS and accepts images up to 1 MiB (`MAX_IMAGE_BYTES`), one image at a time |
 | The filesystem has **no journal** (M5 deliberately skipped the x86 WAL) | a power cut between two writes can leave an operation half-applied; do not claim crash consistency |
@@ -389,9 +391,12 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
     (`flush_rect`). Drawing under the arrow outside that path leaves a stale
     arrow or a hole. Input moves the pointer only through
     `framebuffer::cursor_move_to`; the arrow never reaches the device on its own.
-29. **The pointer is polled, and its absence is normal.** `virtio_input::poll()` runs
+29. **The pointer and keyboard are polled, and their absence is normal.** `virtio_input::poll()` runs
     from the shell's idle loop next to `net::poll()` and the UART ring; there is no
     routed IRQ for it. A blocking wait that never returns to that loop freezes the
-    cursor (and the network). A boot without a pointer device is a valid
-    configuration (`NO_MOUSE=1`, serial-only CI): one log line, no cursor, nothing
-    else changes.
+    cursor and drops typed keys (and the network). Keyboard bytes are consumed
+    exactly like UART bytes (`virtio_input::try_key()` next to
+    `uart::try_get_byte()`); a full key ring drops a byte rather than blocking the
+    idle loop. A boot without a pointer or keyboard device is a valid configuration
+    (`NO_MOUSE=1`, serial-only CI): one log line `virtio-input: no device`, no
+    cursor or keys, nothing else changes.
