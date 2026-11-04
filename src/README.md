@@ -113,7 +113,7 @@
 | release | `cargo build --locked --release` | `target/riscv64gc-unknown-none-elf/release/pagh` |
 | smoke (serial) | `python3 .github/smoke.py <kernel>` | exit 0 + серийный лог |
 | smoke (+экран) | `python3 .github/smoke.py <kernel> --ramfb` | то же, с `-device ramfb` |
-| память в госте | команда `selftest` | `SELFTEST SUMMARY: 7/7`, `(block) 4/4` (или 3/4 + skip без диска, включая `input-device`), `ext2 summary: 11/11`, `(arch) 4/4`, `(task) 5/5`, `(user) 7/7`, `(net) 11/11` |
+| память в госте | команда `selftest` | `SELFTEST SUMMARY: 7/7`, `(block) 4/4` (или 3/4 + skip без диска, включая `input-device`), `ext2 summary: 11/11`, `(arch) 4/4`, `(task) 5/5`, `(user) 8/8` с `/mnt` (или 7/8 + skip `user-run-large-file`), `(net) 11/11` |
 | диск в госте | `qemu-img create` + `-device virtio-blk-device` + `-global virtio-mmio.force-legacy=false` | пустой образ форматируется, `/mnt` монтируется, файл переживает перезагрузку |
 
 Оба профиля: `panic = "abort"` (`Cargo.toml:10-14`), release дополнительно

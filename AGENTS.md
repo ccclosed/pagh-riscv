@@ -51,7 +51,7 @@ unknown argument is rejected, not ignored. Two in-guest checks that are not part
 
 ```sh
 # at the `pagh:rv64>` prompt
-selftest                                        # in-QEMU suites: 7 mem + 4 block/pointer + 11 fs + 4 arch/timer + 5 task + 7 user + 11 net + ledgers
+selftest                                        # in-QEMU suites: 7 mem + 4 block/pointer + 11 fs + 4 arch/timer + 5 task + 8 user (7/8 + skip without /mnt) + 11 net + ledgers
 # from the host
 python3 tools/run.py --keys "help\n" --shot /tmp/shot.png --check-font --scan-all
 python3 tools/run.py --disk /tmp/pagh.img --keys "ls /mnt\n" --shot /tmp/fs.png
@@ -254,8 +254,8 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
     print-and-park contract. A user program's bad pointer must be `-EFAULT` via
     PTE validation (`U=1` and `R=1` for every page, `SUM` only around the copy),
     not an exception.
-23. **`RUN` is not held across blocking work.** `run_image` claims the one user
-    program (`Busy` otherwise) and releases it after the pages are gone; the
+23. **`RUN` is not held across blocking work.** `run_image`/`run_file` claim the
+    one user program (`Busy` otherwise) and release it after the pages are gone; the
     wait loop (`yield_now`) and the trap paths only read/update short sections.
     One address space, one ASID, one program at a time: there is no per-process
     `satp` and no isolation between two user programs.
@@ -291,7 +291,7 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
 ## Testing philosophy
 
 What exists: the in-QEMU suites (shell `selftest`: 7 memory + 4 block/pointer + 11 ext2/VFS
-+ 4 interrupt/timer + 5 scheduler + 7 user-mode + 11 network checks, idempotent,
++ 4 interrupt/timer + 5 scheduler + 8 user-mode + 11 network checks, idempotent,
 each group prints a free-frame ledger), the headless QEMU smoke driver in five
 modes (serial, ramfb, disk-fresh, disk-existing, `--net`) — every mode attaches a
 virtio-tablet and the boot log must carry `virtio-input: tablet at 0x…` — including the M5
@@ -374,7 +374,7 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
 | Interrupt handlers cannot allocate or print | put work in normal context; bump a counter and read it from `time`/`selftest` |
 | The pointer has **no IRQ**: it is polled from the shell's idle loop | a long-running command (or a blocking wait that does not poll) freezes the cursor; do not put cursor movement in a place that never returns to the idle loop |
 | Clicks/selection are not consumed: `BTN_LEFT` is read and stored, nothing acts on it | mouse-driven editing/selection is a UI milestone, not a driver change |
-| One address space, one ASID: user pages carry `U=1` in the kernel's single Sv39 tree | two user programs are not isolated from each other; no per-process `satp`, no `brk`/`mmap`, no `fork`/`exec`/signals; `run <path>` reads one 64 KiB heap chunk at most |
+| One address space, one ASID: user pages carry `U=1` in the kernel's single Sv39 tree | two user programs are not isolated from each other; no per-process `satp`, no `brk`/`mmap`, no `fork`/`exec`/signals; `run <path>` streams from the VFS and accepts images up to 1 MiB (`MAX_IMAGE_BYTES`), one image at a time |
 | The filesystem has **no journal** (M5 deliberately skipped the x86 WAL) | a power cut between two writes can leave an operation half-applied; do not claim crash consistency |
 | One block device slot, no partitions/hot-plug | a second disk is a design change, not a registration |
 | Formatting is the only destructive operation and is gated by `format_policy` | never format "to recover": a failed mount is not permission to erase |

@@ -193,10 +193,10 @@ SELFTEST SUMMARY: 6/6 passed
 | Файловая система (ext2) | готово | чтение/запись файлов (direct + single/double indirect), truncate, каталоги, create/unlink/mkdir/rmdir/rename, симлинки; совместимо с образом хостового `mkfs.ext2 -t ext2`; форматируется только пустое устройство (MBR/GPT/чужие данные — отказ с причиной); журнала/WAL нет | `src/fs/ext2/`, `src/fs/format_policy.rs` |
 | VFS | готово | `VfsNode`, синтетический корень, монтирование в `/mnt`, два примитива разрешения путей (`lookup_path` без последней симлинки / `walk` с переходом и бюджетом) | `src/vfs/mod.rs` |
 | Планировщик, потоки ядра (M6a) | готово | контекстный switch (callee-saved ABI), до 8 потоков, round-robin, квант 8 тиков, стек 16 KiB + guard из PMM, вытеснение тиком таймера из trap-контекста (включая вытеснение U-mode), `tasks`/`spawn`/`yield`; exit возвращает кадры | `src/arch/riscv64/switch.rs`, `src/task/` |
-| User mode, syscalls, ELF (M6b) | готово | `sret` в U-mode (`SPP=0`, `SPIE=1`, `SUM=0`, `sscratch`-контракт), `ecall`-диспетчер Linux/RISC-V (`write`/`exit`/`sched_yield`/`getpid`, `sepc+4`, проверка user-указателей, `SUM` вокруг копии), ELF64-загрузчик с откатом кадров, `run <path>` и фикстуры `demo`/`fault`/`spin`, fault из U убивает только задачу; таймер вытесняет U-mode | `src/user/`, `userland/` |
+| User mode, syscalls, ELF (M6b) | готово | `sret` в U-mode (`SPP=0`, `SPIE=1`, `SUM=0`, `sscratch`-контракт), `ecall`-диспетчер Linux/RISC-V (`write`/`exit`/`sched_yield`/`getpid`, `sepc+4`, проверка user-указателей, `SUM` вокруг копии), ELF64-загрузчик с откатом кадров и **потоковым чтением** `ImageSource` (заголовок, program headers, сегменты по 4 KiB; без буфера размером с файл), `run <path>` до 1 MiB и фикстуры `demo`/`fault`/`spin`, fault из U убивает только задачу; таймер вытесняет U-mode | `src/user/`, `userland/` |
 | Сеть (M7) | готово | virtio-net (modern, polled) + свой стек: Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP-клиент, DNS-резолвер, `net`/`dhcp`/`ping`/`dns`/`http`; без smoltcp и внешних крейтов | `src/net/`, `src/drivers/virtio_net.rs` |
 | Пакеты, apt | **нет** | нужен TLS-стек (vendored `embedded-tls` + OpenPGP-проверка), как на x86; следующий майлстоун после сети | — |
-| Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 4 блока/указателя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 7 user-mode + 11 сети (идемпотентность по ledger'у свободных кадров), QEMU-smoke в пяти режимах (serial, ramfb, диск-fresh, диск-existing, net) — во всех приложен virtio-tablet, и проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/net/selftest.rs`, `.github/smoke.py`, `tools/` |
+| Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 4 блока/указателя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 8 user-mode (`user-run-large-file`: 8/8 с диском, 7/8 + SKIP без `/mnt`) + 11 сети (идемпотентность по ledger'у свободных кадров), QEMU-smoke в пяти режимах (serial, ramfb, диск-fresh, диск-existing, net) — во всех приложен virtio-tablet, и проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/net/selftest.rs`, `.github/smoke.py`, `tools/` |
 | CI | готово | `fmt`, debug/release build, QEMU-smoke в пяти режимах: serial, ramfb, диск-fresh (формат/монтирование/запись), диск-existing (повторная загрузка читает файл), net (DHCP + ping шлюза); каждый режим подключает virtio-tablet | `.github/workflows/ci.yml` |
 
 ---
@@ -261,7 +261,7 @@ M6b вживую (те же команды понимает шелл):
 run demo        # hello from user mode + run: demo exited with code 42
 run fault       # [user] fault killed: load page fault ... ; шелл жив
 run spin        # 0.2 s в U-mode (таймер вытесняет) -> exit 7
-selftest        # + SELFTEST user-*: 7/7
+selftest        # + SELFTEST user-*: 8/8 с /mnt (без диска 7/8 + SKIP)
 ```
 
 ### Как управлять шеллом
@@ -273,7 +273,7 @@ backspace работает, всё остальное — команды:
 |---|---|
 | `help` | список команд |
 | `mem` | память из device tree **и** статистика PMM и кучи (свободно/всего кадров, диапазон пула, байты кучи) |
-| `selftest` | in-QEMU self-tests: 7 памяти, 3 блочного слоя, 11 ext2/VFS, 4 таймера/PLIC, 5 планировщика, 7 user-mode; печатает ledger свободных кадров до и после каждого блока |
+| `selftest` | in-QEMU self-tests: 7 памяти, 3 блочного слоя, 11 ext2/VFS, 4 таймера/PLIC, 5 планировщика, 8 user-mode (`user-run-large-file` — SKIP без `/mnt`, итог 7/8); печатает ledger свободных кадров до и после каждого блока |
 | `disk` | блочное устройство: имя, ёмкость, живая проверка чтения сектора 0 |
 | `ls [path]` | листинг каталога (каталоги с `/`) |
 | `cat <path>` | содержимое файла |
@@ -285,7 +285,7 @@ backspace работает, всё остальное — команды:
 | `cp <src> <dst>` / `mv <src> <dst>` | копировать / переименовать |
 | `ln [-s] <target> <path>` | жёсткая или символическая ссылка |
 | `ramdisk [sectors]` | **только для тестов**: отформатировать RAM-диск и смонтировать его в `/mnt` |
-| `run <path>` | исполнить статический RV64 ELF из VFS в U-mode (файл грузится в heap-буфер, ≤ одного 64 KiB-чанка) |
+| `run <path>` | исполнить статический RV64 ELF из VFS в U-mode: файл читается **потоково** (ELF-заголовок, program headers и сегменты по 4 KiB), без буфера размером с файл; образ ≤ 1 MiB, один user-образ за раз |
 | `run demo` / `run fault` / `run spin` | встроенные фикстуры: hello (exit 42), падение по load page fault (задача убита, машина жива), 0.2 s спина в U-mode (exit 7) |
 | `net` | MAC, `ip/mask`, gateway, DNS и срок DHCP-lease |
 | `dhcp` | повторить DHCP-обмен (DISCOVER/OFFER/REQUEST/ACK) и напечатать новый lease |
@@ -392,8 +392,10 @@ IPv4, ICMP и UDP, а `dhcp`/`dns`/`tcp` — маленькие клиенты. 
   за раз».
 * **Нет `fork`/`exec`, сигналов и динамического ELF.** Загрузчик понимает только
   статические `ET_EXEC`/`ET_DYN` без интерпретатора; userland — голые `ecall`.
-  `run <path>` читает файл *ядром* и грузит его: отображения `/mnt` в адресное
-  пространство процесса как отдельной сущности нет.
+  `run <path>` читает файл *ядром* потоково, частями не больше 4 KiB, и грузит
+  его в user-окно; предел образа — 1 MiB (`MAX_IMAGE_BYTES`), одновременно
+  исполняется один user-образ, отдельного адресного пространства процесса и
+  отображения `/mnt` в него нет.
 * **Нет журнала/WAL в ext2.** Сбой между двумя записями может оставить операцию
   недоделанной; crash-consistency не заявляется.
 * **Один блочный слот, нет разделов/hot-plug.** Второй диск — изменение дизайна.

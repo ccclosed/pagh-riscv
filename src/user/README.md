@@ -10,10 +10,10 @@ M6b — первое место, где код исполняется с U-би�
 
 | Файл | Роль |
 |---|---|
-| `mod.rs` | `run_image(bytes, name)` — весь сценарий запуска: ELF → user-стек → `spawn` задачи → `enter_user` (`sret`) → ожидание `Exited` → `reap` → снятие маппингов; `Exit`/`UserError`, `on_fault`, `RUN` (одна программа за раз), встроенные фикстуры `HELLO_ELF`/`FAULT_ELF`/`SPIN_ELF` |
-| `elf.rs` | ELF64-загрузчик: валидация заголовка/program headers/сегментов **до** первого кадра, `PT_LOAD`-страницы `U=1` в общей карте, копирование, нулевой `.bss`-хвост, откат кадров при любой ошибке; `Loaded { entry, pages(), release() }`, типизированный `ElfError` |
+| `mod.rs` | `run_image(bytes, name)` для фикстур и `run_file(path)` для `run <path>` — весь сценарий запуска: ELF → user-стек → `spawn` задачи → `enter_user` (`sret`) → ожидание `Exited` → `reap` → снятие маппингов; `FileSource` поверх `VfsNode` (потоковое чтение), `Exit`/`UserError`, `on_fault`, `RUN` (одна программа за раз), встроенные фикстуры `HELLO_ELF`/`FAULT_ELF`/`SPIN_ELF` |
+| `elf.rs` | ELF64-загрузчик: `ImageSource` (`len` + `read_at`) и потоковое чтение — заголовок, таблица program headers (≤ 8) и сегменты по ≤ 4 KiB в уже замапленные страницы, **без буфера размером с образ**; валидация заголовка/сегментов до первого кадра, `PT_LOAD`-страницы `U=1` в общей карте, нулевой `.bss`-хвост, откат кадров при любой ошибке; `Loaded { entry, pages(), release() }`, типизированные `ElfError`/`SourceError` |
 | `syscall.rs` | `dispatch(frame)`: Linux/RISC-V номера `write(64)`, `exit(93)`, `sched_yield(124)`, `getpid(172)`; проверка user-указателей, `SUM` только вокруг копии, `ecall → sepc + 4`, счётчики для selftest |
-| `selftest.rs` | семь проверок для `selftest`: accept фикстуры, reject-матрица (14 мутаций заголовка/сегментов), отказ `run_image` на битом ELF, round-trip `hello`, fault-изоляция, запуск после fault, таймер-in-U |
+| `selftest.rs` | восемь проверок для `selftest`: accept фикстуры, reject-матрица (14 мутаций заголовка/сегментов), отказ `run_image` на битом ELF, round-trip `hello`, fault-изоляция, запуск после fault, таймер-in-U и `user-run-large-file` (100 KiB образ с нулевым хвостом через `run_file`, SKIP без `/mnt`) |
 
 ## Раскладка адресов
 
@@ -28,6 +28,19 @@ M6b — первое место, где код исполняется с U-би�
 Окно ниже RAM, но численно пересекается с PLIC (`0x0c00_0000`) и UART
 (`0x1000_0000`) в карте ядра: ELF, который просит эти адреса, получает
 `ElfError::AddressInUse` от page-table walk, а не «почти работает».
+
+## Загрузчик: потоковое чтение
+
+`elf::load` принимает `ImageSource` (`len` + `read_at`) и читает только то, что
+описывает ELF: 64-байтный заголовок, таблицу program headers (≤ 8) и каждый
+`PT_LOAD` кусками не больше 4 KiB прямо в уже замапленные user-страницы. Буфера
+размером с образ нет, поэтому `run <path>` принимает файлы до 1 MiB
+(`MAX_IMAGE_BYTES`) независимо от того, что куча выдаёт чанки по 64 KiB. Хвост
+файла после последнего `PT_LOAD` не читается и не валидируется — именно это
+проверяет `user-run-large-file` на 100 KiB. Короткий источник даёт
+`ElfError::Truncated`, отказ чтения — `ElfError::Source`/`UserError::Source`;
+все страницы, замапленные до ошибки, откатываются. Встроенные фикстуры идут
+через тот же загрузчик с `impl ImageSource for [u8]`.
 
 ## Контракты (инварианты M6b)
 
@@ -64,10 +77,11 @@ M6b — первое место, где код исполняется с U-би�
    короткие обновления и снятие; `wait_for_exit` крутит `yield_now` без него;
    teardown делает раннер (trap-пути только читают/пишут запись).
 
-## Жизненный цикл `run_image`
+## Жизненный цикл `run_image` / `run_file`
 
 1. захват `RUN` (`Busy`, если занято);
-2. `elf::load`: валидация → маппинг страниц (при ошибке — откат и `Err`);
+2. `elf::load` поверх `ImageSource`: потоковое чтение заголовка, program headers
+   и сегментов → валидация → маппинг страниц (при ошибке — откат и `Err`);
 3. 16 кадров contiguous под user-стек + маппинг `U|R|W`;
 4. `task::spawn(user_task)`; шелл ждёт `Exited` в цикле `yield_now`
    (таймер продолжает вытеснять, пока ждём);
@@ -76,10 +90,14 @@ M6b — первое место, где код исполняется с U-би�
 
 ## Пределы (честно)
 
-- образ ≤ 1 MiB / 256 страниц / 8 `PT_LOAD` / 8 program headers (`elf.rs`);
-- `run <path>` читает файл в **один** heap-буфер (`try_reserve`), т.е. не больше
-  одного 64 KiB-чанка; образ крупнее отвергается строкой, а не паникой
-  (встроенные фикстуры этим лимитом не ограничены — они в `.rodata` ядра);
+- образ ≤ 1 MiB (`MAX_IMAGE_BYTES`) / 256 страниц / 8 `PT_LOAD` / 8 program
+  headers (`elf.rs`); больше — `ElfError::ImageTooLarge`, отказ без маппинга;
+- `run <path>` читает файл **потоково** через `ImageSource`: ELF-заголовок,
+  таблица program headers и каждый сегмент копируются кусками не больше 4 KiB,
+  поэтому файл в 100 KiB и образ до 1 MiB грузятся без heap-буфера размером с
+  файл; нулевой хвост после последнего `PT_LOAD` игнорируется (это и проверяет
+  `user-run-large-file`). Один user-образ за раз (`RUN`), per-process address
+  space нет — user-страницы живут в общей Sv39-карте с `U=1`;
 - нет per-process page table/ASID (изоляция только «юзер vs ядро»), нет
   `brk`/`mmap`, динамического ELF, `fork`/`exec`, сигналов, нескольких процессов;
 - U-mode не имеет доступа к устройствам (их страницы без `U`) и не может
@@ -91,7 +109,7 @@ M6b — первое место, где код исполняется с U-би�
 run demo     # hello: write + sched_yield + exit 42
 run fault    # getpid, затем load с адреса 0 -> killed: load page fault; машина жива
 run spin     # 0.2 s в U-mode (~20 timer interrupts из U), getpid, exit 7
-selftest     # SELFTEST user-*: 7/7, PMM-ledger до/после одинаковый
+selftest     # SELFTEST user-*: 8/8 с /mnt (7/8 + SKIP без диска), PMM-ledger до/после одинаковый
 ```
 
 Два `selftest` подряд печатают одинаковые ledger'ы — это и есть доказательство,
