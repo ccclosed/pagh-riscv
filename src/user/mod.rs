@@ -557,7 +557,11 @@ fn run_source<S: ImageSource + ?Sized>(
         }
     }
 
+    // The descriptor table is per run: three console descriptors, no files.
+    // Reset after the frame is built and before the task can issue an `ecall`.
+    syscall::reset_fds();
     let Some(id) = task::spawn(user_task) else {
+        syscall::release_fds();
         release_stack(stack_base);
         loaded.release();
         *RUN.lock() = None;
