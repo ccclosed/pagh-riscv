@@ -3,10 +3,14 @@
 //!
 //! # The shape of a run
 //!
-//! [`run_image`] is the whole user-visible operation, called from the shell:
+//! [`run_image`] (embedded fixtures) and [`run_file`] (`run <path>`) are the
+//! whole user-visible operation, called from the shell:
 //!
 //! 1. [`elf::load`] validates the image and maps its `PT_LOAD` pages with `U=1`
-//!    in the kernel's one Sv39 tree (see that module for the layout).
+//!    in the kernel's one Sv39 tree (see that module for the layout). The image
+//!    is read through [`elf::ImageSource`], so a file is streamed: the loader
+//!    asks for the header, the program-header table and one page of each
+//!    segment at a time and never allocates a whole-image buffer.
 //! 2. The 64 KiB user stack (`USER_STACK_BASE..USER_TOP`) is mapped from a
 //!    contiguous PMM run.
 //! 3. A normal scheduler task is spawned; its kernel-thread body calls
@@ -51,6 +55,8 @@ pub mod syscall;
 
 use core::fmt;
 
+use alloc::sync::Arc;
+
 use crate::arch::riscv64::mmu::Flags;
 use crate::memory::paging;
 use crate::memory::pmm;
@@ -58,6 +64,7 @@ use crate::memory::FRAME_SIZE;
 use crate::sync::Spinlock;
 use crate::task::scheduler::{self, State};
 use crate::task::{self, TaskInfo, MAX_TASKS};
+use crate::vfs::{self, VfsError, VfsNode};
 
 /// Embedded hello fixture: `write(1, "hello from user mode\n")`, `sched_yield`,
 /// `exit(42)`. Built by `userland/build.sh` and committed, so a clean checkout
@@ -73,7 +80,7 @@ pub const FAULT_ELF: &[u8] = include_bytes!("../../userland/fault.elf");
 /// interrupt taken while the hart is in U-mode is handled and returned from.
 pub const SPIN_ELF: &[u8] = include_bytes!("../../userland/spin.elf");
 
-pub use elf::{ElfError, USER_STACK_BASE, USER_STACK_PAGES, USER_TOP};
+pub use elf::{ElfError, ImageSource, SourceError, USER_STACK_BASE, USER_STACK_PAGES, USER_TOP};
 
 /// Longest program name kept for the fault diagnostic; the shell's path may be
 /// longer and is truncated rather than allocated.
@@ -122,6 +129,14 @@ pub enum UserError {
     StackMap(paging::MapError),
     /// The scheduler had no task slot or no frames for the kernel stack.
     TaskSlot,
+    /// The path could not be resolved through the VFS.
+    Vfs(VfsError),
+    /// The path names a directory, not an image file.
+    IsADirectory,
+    /// The file is empty or larger than [`elf::MAX_IMAGE_BYTES`].
+    ImageSize(u64),
+    /// The backing source refused a read while the image was loading.
+    Source(SourceError),
 }
 
 impl fmt::Display for UserError {
@@ -134,6 +149,15 @@ impl fmt::Display for UserError {
             UserError::TaskSlot => {
                 f.write_str("the scheduler has no free slot or kernel stack for the task")
             }
+            UserError::Vfs(error) => f.write_str(error.as_str()),
+            UserError::IsADirectory => f.write_str("is a directory"),
+            UserError::ImageSize(size) => write!(
+                f,
+                "image size {} B is outside 1..={} B",
+                size,
+                elf::MAX_IMAGE_BYTES
+            ),
+            UserError::Source(error) => write!(f, "{error}"),
         }
     }
 }
@@ -183,6 +207,57 @@ struct RunState {
 
 static RUN: Spinlock<Option<RunState>> = Spinlock::new(None);
 
+/// A file in the VFS as an [`ImageSource`].
+///
+/// The loader asks only for the header, the program-header table and segment
+/// bytes, so those reads go straight to `VfsNode::read`; there is no cache and
+/// no whole-file copy. `size` is captured when the run starts and bounds every
+/// read, so a file that shrinks mid-load is refused as a short source instead
+/// of silently reading whatever now follows it.
+struct FileSource {
+    node: Arc<dyn VfsNode>,
+    size: u64,
+}
+
+impl ImageSource for FileSource {
+    fn len(&self) -> u64 {
+        self.size
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, SourceError> {
+        if buf.is_empty() || offset >= self.size {
+            return Ok(0);
+        }
+        let want = core::cmp::min(buf.len() as u64, self.size - offset) as usize;
+        match self.node.read(offset, &mut buf[..want]) {
+            // The VFS contract is "up to buf.len()"; clamping keeps a broken node
+            // from claiming bytes it never wrote.
+            Ok(read) => Ok(read.min(want)),
+            Err(error) => Err(SourceError::Io(error.as_str())),
+        }
+    }
+}
+
+/// Load `path` from the VFS and run it in U-mode until `exit` or a fault.
+///
+/// The path is resolved with [`vfs::walk`] (the final symlink is followed) and
+/// the file is streamed by [`elf::load`]: no whole-image buffer, so any image
+/// up to [`elf::MAX_IMAGE_BYTES`] (1 MiB) is accepted even though the kernel
+/// heap hands out 64 KiB chunks. `path` is absolute; the shell resolves its
+/// current directory before calling this.
+pub fn run_file(path: &str) -> Result<Exit, UserError> {
+    let node = vfs::walk(path, true).map_err(UserError::Vfs)?;
+    if node.is_directory() {
+        return Err(UserError::IsADirectory);
+    }
+    let size = node.size();
+    if size == 0 || size > elf::MAX_IMAGE_BYTES as u64 {
+        return Err(UserError::ImageSize(size));
+    }
+    let source = FileSource { node, size };
+    run_source(&source, path)
+}
+
 /// Load `bytes` and run it in U-mode until `exit` or a fault, then return how it
 /// ended. The image and stack mappings are gone before this returns.
 ///
@@ -190,6 +265,16 @@ static RUN: Spinlock<Option<RunState>> = Spinlock::new(None);
 /// copied into a fixed buffer because the trap handler needs it while the caller
 /// is suspended.
 pub fn run_image(bytes: &[u8], name: &str) -> Result<Exit, UserError> {
+    run_source(bytes, name)
+}
+
+/// The shared run path: claim `RUN`, load from `source`, map the stack, spawn,
+/// wait, and unwind every allocation on both success and failure.
+///
+/// `RUN` is claimed before the first mapping and released only after the image
+/// pages and the task are gone, which is what makes [`UserError::Busy`] a real
+/// one-run-at-a-time guarantee rather than advice.
+fn run_source<S: ImageSource + ?Sized>(source: &S, name: &str) -> Result<Exit, UserError> {
     {
         let mut slot = RUN.lock();
         if slot.is_some() {
@@ -203,8 +288,12 @@ pub fn run_image(bytes: &[u8], name: &str) -> Result<Exit, UserError> {
         });
     }
 
-    let mut loaded = match elf::load(bytes, 0) {
+    let mut loaded = match elf::load(source, 0) {
         Ok(loaded) => loaded,
+        Err(ElfError::Source(error)) => {
+            *RUN.lock() = None;
+            return Err(UserError::Source(error));
+        }
         Err(error) => {
             *RUN.lock() = None;
             return Err(UserError::Elf(error));
