@@ -3,11 +3,17 @@
 //! This is deliberately not a general TCP implementation. It has one socket, it
 //! only initiates connections, it assumes in-order delivery with no loss on the
 //! path (QEMU's `user` network is a local host stack; a real link would need
-//! retransmission timers and out-of-order reassembly), and it advertises a small
-//! fixed window. What it does implement correctly is the part an HTTP client
-//! needs: the three-way handshake, sequence/acknowledgement tracking, payload
-//! delivery to the caller, a clean FIN from the peer and a bounded wait for
-//! every step.
+//! retransmission timers and out-of-order reassembly), and its advertised
+//! window is exactly the free space in the 4 KiB receive buffer. What it does
+//! implement correctly is the part an HTTP client needs: the three-way
+//! handshake, sequence/acknowledgement tracking, payload delivery to the
+//! caller, a clean FIN from the peer and a bounded wait for every step.
+//!
+//! The window matters for a package download. A receiver that always advertises
+//! the full buffer lets the peer send bytes it cannot store; those bytes are
+//! dropped, the sender waits for a retransmission timer, and a 13 KiB download
+//! stalls after the first 4 KiB. Every ACK here carries the *actual* free
+//! space, and [`recv`] re-opens the window after the caller drains the buffer.
 //!
 //! The state lives in one static [`Socket`] guarded by a spinlock. [`on_segment`]
 //! is called from the poll loop (no lock held by the caller); it updates the
@@ -18,20 +24,43 @@ use super::wire::{self, Ipv4, TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN};
 use super::{config, poll};
 use crate::arch::riscv64::timer;
 use crate::sync::Spinlock;
+use core::sync::atomic::{AtomicU16, Ordering};
 
-/// Local port the single client socket uses.
-const LOCAL_PORT: u16 = 49152;
-/// Advertised receive window.
+/// First local port handed to a connection. A *fresh* port per connection (not
+/// one fixed port) is what keeps a second download after a close from landing on
+/// a 4-tuple the host stack still holds in TIME_WAIT: with the old fixed port,
+/// QEMU's user-network layer silently dropped the new SYN and the package
+/// install timed out before the server saw a request.
+const LOCAL_PORT_FIRST: u16 = 49152;
+static NEXT_LOCAL_PORT: AtomicU16 = AtomicU16::new(LOCAL_PORT_FIRST);
+
+/// Allocate the next local port; wraps back to 49152 past 65535.
+fn allocate_local_port() -> u16 {
+    loop {
+        let port = NEXT_LOCAL_PORT.fetch_add(1, Ordering::Relaxed);
+        if port >= LOCAL_PORT_FIRST {
+            return port;
+        }
+        NEXT_LOCAL_PORT.store(LOCAL_PORT_FIRST, Ordering::Relaxed);
+    }
+}
+/// Receive window when the buffer is empty (also the SYN window).
 const WINDOW: u16 = 4096;
 /// Receive buffer for one connection.
 const RX_CAPACITY: usize = 4096;
 /// Payload bytes per segment we send; small enough for one Ethernet frame.
 const MSS: usize = 1000;
-/// Ticks one step may take (3 s).
-const STEP_TICKS: u64 = 300;
+/// Ticks the handshake may take per SYN attempt (3 s).
+const CONNECT_TICKS: u64 = 300;
+/// Ticks a data step may take (10 s). A debug kernel writes the received bytes
+/// to ext2 between polls, so the NIC's small RX ring can drop frames; the
+/// sender then recovers on its retransmission timers, and the first few of
+/// those (200 ms, 400 ms, …) must fit inside one bounded step. Three seconds
+/// was enough for a single segment exchange and not for a 13 KiB package.
+const DATA_TICKS: u64 = 1000;
 /// Poll iterations before a step is declared stuck (bounds a machine whose clock
 /// does not advance).
-const STEP_ITERATIONS: u64 = 2_000_000;
+const STEP_ITERATIONS: u64 = 8_000_000;
 
 /// Connection state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +81,7 @@ enum State {
 #[derive(Clone, Copy)]
 struct Socket {
     state: State,
+    local_port: u16,
     remote: Ipv4,
     remote_port: u16,
     /// Next sequence number we will send.
@@ -69,6 +99,7 @@ struct Socket {
 impl Socket {
     const EMPTY: Self = Socket {
         state: State::Closed,
+        local_port: 0,
         remote: [0; 4],
         remote_port: 0,
         sequence: 0,
@@ -112,17 +143,33 @@ impl core::fmt::Display for Error {
     }
 }
 
+/// The window to advertise for a buffer holding `used` bytes.
+///
+/// Advertising capacity the buffer does not have is what turns this client's
+/// 4 KiB receive buffer into silent packet loss on anything larger: the peer
+/// fills the window, the excess cannot be stored, and recovery waits on the
+/// sender's retransmission timer instead of on an ACK.
+fn window_for(used: usize) -> u16 {
+    RX_CAPACITY.saturating_sub(used).min(u16::MAX as usize) as u16
+}
+
 /// A monotonically changing initial sequence number.
 fn initial_sequence() -> u32 {
     (timer::ticks() as u32).wrapping_mul(2654435761) ^ 0x5041_4748
 }
 
 /// Send one segment on the socket's 4-tuple; returns whether the frame left.
-fn send_segment(sequence: u32, acknowledgement: u32, flags: u16, payload: &[u8]) -> bool {
+fn send_segment(
+    sequence: u32,
+    acknowledgement: u32,
+    flags: u16,
+    payload: &[u8],
+    window: u16,
+) -> bool {
     let Some(config) = config() else {
         return false;
     };
-    let Some((remote, remote_port)) = socket_endpoints() else {
+    let Some((local_port, remote, remote_port)) = socket_endpoints() else {
         return false;
     };
     super::send_ipv4_raw(
@@ -141,25 +188,32 @@ fn send_segment(sequence: u32, acknowledgement: u32, flags: u16, payload: &[u8])
                 0,
                 config.ip,
                 remote,
-                LOCAL_PORT,
+                local_port,
                 remote_port,
                 sequence,
                 acknowledgement,
                 flags,
-                WINDOW,
+                window,
                 payload,
             )
         },
     )
 }
 
-/// Copy the remote endpoint out of the socket (short lock, no nesting).
-fn socket_endpoints() -> Option<(Ipv4, u16)> {
+/// Copy the connection's endpoints out of the socket (short lock, no nesting).
+fn socket_endpoints() -> Option<(u16, Ipv4, u16)> {
     let socket = SOCKET.lock();
     if socket.state == State::Closed {
         return None;
     }
-    Some((socket.remote, socket.remote_port))
+    Some((socket.local_port, socket.remote, socket.remote_port))
+}
+
+/// The local port of the current connection, read under its own short lock.
+/// `on_segment` runs before the state lock below; the port can only change in
+/// `connect`, which is serialised with this check by the shell's request loop.
+fn socket_local_port() -> u16 {
+    SOCKET.lock().local_port
 }
 
 /// Handle an incoming TCP segment. Called from the poll loop with no lock held.
@@ -170,13 +224,13 @@ pub fn on_segment(src: Ipv4, dst: Ipv4, segment: &[u8]) {
     let Some(tcp) = wire::parse_tcp(segment) else {
         return;
     };
-    if tcp.dst_port != LOCAL_PORT {
+    if tcp.dst_port != socket_local_port() {
         return;
     }
     let payload = segment
         .get(tcp.payload_offset..tcp.payload_offset + tcp.payload_len)
         .unwrap_or(&[]);
-    let mut ack = None;
+    let mut ack: Option<(u32, u32, u16)> = None;
     {
         let mut socket = SOCKET.lock();
         if socket.state == State::Closed
@@ -203,7 +257,11 @@ pub fn on_segment(src: Ipv4, dst: Ipv4, segment: &[u8]) {
                     socket.sequence = socket.sequence.wrapping_add(1);
                     socket.acked = socket.sequence;
                     socket.state = State::Established;
-                    ack = Some((socket.sequence, socket.acknowledgement));
+                    ack = Some((
+                        socket.sequence,
+                        socket.acknowledgement,
+                        window_for(socket.rx_len),
+                    ));
                 }
             }
             State::Established | State::Closing => {
@@ -212,14 +270,30 @@ pub fn on_segment(src: Ipv4, dst: Ipv4, segment: &[u8]) {
                         socket.acked = tcp.acknowledgement;
                     }
                 }
-                if !payload.is_empty() && tcp.sequence == socket.acknowledgement {
-                    let start = socket.rx_len;
-                    let take = payload.len().min(RX_CAPACITY - start);
-                    if take > 0 {
-                        socket.rx[start..start + take].copy_from_slice(&payload[..take]);
-                        socket.rx_len = start + take;
-                        socket.acknowledgement = socket.acknowledgement.wrapping_add(take as u32);
-                        ack = Some((socket.sequence, socket.acknowledgement));
+                if !payload.is_empty() {
+                    if tcp.sequence == socket.acknowledgement {
+                        let start = socket.rx_len;
+                        let take = payload.len().min(RX_CAPACITY - start);
+                        if take > 0 {
+                            socket.rx[start..start + take].copy_from_slice(&payload[..take]);
+                            socket.rx_len = start + take;
+                            socket.acknowledgement =
+                                socket.acknowledgement.wrapping_add(take as u32);
+                            ack = Some((
+                                socket.sequence,
+                                socket.acknowledgement,
+                                window_for(socket.rx_len),
+                            ));
+                        }
+                    } else {
+                        // A gap (or a duplicate): repeat the ACK. Three of these
+                        // are the sender's fast-retransmit trigger; staying
+                        // silent makes every lost segment cost a full RTO.
+                        ack = Some((
+                            socket.sequence,
+                            socket.acknowledgement,
+                            window_for(socket.rx_len),
+                        ));
                     }
                 }
                 if tcp.flags & TCP_FIN != 0
@@ -231,20 +305,25 @@ pub fn on_segment(src: Ipv4, dst: Ipv4, segment: &[u8]) {
                     } else {
                         socket.state = State::Closed;
                     }
-                    ack = Some((socket.sequence, socket.acknowledgement));
+                    ack = Some((
+                        socket.sequence,
+                        socket.acknowledgement,
+                        window_for(socket.rx_len),
+                    ));
                 }
             }
             _ => {}
         }
     }
-    if let Some((sequence, acknowledgement)) = ack {
-        let _ = send_segment(sequence, acknowledgement, TCP_ACK, &[]);
+    if let Some((sequence, acknowledgement, window)) = ack {
+        let _ = send_segment(sequence, acknowledgement, TCP_ACK, &[], window);
     }
 }
 
 /// Wait for the socket to reach a state satisfying `done`, polling the NIC.
-fn wait_for(done: impl Fn(&Socket) -> bool) -> bool {
-    let deadline = timer::ticks().saturating_add(STEP_TICKS);
+/// `ticks` is the bound in 10 ms timer ticks; there is no blocking sleep.
+fn wait_for(done: impl Fn(&Socket) -> bool, ticks: u64) -> bool {
+    let deadline = timer::ticks().saturating_add(ticks);
     let mut iterations = 0u64;
     loop {
         poll();
@@ -276,6 +355,7 @@ pub fn connect(remote: Ipv4, port: u16) -> Result<(), Error> {
             return Err(Error::Busy);
         }
         socket.state = State::SynSent;
+        socket.local_port = allocate_local_port();
         socket.remote = remote;
         socket.remote_port = port;
         socket.sequence = initial_sequence();
@@ -291,11 +371,11 @@ pub fn connect(remote: Ipv4, port: u16) -> Result<(), Error> {
         // `send_segment` may poll the NIC, and the poll path re-enters this
         // module, so the lock must be free by then.
         let sequence = SOCKET.lock().sequence;
-        if !send_segment(sequence, 0, TCP_SYN, &[]) {
+        if !send_segment(sequence, 0, TCP_SYN, &[], WINDOW) {
             reset();
             return Err(Error::Send);
         }
-        if wait_for(|socket| socket.state == State::Established) {
+        if wait_for(|socket| socket.state == State::Established, CONNECT_TICKS) {
             return Ok(());
         }
         let state = SOCKET.lock().state;
@@ -317,7 +397,7 @@ pub fn send(data: &[u8]) -> Result<usize, Error> {
     let mut sent = 0usize;
     while sent < data.len() {
         let chunk_len = (data.len() - sent).min(MSS);
-        let (sequence, acknowledgement) = {
+        let (sequence, acknowledgement, window) = {
             let socket = SOCKET.lock();
             if socket.state != State::Established {
                 return Err(if socket.state == State::Reset {
@@ -326,10 +406,14 @@ pub fn send(data: &[u8]) -> Result<usize, Error> {
                     Error::Closed
                 });
             }
-            (socket.sequence, socket.acknowledgement)
+            (
+                socket.sequence,
+                socket.acknowledgement,
+                window_for(socket.rx_len),
+            )
         };
         let chunk = &data[sent..sent + chunk_len];
-        if !send_segment(sequence, acknowledgement, TCP_PSH | TCP_ACK, chunk) {
+        if !send_segment(sequence, acknowledgement, TCP_PSH | TCP_ACK, chunk, window) {
             return Err(Error::Send);
         }
         {
@@ -337,7 +421,10 @@ pub fn send(data: &[u8]) -> Result<usize, Error> {
             socket.sequence = socket.sequence.wrapping_add(chunk_len as u32);
         }
         let target = sequence.wrapping_add(chunk_len as u32);
-        if !wait_for(|socket| (socket.acked.wrapping_sub(target) as i32) >= 0) {
+        if !wait_for(
+            |socket| (socket.acked.wrapping_sub(target) as i32) >= 0,
+            DATA_TICKS,
+        ) {
             // The peer never acknowledged; report what left and drop the
             // connection rather than pretend the bytes were delivered.
             reset();
@@ -354,8 +441,13 @@ pub fn recv(out: &mut [u8]) -> Result<usize, Error> {
     if out.is_empty() {
         return Ok(0);
     }
-    let has_data = |socket: &Socket| socket.rx_len > 0;
-    wait_for(has_data);
+    // A FIN is data delivery for this wait: without it the call sleeps out the
+    // whole 10 s data deadline after the last byte and delays `close` by the
+    // same amount (visible in a pcap as a very late client FIN).
+    let readable = |socket: &Socket| {
+        socket.rx_len > 0 || matches!(socket.state, State::Closing | State::Closed)
+    };
+    wait_for(readable, DATA_TICKS);
     let mut socket = SOCKET.lock();
     if socket.rx_len == 0 {
         return match socket.state {
@@ -371,17 +463,39 @@ pub fn recv(out: &mut [u8]) -> Result<usize, Error> {
     // cheaper than a ring-buffer's bookkeeping.
     socket.rx.copy_within(take..buffered, 0);
     socket.rx_len = buffered - take;
+    // The bytes just handed to the caller must be reflected in the advertised
+    // window, or a sender that filled the old window has no way to learn that
+    // space opened up (it would wait for a retransmission timer). Send the
+    // window update *after* releasing the lock: `send_segment` can poll the NIC
+    // and re-enter `on_segment`, which takes this lock.
+    let update = match socket.state {
+        State::Established | State::Closing => Some((
+            socket.sequence,
+            socket.acknowledgement,
+            window_for(socket.rx_len),
+        )),
+        _ => None,
+    };
+    drop(socket);
+    if let Some((sequence, acknowledgement, window)) = update {
+        let _ = send_segment(sequence, acknowledgement, TCP_ACK, &[], window);
+    }
     Ok(take)
 }
 
 /// Close the connection (FIN|ACK) and forget the socket.
 pub fn close() {
-    let (sequence, acknowledgement, state) = {
+    let (sequence, acknowledgement, state, window) = {
         let socket = SOCKET.lock();
-        (socket.sequence, socket.acknowledgement, socket.state)
+        (
+            socket.sequence,
+            socket.acknowledgement,
+            socket.state,
+            window_for(socket.rx_len),
+        )
     };
     if state == State::Established || state == State::Closing {
-        let _ = send_segment(sequence, acknowledgement, TCP_FIN | TCP_ACK, &[]);
+        let _ = send_segment(sequence, acknowledgement, TCP_FIN | TCP_ACK, &[], window);
     }
     reset();
 }

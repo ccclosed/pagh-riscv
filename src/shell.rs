@@ -257,6 +257,9 @@ fn execute(line: &str, tree: &Fdt, state: &mut State) {
             crate::kprintln!("  ping <ip> [n] send up to four ICMP echo requests (default 4)");
             crate::kprintln!("  dns <name>    resolve a host name through the DHCP DNS server");
             crate::kprintln!("  http <ip> <port> <path>  GET over TCP and print the response");
+            crate::kprintln!(
+                "  pkg <cmd>     native packages: repo/index/list/install/remove/installed"
+            );
             crate::kprintln!("  fs            filesystem status: device, mount point, free space");
             crate::kprintln!("  clear         clear the screen (ANSI)");
             crate::kprintln!("  halt          power the machine off (SBI SRST)");
@@ -500,6 +503,7 @@ fn execute(line: &str, tree: &Fdt, state: &mut State) {
         "ping" => cmd_ping(args),
         "dns" => cmd_dns(args),
         "http" => cmd_http(args),
+        "pkg" => crate::pkg::command(args),
         "clear" => crate::kprint!("\x1b[2J\x1b[H"),
         "halt" => {
             // Ask firmware to power the machine off (SBI SRST). Parking the hart

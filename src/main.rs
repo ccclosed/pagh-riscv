@@ -22,6 +22,7 @@ mod fdt;
 mod fs;
 mod memory;
 mod net;
+mod pkg;
 mod shell;
 mod sync;
 mod task;
