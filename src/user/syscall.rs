@@ -54,6 +54,11 @@ const SYS_CLOSE: usize = 57;
 const SYS_GETDENTS64: usize = 61;
 const SYS_LSEEK: usize = 62;
 const SYS_FSTAT: usize = 80;
+const SYS_NANOSLEEP: usize = 101;
+const SYS_CLOCK_GETTIME: usize = 113;
+const SYS_READLINKAT: usize = 78;
+const SYS_UNAME: usize = 160;
+const SYS_BRK: usize = 214;
 const SYS_EXIT: usize = 93;
 const SYS_SCHED_YIELD: usize = 124;
 const SYS_GETPID: usize = 172;
@@ -63,6 +68,7 @@ const ENOENT: isize = -2;
 const EIO: isize = -5;
 const EBADF: isize = -9;
 const EAGAIN: isize = -11;
+const ENOMEM: isize = -12;
 const EFAULT: isize = -14;
 const EEXIST: isize = -17;
 const ENOTDIR: isize = -20;
@@ -120,6 +126,16 @@ pub struct Stats {
     pub fstats: u64,
     /// Directory records delivered by `getdents64`.
     pub dirents: u64,
+    /// `brk` calls that returned a break (including the query).
+    pub brks: u64,
+    /// `clock_gettime` calls that filled a `Timespec`.
+    pub clocks: u64,
+    /// `nanosleep` calls that returned.
+    pub sleeps: u64,
+    /// `uname` calls that filled the `Uname`.
+    pub unames: u64,
+    /// `readlinkat` calls that returned a target.
+    pub readlinks: u64,
     /// Unknown syscall numbers answered with `-ENOSYS`.
     pub unknown: u64,
     /// Bad user buffers answered with `-EFAULT`.
@@ -137,6 +153,11 @@ static CLOSES: AtomicU64 = AtomicU64::new(0);
 static SEEKS: AtomicU64 = AtomicU64::new(0);
 static FSTATS: AtomicU64 = AtomicU64::new(0);
 static DIRENTS: AtomicU64 = AtomicU64::new(0);
+static BRKS: AtomicU64 = AtomicU64::new(0);
+static CLOCKS: AtomicU64 = AtomicU64::new(0);
+static SLEEPS: AtomicU64 = AtomicU64::new(0);
+static UNAMES: AtomicU64 = AtomicU64::new(0);
+static READLINKS: AtomicU64 = AtomicU64::new(0);
 static UNKNOWN: AtomicU64 = AtomicU64::new(0);
 static FAULTS: AtomicU64 = AtomicU64::new(0);
 
@@ -155,6 +176,11 @@ pub fn stats() -> Stats {
         seeks: SEEKS.load(Ordering::Relaxed),
         fstats: FSTATS.load(Ordering::Relaxed),
         dirents: DIRENTS.load(Ordering::Relaxed),
+        brks: BRKS.load(Ordering::Relaxed),
+        clocks: CLOCKS.load(Ordering::Relaxed),
+        sleeps: SLEEPS.load(Ordering::Relaxed),
+        unames: UNAMES.load(Ordering::Relaxed),
+        readlinks: READLINKS.load(Ordering::Relaxed),
         unknown: UNKNOWN.load(Ordering::Relaxed),
         faults: FAULTS.load(Ordering::Relaxed),
     }
@@ -302,6 +328,17 @@ pub fn dispatch(frame: &mut TrapFrame) {
         SYS_LSEEK => lseek(frame.a0, frame.a1, frame.a2),
         SYS_FSTAT => fstat(frame.a0, frame.a1),
         SYS_GETDENTS64 => getdents64(frame.a0, frame.a1, frame.a2),
+        SYS_READLINKAT => readlinkat(frame.a0, frame.a1, frame.a2, frame.a3),
+        SYS_CLOCK_GETTIME => clock_gettime(frame.a0, frame.a1),
+        SYS_NANOSLEEP => nanosleep(frame.a0, frame.a1),
+        SYS_UNAME => uname(frame.a0),
+        SYS_BRK => match crate::user::brk(frame.a0) {
+            Ok(current) => {
+                BRKS.fetch_add(1, Ordering::Relaxed);
+                current as isize
+            }
+            Err(()) => ENOMEM,
+        },
         SYS_EXIT => crate::user::exit_current(frame.a0 as u32),
         SYS_SCHED_YIELD => {
             crate::task::scheduler::yield_now();
@@ -717,15 +754,18 @@ fn fstat(fd: usize, pointer: usize) -> isize {
     0
 }
 
-/// Longest `Dirent` this layer can encode: 8-byte header + 255-byte name padded
-/// to 8. ext2's own name limit is the same 255 bytes.
-const DIRENT_MAX: usize = 8 + 256;
+/// Longest `Dirent` this layer can encode: a 12-byte header (ino, kind,
+/// name_len, reserved) plus a 255-byte name, padded so the next record starts on
+/// an 8-byte boundary. ext2's own name limit is the same 255 bytes.
+const DIRENT_MAX: usize = (12 + 255 + 7) & !7;
 
 /// `getdents64(fd, buf, len)`: encode the directory snapshot as the ABI's
 /// `Dirent` records, 8-byte aligned.
 ///
 /// One record is `u64 ino`, `u8 kind`, `u8 name_len`, `u16 reserved`,
-/// `name[name_len]`, then zero padding to an 8-byte boundary. Records are
+/// `name[name_len]`, then zero padding to an 8-byte boundary. The header is 12
+/// bytes, so a 16-byte name occupies 28 bytes padded to 32 — the old
+/// `8 + align(name)` shape truncated every name longer than 12 bytes. Records are
 /// produced until the next whole record does not fit in the caller's remaining
 /// buffer; no record is ever split. The cursor advances only for records that
 /// were copied, so a short buffer does not lose an entry.
@@ -761,7 +801,7 @@ fn getdents64(fd: usize, buf: usize, len: usize) -> isize {
                 ENAMETOOLONG
             };
         }
-        let record_len = 8 + ((name.len() + 7) & !7);
+        let record_len = (12 + name.len() + 7) & !7;
         if record_len > len - total {
             break;
         }
@@ -786,6 +826,155 @@ fn getdents64(fd: usize, buf: usize, len: usize) -> isize {
         DIRENTS.fetch_add(1, Ordering::Relaxed);
     }
     total as isize
+}
+
+// ─── readlinkat / time / uname / brk ──────────────────────────────────────
+
+/// `readlinkat(dirfd, path, buf, len)`: the target of a symbolic link, without a
+/// terminating NUL, truncated to `len`.
+///
+/// `dirfd` is ignored (absolute paths only). The lookup is `vfs::lookup_path`,
+/// which does *not* follow a final link — the whole point of the call — while
+/// intermediate links are still resolved. A path that is not a link is
+/// `-EINVAL`; a link whose target cannot be read is `-EIO`.
+fn readlinkat(dirfd: usize, path_ptr: usize, buf: usize, len: usize) -> isize {
+    let _ = dirfd;
+    let mut path_buf = [0u8; PATH_CAPACITY];
+    let length = match read_user_path(path_ptr, &mut path_buf) {
+        Ok(length) => length,
+        Err(error) => return error,
+    };
+    let Ok(path) = core::str::from_utf8(&path_buf[..length]) else {
+        return EINVAL;
+    };
+    if !path.starts_with('/') {
+        return EINVAL;
+    }
+    let node = match vfs::lookup_path(path) {
+        Ok(node) => node,
+        Err(error) => return errno(error),
+    };
+    if !node.is_symlink() {
+        return EINVAL;
+    }
+    let Some(target) = node.read_link() else {
+        return EIO;
+    };
+    let bytes = target.as_bytes();
+    let take = bytes.len().min(len);
+    if take > 0 {
+        if let Err(error) = copy_to_user(buf, &bytes[..take]) {
+            return error;
+        }
+    }
+    READLINKS.fetch_add(1, Ordering::Relaxed);
+    take as isize
+}
+
+/// `struct Timespec` from the ABI: `i64 seconds`, `i64 nanos`.
+const TIMESPEC_SIZE: usize = 16;
+
+/// Nanoseconds in one second, and nanoseconds per kernel tick's worth of
+/// conversion. Kept as integers: the ABI's `Timespec` is exact, the kernel clock
+/// is 100 Hz, and the rounding rule is documented on [`nanosleep`].
+const NANOS_PER_SEC: u128 = 1_000_000_000;
+
+/// `clock_gettime(clk, *Timespec)`.
+///
+/// Clock ids 0 (realtime/uptime) and 1 (monotonic) are both the kernel's tick
+/// clock: this machine has no wall-clock source, and the ABI documents the two
+/// as "monotonic wall-ish". The resolution is [`crate::arch::riscv64::timer::TICK_MS`],
+/// so `nsec` is always a multiple of one millisecond. Any other id is `-EINVAL`.
+fn clock_gettime(clock: usize, pointer: usize) -> isize {
+    if clock > 1 {
+        return EINVAL;
+    }
+    let milliseconds = crate::arch::riscv64::timer::uptime_ms();
+    let seconds = (milliseconds / 1000) as i64;
+    let nanos = ((milliseconds % 1000) * 1_000_000) as i64;
+    let mut timespec = [0u8; TIMESPEC_SIZE];
+    timespec[0..8].copy_from_slice(&seconds.to_le_bytes());
+    timespec[8..16].copy_from_slice(&nanos.to_le_bytes());
+    if let Err(error) = copy_to_user(pointer, &timespec) {
+        return error;
+    }
+    CLOCKS.fetch_add(1, Ordering::Relaxed);
+    0
+}
+
+/// `nanosleep(*Timespec, rem)`: wait for the requested duration, rounded *up*
+/// to the next 10 ms tick; `rem` is accepted and ignored (the ABI says so, and
+/// the wait never returns early).
+///
+/// The trap handler runs with `sstatus.SIE = 0`, so `timer::sleep_ticks` — which
+/// waits for the tick counter to move and parks in `wfi` — would wait forever
+/// without enabling interrupts around the wait. This function is the one
+/// syscall that does that, deliberately and with no lock held: a timer
+/// interrupt inside the wait is handled and may even switch this task out, and
+/// the nested trap frame lives on this task's own kernel stack (the scheduler's
+/// documented contract). `sstatus` is restored from the entry value afterwards,
+/// so the `sret` still resumes U-mode with interrupts on.
+fn nanosleep(pointer: usize, remaining: usize) -> isize {
+    let _ = remaining;
+    let mut timespec = [0u8; TIMESPEC_SIZE];
+    if let Err(error) = copy_from_user(&mut timespec, pointer) {
+        return error;
+    }
+    let seconds = i64::from_le_bytes(timespec[0..8].try_into().unwrap_or([0; 8]));
+    let nanos = i64::from_le_bytes(timespec[8..16].try_into().unwrap_or([0; 8]));
+    if seconds < 0 || nanos < 0 || nanos >= NANOS_PER_SEC as i64 {
+        return EINVAL;
+    }
+    let total = (seconds as u128)
+        .saturating_mul(NANOS_PER_SEC)
+        .saturating_add(nanos as u128);
+    let ticks = total
+        .saturating_mul(crate::arch::riscv64::timer::TICK_HZ as u128)
+        .div_ceil(NANOS_PER_SEC)
+        .min(u64::MAX as u128) as u64;
+    if ticks == 0 {
+        return 0;
+    }
+    let was = csr::read_sstatus();
+    csr::write_sstatus(was | csr::SSTATUS_SIE);
+    crate::arch::riscv64::timer::sleep_ticks(ticks);
+    csr::write_sstatus(was);
+    SLEEPS.fetch_add(1, Ordering::Relaxed);
+    0
+}
+
+/// `struct Uname` from the ABI: five 16-byte fields.
+const UNAME_SIZE: usize = 80;
+const UNAME_FIELD: usize = 16;
+
+/// Copy `text` into field `index` of an 80-byte `Uname`, truncated to 16 bytes
+/// and never writing past the struct. `text` must be ASCII (the ABI's fields
+/// are).
+fn put_uname_field(buf: &mut [u8; UNAME_SIZE], index: usize, text: &[u8]) {
+    let start = index * UNAME_FIELD;
+    let take = text.len().min(UNAME_FIELD);
+    buf[start..start + take].copy_from_slice(&text[..take]);
+}
+
+/// `uname(*Uname)`: system identity for libpagh.
+///
+/// The release string is the ABI baseline's `0.10.0-dev` even though
+/// `Cargo.toml` is still `0.9.1` on this branch: the version bump is the release
+/// commit's job, and the userland side matches the ABI document, not a build
+/// number. `version` reports the actual package version so the two are not
+/// silently conflated.
+fn uname(pointer: usize) -> isize {
+    let mut buffer = [0u8; UNAME_SIZE];
+    put_uname_field(&mut buffer, 0, b"pagh");
+    put_uname_field(&mut buffer, 1, b"pagh-riscv");
+    put_uname_field(&mut buffer, 2, b"0.10.0-dev");
+    put_uname_field(&mut buffer, 3, env!("CARGO_PKG_VERSION").as_bytes());
+    put_uname_field(&mut buffer, 4, b"riscv64");
+    if let Err(error) = copy_to_user(pointer, &buffer) {
+        return error;
+    }
+    UNAMES.fetch_add(1, Ordering::Relaxed);
+    0
 }
 
 // ─── path helper ───────────────────────────────────────────────────────────

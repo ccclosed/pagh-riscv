@@ -10,7 +10,7 @@ cd "$(dirname "$0")"
 TOOLCHAIN="${TOOLCHAIN:-nightly-2026-07-12}"
 TARGET=riscv64gc-unknown-none-elf
 RUSTC="rustup run $TOOLCHAIN rustc --target $TARGET"
-FLAGS="-C panic=abort -C opt-level=2 -C debuginfo=0 -C relocation-model=static -C force-frame-pointers=no"
+FLAGS="-C panic=abort -C opt-level=2 -C debuginfo=0 -C strip=debuginfo -C relocation-model=static -C force-frame-pointers=no"
 
 build() {
     src=$1
@@ -27,3 +27,4 @@ build hello.rs hello.elf
 build fault.rs fault.elf
 build spin.rs spin.elf
 build argv.rs argv.elf
+build abi.rs abi.elf

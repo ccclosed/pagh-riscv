@@ -85,6 +85,12 @@ pub const SPIN_ELF: &[u8] = include_bytes!("../../userland/spin.elf");
 /// layout against the ABI, prints one line and exits 0. See `userland/argv.rs`.
 pub const ARGV_ELF: &[u8] = include_bytes!("../../userland/argv.elf");
 
+/// Embedded native-ABI fixture: exercises `read`/`write`/`openat`/`close`/
+/// `lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/
+/// `readlinkat`. It exits 0 when everything passed, 77 when only the filesystem
+/// half was skipped (no `/mnt`), and a distinct non-zero code otherwise.
+pub const ABI_ELF: &[u8] = include_bytes!("../../userland/abi.elf");
+
 pub use elf::{ElfError, ImageSource, SourceError, USER_STACK_BASE, USER_STACK_PAGES, USER_TOP};
 
 /// Longest program name kept for the fault diagnostic; the shell's path may be
@@ -388,9 +394,9 @@ pub fn run_file(path: &str) -> Result<Exit, UserError> {
     run_file_with_argv0(path, path, &[], &[])
 }
 
-/// [`run_file`] with arguments and an environment: `argv` is `argv[1..]` and
+/// [`run_file`] with arguments and an environment: `args` is `argv[1..]` and
 /// `argv[0]` is `path` itself.
-#[allow(dead_code)] // the ABI selftest uses the path+args form
+#[allow(dead_code)] // the path+args form is part of the kernel ABI, used by tests
 pub fn run_file_with_args(path: &str, args: &[&str], env: &[&str]) -> Result<Exit, UserError> {
     run_file_with_argv0(path, path, args, env)
 }
@@ -408,14 +414,9 @@ pub fn run_file_with_argv0(
     args: &[&str],
     env: &[&str],
 ) -> Result<Exit, UserError> {
-    let mut argv = [""; MAX_ENTRY_STRINGS];
-    let count = 1 + args.len();
-    if count > MAX_ENTRY_STRINGS {
+    if 1 + args.len() + env.len() > MAX_ENTRY_STRINGS {
         return Err(UserError::ArgumentsTooLong);
     }
-    argv[0] = argv0;
-    argv[1..count].copy_from_slice(args);
-
     let node = vfs::walk(open_path, true).map_err(UserError::Vfs)?;
     if node.is_directory() {
         return Err(UserError::IsADirectory);
@@ -425,7 +426,7 @@ pub fn run_file_with_argv0(
         return Err(UserError::ImageSize(size));
     }
     let source = FileSource { node, size };
-    run_source(&source, &argv[..count], env)
+    run_source(&source, argv0, args, env)
 }
 
 /// Load `bytes` and run it in U-mode until `exit` or a fault, then return how it
@@ -436,15 +437,18 @@ pub fn run_file_with_argv0(
 /// is suspended. The fixture gets `argc = 1`, `argv = [name]` and the minimal
 /// environment `PWD=/` (fixtures have no cwd of their own).
 pub fn run_image(bytes: &[u8], name: &str) -> Result<Exit, UserError> {
-    run_source(bytes, &[name], &["PWD=/"])
+    run_source(bytes, name, &[], &["PWD=/"])
 }
 
 /// [`run_image`] with explicit arguments (used by the ABI selftest to prove the
-/// multi-argument stack without a filesystem). `argv[0]` is `args[0]`; the
+/// multi-argument stack without a filesystem). `args[0]` is `argv[0]`; the
 /// environment is the caller's, because a fixture that checks `envp` needs to
 /// know what to expect.
 pub fn run_image_with_args(bytes: &[u8], args: &[&str], env: &[&str]) -> Result<Exit, UserError> {
-    run_source(bytes, args, env)
+    let Some((argv0, rest)) = args.split_first() else {
+        return Err(UserError::ArgumentsTooLong);
+    };
+    run_source(bytes, argv0, rest, env)
 }
 
 /// The shared run path: claim `RUN`, load from `source`, map the stack, build
@@ -457,14 +461,19 @@ pub fn run_image_with_args(bytes: &[u8], args: &[&str], env: &[&str]) -> Result<
 /// guarantee rather than advice.
 fn run_source<S: ImageSource + ?Sized>(
     source: &S,
-    argv: &[&str],
+    argv0: &str,
+    args: &[&str],
     env: &[&str],
 ) -> Result<Exit, UserError> {
-    if argv.is_empty() || argv.len() + env.len() > MAX_ENTRY_STRINGS {
+    let argc = 1 + args.len();
+    if argc + env.len() > MAX_ENTRY_STRINGS {
         return Err(UserError::ArgumentsTooLong);
     }
     let mut string_bytes = 0usize;
-    for text in argv.iter().chain(env.iter()) {
+    for text in core::iter::once(argv0)
+        .chain(args.iter().copied())
+        .chain(env.iter().copied())
+    {
         // An embedded NUL would make the in-memory vector of strings disagree
         // with the pointer table; refuse instead of silently truncating.
         if text.as_bytes().contains(&0) {
@@ -484,10 +493,10 @@ fn run_source<S: ImageSource + ?Sized>(
             return Err(UserError::Busy);
         }
         *slot = Some(RunState {
-            name: RunName::new(argv[0]),
+            name: RunName::new(argv0),
             entry: 0,
             sp: USER_TOP,
-            argc: argv.len(),
+            argc,
             argv: USER_TOP,
             exit: None,
             heap_end: USER_HEAP_BASE,
@@ -537,7 +546,7 @@ fn run_source<S: ImageSource + ?Sized>(
         unsafe { core::ptr::write_bytes(pa as *mut u8, 0, FRAME_SIZE) };
     }
 
-    let frame = match build_entry_stack(argv, env) {
+    let frame = match build_entry_stack(argv0, args, env) {
         Ok(frame) => frame,
         Err(error) => {
             release_stack(stack_base);
@@ -606,35 +615,38 @@ struct EntryStack {
 /// sp -> [argc][argv0..argvN-1][NULL][env0..envK-1][NULL][argv strings][env strings]
 /// ```
 ///
-/// The strings are placed first, growing down from [`USER_TOP`], so their
-/// addresses are known before the pointer table is written. The table start is
-/// then aligned down to 16 bytes, which is the entry `sp` alignment RISC-V
-/// requires. Every write goes through `paging::translate` to the physical frame
-/// (the loader's pattern): `SUM` stays clear, because this is S-mode writing
-/// through the identity map, not the kernel borrowing a user pointer.
-fn build_entry_stack(argv: &[&str], env: &[&str]) -> Result<EntryStack, UserError> {
-    let argc = argv.len();
+/// The strings grow down from [`USER_TOP`]; the frame size is known from the
+/// string lengths, so `sp` is computed up front and each string's pointer is
+/// written into the table as the string itself is copied. That is deliberate:
+/// an intermediate `[usize; N]` of addresses cost 512 bytes of the shell's
+/// 64 KiB boot stack, and the stack is already the deepest part of a
+/// file-backed `run` (the loader's page buffer lives there too). The table start
+/// is aligned down to 16 bytes, which is the entry `sp` alignment RISC-V
+/// requires.
+///
+/// Every write goes through `paging::translate` to the physical frame (the
+/// loader's pattern): `SUM` stays clear, because this is S-mode writing through
+/// the identity map, not the kernel borrowing a user pointer.
+fn build_entry_stack(argv0: &str, args: &[&str], env: &[&str]) -> Result<EntryStack, UserError> {
+    let argc = 1 + args.len();
     let envc = env.len();
-    let mut addresses = [0usize; MAX_ENTRY_STRINGS];
-    let mut cursor = USER_TOP;
-    let mut index = 0usize;
-    for text in argv.iter().chain(env.iter()) {
-        cursor = cursor
-            .checked_sub(text.len() + 1)
-            .filter(|start| *start >= USER_STACK_BASE)
+    let mut string_bytes = 0usize;
+    for text in core::iter::once(argv0)
+        .chain(args.iter().copied())
+        .chain(env.iter().copied())
+    {
+        string_bytes = string_bytes
+            .checked_add(text.len() + 1)
             .ok_or(UserError::ArgumentsTooLong)?;
-        addresses[index] = cursor;
-        write_user_bytes(cursor, text.as_bytes())?;
-        write_user_bytes(cursor + text.len(), &[0])?;
-        index += 1;
     }
     // `[argc]` + `argv` + `NULL` + `envp` + `NULL`.
     let words = 1 + argc + 1 + envc + 1;
     let frame_bytes = words
         .checked_mul(core::mem::size_of::<u64>())
         .ok_or(UserError::ArgumentsTooLong)?;
-    let sp = cursor
-        .checked_sub(frame_bytes)
+    let sp = USER_TOP
+        .checked_sub(string_bytes)
+        .and_then(|strings_start| strings_start.checked_sub(frame_bytes))
         .ok_or(UserError::ArgumentsTooLong)?
         & !0xf;
     if sp < USER_STACK_BASE {
@@ -642,18 +654,33 @@ fn build_entry_stack(argv: &[&str], env: &[&str]) -> Result<EntryStack, UserErro
     }
 
     write_user_u64(sp, argc as u64)?;
-    let mut slot = sp + 8;
-    for address in &addresses[..argc] {
-        write_user_u64(slot, *address as u64)?;
-        slot += 8;
+    let mut cursor = USER_TOP;
+    let mut argv_slot = sp + 8;
+    let env_base = sp + 8 + (argc + 1) * 8;
+    let mut env_slot = env_base;
+    let mut index = 0usize;
+    for text in core::iter::once(argv0)
+        .chain(args.iter().copied())
+        .chain(env.iter().copied())
+    {
+        let start = cursor
+            .checked_sub(text.len() + 1)
+            .filter(|start| *start >= USER_STACK_BASE)
+            .ok_or(UserError::ArgumentsTooLong)?;
+        cursor = start;
+        write_user_bytes(cursor, text.as_bytes())?;
+        write_user_bytes(cursor + text.len(), &[0])?;
+        if index < argc {
+            write_user_u64(argv_slot, cursor as u64)?;
+            argv_slot += 8;
+        } else {
+            write_user_u64(env_slot, cursor as u64)?;
+            env_slot += 8;
+        }
+        index += 1;
     }
-    write_user_u64(slot, 0)?;
-    slot += 8;
-    for address in &addresses[argc..argc + envc] {
-        write_user_u64(slot, *address as u64)?;
-        slot += 8;
-    }
-    write_user_u64(slot, 0)?;
+    write_user_u64(sp + 8 + argc * 8, 0)?;
+    write_user_u64(env_slot, 0)?;
     Ok(EntryStack {
         sp,
         argc,
@@ -700,21 +727,87 @@ fn write_user_u64(va: usize, value: u64) -> Result<(), UserError> {
     write_user_bytes(va, &value.to_le_bytes())
 }
 
+/// `brk(addr)` for the running program.
+///
+/// `addr == 0` queries the current (page-aligned) break. Growing maps zeroed
+/// PMM frames at [`USER_HEAP_BASE`] on demand; shrinking unmaps them and returns
+/// the frames immediately. `addr` below the window is clamped to the base (the
+/// program cannot shrink the heap past the start), `addr` past
+/// [`USER_HEAP_TOP`] is `Err(())` → `-ENOMEM`, and a partial growth is rolled
+/// back so a failed call changes neither the mapping nor the ledger.
+///
+/// The return value is the new break, rounded up to a page. `libpagh`'s bump
+/// allocator uses the returned value as its new limit, so the extra space
+/// between the requested and rounded break is normal and usable.
+///
+/// Frames are recorded in [`RunState::heap_frames`] here; the runner's
+/// [`release_heap`] is what unmaps/frees anything still mapped when the task
+/// ends, including after a fault.
+pub(crate) fn brk(address: usize) -> Result<usize, ()> {
+    let mut slot = RUN.lock();
+    let Some(run) = slot.as_mut() else {
+        // No run means no address space to grow: a stale `ecall` from a task
+        // that is already being torn down. Refuse rather than touch `RUN`.
+        return Err(());
+    };
+    if address == 0 {
+        return Ok(run.heap_end);
+    }
+    let target = address
+        .checked_add(FRAME_SIZE - 1)
+        .map(|value| value & !(FRAME_SIZE - 1))
+        .ok_or(())?
+        .max(USER_HEAP_BASE);
+    if target > USER_HEAP_TOP {
+        return Err(());
+    }
+
+    if target > run.heap_end {
+        let start = run.heap_end;
+        while run.heap_end < target {
+            let Some(frame) = pmm::alloc_frame() else {
+                release_heap_to(run, start);
+                return Err(());
+            };
+            if paging::map(run.heap_end, frame, Flags::user_rw()).is_err() {
+                pmm::free_frame(frame);
+                release_heap_to(run, start);
+                return Err(());
+            }
+            // SAFETY: `frame` is a fresh PMM frame (RAM, identity-mapped
+            // supervisor RW) that was just mapped into the user heap; writing
+            // through the physical address cannot fault and keeps `SUM` off.
+            // Zeroing stops a U-mode program from reading whatever used the
+            // frame before it, the same rule the initial stack follows.
+            unsafe { core::ptr::write_bytes(frame as *mut u8, 0, FRAME_SIZE) };
+            run.heap_frames[run.heap_count] = frame;
+            run.heap_count += 1;
+            run.heap_end += FRAME_SIZE;
+        }
+    } else if target < run.heap_end {
+        release_heap_to(run, target);
+    }
+    Ok(run.heap_end)
+}
+
+/// Unmap and free heap pages above `target`, updating the recorded break.
+fn release_heap_to(run: &mut RunState, target: usize) {
+    while run.heap_end > target {
+        run.heap_end -= FRAME_SIZE;
+        run.heap_count -= 1;
+        let frame = run.heap_frames[run.heap_count];
+        run.heap_frames[run.heap_count] = 0;
+        let _ = paging::unmap(run.heap_end);
+        pmm::free_frame(frame);
+    }
+}
+
 /// Unmap and free every page the program mapped with `brk`.
 ///
 /// Called by the runner after the task is gone and before `RunState` is dropped;
 /// a second call (heap already shrunk to the base) has nothing to do.
 fn release_heap(run: &mut RunState) {
-    for index in 0..run.heap_count {
-        let va = USER_HEAP_BASE + index * FRAME_SIZE;
-        let _ = paging::unmap(va);
-        if run.heap_frames[index] != 0 {
-            pmm::free_frame(run.heap_frames[index]);
-            run.heap_frames[index] = 0;
-        }
-    }
-    run.heap_count = 0;
-    run.heap_end = USER_HEAP_BASE;
+    release_heap_to(run, USER_HEAP_BASE);
 }
 
 /// Unmap the user stack pages and return the contiguous run to the PMM.

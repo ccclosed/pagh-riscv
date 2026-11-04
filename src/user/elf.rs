@@ -577,10 +577,14 @@ pub fn load<S: ImageSource + ?Sized>(source: &S, bias: usize) -> Result<Loaded, 
 
     // ── stream the file bytes; the rest of every page is already zero ─────
     //
-    // One 4 KiB stack buffer serves every segment: each read is bounded by the
-    // page it lands in, so the loader's own footprint does not grow with the
-    // image (a 1 MiB image is 256 chunks of at most 4 KiB, not one 1 MiB Vec).
-    let mut page_buf = [0u8; FRAME_SIZE];
+    // One small stack buffer serves every segment: each read is bounded by the
+    // page it lands in and by `SEGMENT_CHUNK`, so the loader's own footprint does
+    // not grow with the image. 512 bytes (not a whole page) is deliberate: the
+    // shell runs on the 64 KiB boot stack, `run_file` is its deepest call chain,
+    // and a 4 KiB buffer here left barely any headroom below the stack on a
+    // file-backed image. The cost is a handful of extra VFS reads.
+    const SEGMENT_CHUNK: usize = 512;
+    let mut page_buf = [0u8; SEGMENT_CHUNK];
     for segment in &segments[..segment_count] {
         let mut copied = 0usize;
         while copied < segment.filesz {
@@ -589,7 +593,7 @@ pub fn load<S: ImageSource + ?Sized>(source: &S, bias: usize) -> Result<Loaded, 
             let offset_in_page = va - page;
             let available = FRAME_SIZE - offset_in_page;
             let bytes_left = segment.filesz - copied;
-            let take = available.min(bytes_left).min(FRAME_SIZE);
+            let take = available.min(bytes_left).min(SEGMENT_CHUNK);
             let source_start = segment.file_offset + copied;
             if let Err(error) = read_exact(source, source_start as u64, &mut page_buf[..take]) {
                 loaded.release();

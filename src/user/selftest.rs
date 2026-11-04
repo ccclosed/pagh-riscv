@@ -31,7 +31,7 @@ use crate::arch::riscv64::traps::CAUSE_LOAD_PAGE_FAULT;
 use crate::memory::pmm;
 use crate::user::elf::{self, ElfError, MAX_IMAGE_BYTES};
 use crate::user::syscall;
-use crate::user::{self, Exit, UserError, ARGV_ELF, FAULT_ELF, HELLO_ELF, SPIN_ELF};
+use crate::user::{self, Exit, UserError, ABI_ELF, ARGV_ELF, FAULT_ELF, HELLO_ELF, SPIN_ELF};
 use crate::vfs::{self, VfsError, VfsNode};
 
 /// The fixture's `e_entry`: `user.ld` places `_start` at the bottom of the first
@@ -327,6 +327,174 @@ fn user_abi_argv(_buf: &mut Vec<u8>) -> Outcome {
         ok = false;
     }
     verdict(ok)
+}
+
+/// The filesystem fixture's inputs: the read-only file the ABI fixture opens,
+/// the file it creates/writes/appends, and the relative symlink it resolves.
+const ABI_FILE: &str = "abi-syscalls.txt";
+const ABI_CREATED: &str = "abi-created.txt";
+const ABI_LINK: &str = "abi-link";
+const ABI_FILE_BYTES: &[u8] = b"pagh-abi\n";
+
+/// Remove every fixture input; missing entries are fine (idempotency).
+fn cleanup_abi_files(dir: &Arc<dyn VfsNode>) {
+    for name in [ABI_FILE, ABI_CREATED, ABI_LINK] {
+        match dir.remove(name) {
+            Ok(()) | Err(VfsError::NotFound) => {}
+            Err(error) => crate::kprintln!(
+                "[selftest] user: cannot remove stale /mnt/{}: {}",
+                name,
+                error.as_str()
+            ),
+        }
+    }
+}
+
+/// Create the fixture's inputs. Called after the ledger baseline is taken, so
+/// the check proves the run *and* the setup hand everything back.
+fn create_abi_files(dir: &Arc<dyn VfsNode>) -> Result<(), &'static str> {
+    let file = dir
+        .create_file(ABI_FILE)
+        .map_err(|_| "cannot create /mnt/abi-syscalls.txt")?;
+    match file.write(0, ABI_FILE_BYTES) {
+        Ok(written) if written == ABI_FILE_BYTES.len() => {}
+        _ => return Err("cannot write /mnt/abi-syscalls.txt"),
+    }
+    drop(file);
+    dir.create_file(ABI_CREATED)
+        .map_err(|_| "cannot create /mnt/abi-created.txt")?;
+    let link = dir
+        .create_symlink(ABI_LINK, ABI_FILE.as_bytes())
+        .map_err(|_| "cannot create /mnt/abi-link")?;
+    drop(link);
+    Ok(())
+}
+
+/// The native-ABI acceptance run.
+///
+/// The fixture is one static ELF that calls every syscall the ABI lists. With a
+/// filesystem it must exit 0; without one it must exit 77 *after* the
+/// filesystem-independent half passed, which is a SKIP (not a pass: the file
+/// path was not exercised) but still proves `write`, `brk`, `clock_gettime`,
+/// `nanosleep`, `uname`, `getdents64("/")` and the error paths.
+///
+/// The PMM and heap ledgers are compared across the whole check — creating the
+/// inputs, running the program with its directory snapshots and file handles,
+/// and removing the inputs — because a `brk` page, an fd node or a snapshot that
+/// is not released would move them.
+fn user_abi_syscalls(_buf: &mut Vec<u8>) -> Outcome {
+    let dir = match vfs::walk("/mnt", true) {
+        Ok(node) if node.is_directory() => Some(node),
+        Ok(_) => {
+            crate::kprintln!("[selftest] user: /mnt is not a directory");
+            return Outcome::Fail;
+        }
+        Err(VfsError::NotFound) => None,
+        Err(error) => {
+            crate::kprintln!("[selftest] user: cannot resolve /mnt: {}", error.as_str());
+            return Outcome::Fail;
+        }
+    };
+
+    if let Some(dir) = dir.as_ref() {
+        cleanup_abi_files(dir);
+    }
+    let (used_before, mapped_before, _) = crate::heap_stats();
+    let frames_before = frames();
+    let stats_before = syscall::stats();
+    let mut ok = true;
+    if let Some(dir) = dir.as_ref() {
+        if let Err(reason) = create_abi_files(dir) {
+            crate::kprintln!("[selftest] user: {}", reason);
+            ok = false;
+        }
+    }
+
+    let result = if ok {
+        Some(user::run_image_with_args(ABI_ELF, &["abi.elf"], &["PWD=/"]))
+    } else {
+        None // setup failed; do not run against missing inputs
+    };
+    let stats = syscall::stats();
+
+    if let Some(dir) = dir.as_ref() {
+        cleanup_abi_files(dir);
+    }
+
+    match (&dir, &result) {
+        (_, None) => {}
+        (Some(_), Some(Ok(Exit::Code(0)))) => {}
+        (None, Some(Ok(Exit::Code(77)))) => {}
+        (_, Some(Ok(other))) => {
+            crate::kprintln!("[selftest] user: the ABI fixture ended {other}");
+            ok = false;
+        }
+        (_, Some(Err(error))) => {
+            crate::kprintln!("[selftest] user: the ABI fixture failed: {error}");
+            ok = false;
+        }
+    }
+
+    // Counters: the fixture must have gone through the new entry points. The
+    // filesystem-independent set is required on every boot; the file half only
+    // when /mnt existed.
+    if stats.brks <= stats_before.brks
+        || stats.clocks <= stats_before.clocks
+        || stats.unames <= stats_before.unames
+        || stats.opens <= stats_before.opens
+        || stats.closes <= stats_before.closes
+        || stats.fstats <= stats_before.fstats
+        || stats.sleeps <= stats_before.sleeps
+    {
+        crate::kprintln!(
+            "[selftest] user: ABI counters did not move as expected (before {:?}, after {:?})",
+            stats_before,
+            stats
+        );
+        ok = false;
+    }
+    if dir.is_some()
+        && (stats.reads <= stats_before.reads
+            || stats.seeks <= stats_before.seeks
+            || stats.dirents <= stats_before.dirents
+            || stats.readlinks <= stats_before.readlinks)
+    {
+        crate::kprintln!(
+            "[selftest] user: filesystem ABI counters did not move (before {:?}, after {:?})",
+            stats_before,
+            stats
+        );
+        ok = false;
+    }
+
+    if frames() != frames_before {
+        crate::kprintln!(
+            "[selftest] user: the ABI run left the PMM at {} (was {})",
+            frames(),
+            frames_before
+        );
+        ok = false;
+    }
+    let (used, mapped, _) = crate::heap_stats();
+    if used != used_before || mapped != mapped_before {
+        crate::kprintln!(
+            "[selftest] user: the ABI run left the heap at {} B used / {} B mapped (was {}/{} B)",
+            used,
+            mapped,
+            used_before,
+            mapped_before
+        );
+        ok = false;
+    }
+
+    if !ok {
+        return Outcome::Fail;
+    }
+    if dir.is_none() {
+        Outcome::Skip("no filesystem mounted at /mnt (the filesystem half did not run)")
+    } else {
+        Outcome::Pass
+    }
 }
 
 /// The shell path's loader refusal: `run_image` must return `UserError::Elf`,
@@ -667,8 +835,9 @@ pub fn run() -> usize {
         total
     );
 
-    let checks: [(&str, fn(&mut Vec<u8>) -> Outcome); 9] = [
+    let checks: [(&str, fn(&mut Vec<u8>) -> Outcome); 10] = [
         ("user-abi-argv", user_abi_argv),
+        ("user-abi-syscalls", user_abi_syscalls),
         ("user-elf-accept", |buf| verdict(elf_accept(buf))),
         ("user-elf-reject", |buf| verdict(elf_rejects(buf))),
         ("user-run-rejects-bad-elf", |buf| {
