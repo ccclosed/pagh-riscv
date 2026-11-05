@@ -1971,7 +1971,8 @@ fn read_user_cstring<'a>(pointer: usize, out: &'a mut [u8]) -> Result<&'a str, i
             return Err(EINVAL);
         }
         let mut byte = [0u8; 1];
-        syscall::copy_from_user(&mut byte, pointer + length)?;
+        let address = pointer.checked_add(length).ok_or(EFAULT)?;
+        syscall::copy_from_user(&mut byte, address)?;
         if byte[0] == 0 {
             break;
         }
