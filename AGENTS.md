@@ -376,7 +376,7 @@ fuzzing. That is a gap, not a policy — the rule stands:
 
 ## Versioning
 
-Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.13.0`,
+Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.14.0`,
 which `Cargo.lock` mirrors. **The two move together in one commit**: CI builds with
 `--locked`, and cargo refuses to rewrite the lock (`cannot update the lock file …
 because --locked was passed`), so a `Cargo.toml`-only bump fails the build job in
@@ -407,7 +407,9 @@ seconds. Verify locally with `cargo build --locked` after any version change.
   BSD sockets over the one TCP client and the POSIX memory/descriptor set:
   mmap/munmap/mprotect, pipe2/dup/dup2/dup3, poll/ppoll; `0.13.0` adds native
   threads and futexes: clone(220) with CLONE_VM|CLONE_THREAD, futex(98) wait/wake,
-  gettid/set_tid_address/exit_group. The same rule applies
+  gettid/set_tid_address/exit_group; `0.14.0` adds POSIX-style signals
+  (rt_sigaction/rt_sigprocmask/kill/tgkill/rt_sigreturn) with user handlers,
+  blocked/pending masks, SA_RESTORER and a delivered user signal frame. The same rule applies
   to both: the tag equals the manifest and the `Cargo.lock` entry, and the
   release is not optional.
 
