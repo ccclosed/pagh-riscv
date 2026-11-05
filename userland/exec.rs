@@ -39,6 +39,54 @@ fn syscall3(number: usize, a0: usize, a1: usize, a2: usize) -> isize {
     result
 }
 
+fn syscall4(number: usize, a0: usize, a1: usize, a2: usize, a3: usize) -> isize {
+    let result: isize;
+    // SAFETY: as `syscall3`; the kernel reads a0..a3 and returns in a0.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") number,
+            inlateout("a0") a0 => result,
+            in("a1") a1,
+            in("a2") a2,
+            in("a3") a3,
+        )
+    };
+    result
+}
+
+/// The native 32-byte `struct sigaction`.
+#[repr(C)]
+struct SigAction {
+    handler: u64,
+    flags: u64,
+    mask: u64,
+    restorer: u64,
+}
+
+/// Query the signal state after `execve`: every handler must be `SIG_DFL` and
+/// the blocked mask must still contain SIGUSR1 (bit 9).
+fn signal_state_ok() -> bool {
+    let mut old = SigAction {
+        handler: u64::MAX,
+        flags: 0,
+        mask: 0,
+        restorer: 0,
+    };
+    if syscall4(134, 10, 0, &mut old as *mut SigAction as usize, 8) != 0 {
+        return false;
+    }
+    if old.handler != 0 {
+        return false;
+    }
+    let mut mask: u64 = 0;
+    // `SIG_SETMASK` with a NULL set only reports the current mask.
+    if syscall4(135, 2, 0, &mut mask as *mut u64 as usize, 8) != 0 {
+        return false;
+    }
+    mask & (1 << 9) != 0
+}
+
 fn write(text: &[u8]) {
     let _ = syscall3(64, 1, text.as_ptr() as usize, text.len());
 }
@@ -98,13 +146,10 @@ pub extern "C" fn exec_main(argc: usize, argv: *const usize, envp: *const usize)
         return 93;
     }
     write(b"abi: exec ok argc=2 argv=exec-arg env=PWD=/mnt\n");
-    // The optional second invocation proves `execve` resets the signal table:
-    // the parent ignored SIGUSR1 before forking, so if the ignore survived the
-    // exec this self-kill is a no-op and the process exits 0. With the required
-    // reset to SIG_DFL the process dies from signal 10 instead.
-    if env_has(envp, b"PAGH_EXEC_SIGNAL=1") {
-        let pid = syscall3(172, 0, 0, 0);
-        let _ = syscall3(129, pid as usize, 10, 0);
+    // The optional second invocation proves the signal-table rules across
+    // `execve`: handlers are back to `SIG_DFL`, while the blocked mask survives.
+    if env_has(envp, b"PAGH_EXEC_SIGNAL=1") && !signal_state_ok() {
+        return 96;
     }
     0
 }

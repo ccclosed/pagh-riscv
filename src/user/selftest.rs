@@ -632,17 +632,11 @@ fn user_abi_syscalls(_buf: &mut Vec<u8>) -> Outcome {
         );
         ok = false;
     }
-    // `faults` counts synchronous SIGSEGV/SIGILL *deliveries*; the fixture
-    // deliberately installs a handler and takes one, which is success, not the
-    // run ending. Only a default action (terminated) is a failure here.
-    if signals.terminated != signals_before.terminated {
-        crate::kprintln!(
-            "[selftest] user: the ABI run ended through a default signal action (before {:?}, after {:?})",
-            signals_before,
-            signals
-        );
-        ok = false;
-    }
+    // `faults` counts synchronous SIGSEGV/SIGILL deliveries and `terminated`
+    // counts children/threads ended by a default action. The fixture deliberately
+    // exercises both (a handled fault and a forked child killed by SIGUSR2), so
+    // neither counter moving means the *run* ended; the fixture returning success
+    // and the live-process/handler checks below are the actual verdict.
     if crate::user::signal::live_handlers() != 0
         || crate::user::signal::live_threads() != 0
         || crate::user::signal::live_pending() != 0

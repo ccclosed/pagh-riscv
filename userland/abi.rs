@@ -2273,11 +2273,10 @@ fn exec_section() {
     check(status == 0, 325, "exec child exit status");
     print("abi: exec wait ok\n");
 
-    // ── exec resets the signal table ──
+    // ── exec resets the signal table, keeps the blocked mask ──
     // SIG_IGN is the observable case: POSIX keeps it across `exec`, pagh
-    // deliberately resets every action to SIG_DFL. The child asks its new image
-    // to raise SIGUSR1; if the ignore survived it exits 0, otherwise `wait4`
-    // reports death by signal 10.
+    // deliberately resets every action to SIG_DFL. The child also sees the
+    // blocked mask inherited by `fork` and preserved by `execve`.
     let ignored = SigAction {
         handler: SIG_IGN,
         flags: 0,
@@ -2288,6 +2287,12 @@ fn exec_section() {
         rt_sigaction(SIGUSR1, &ignored, core::ptr::null_mut()) == 0,
         352,
         "exec install SIG_IGN",
+    );
+    let blocked: u64 = 1 << (SIGUSR1 - 1);
+    check(
+        rt_sigprocmask(SIG_BLOCK, &blocked, core::ptr::null_mut()) == 0,
+        353,
+        "exec block SIGUSR1",
     );
     let signal_child = fork_process();
     if signal_child == 0 {
@@ -2305,17 +2310,22 @@ fn exec_section() {
         let _ = syscall1(SYS_EXIT, 90 + (-result) as usize);
         loop {}
     }
-    check(signal_child > 0, 353, "fork exec signal child");
+    check(signal_child > 0, 354, "fork exec signal child");
     let mut signal_status: i32 = 0;
     check(
         wait_child(signal_child, &mut signal_status, 0) == signal_child,
-        354,
+        355,
         "exec signal child reaped",
     );
     check(
-        signal_status & 0x7f == 10,
-        355,
-        "exec reset SIG_IGN to SIG_DFL",
+        signal_status == 0,
+        356,
+        "exec reset SIG_IGN and kept blocked mask",
+    );
+    check(
+        rt_sigprocmask(SIG_UNBLOCK, &blocked, core::ptr::null_mut()) == 0,
+        357,
+        "exec unblock SIGUSR1",
     );
     let dfl = SigAction {
         handler: SIG_DFL,
@@ -2325,7 +2335,7 @@ fn exec_section() {
     };
     check(
         rt_sigaction(SIGUSR1, &dfl, core::ptr::null_mut()) == 0,
-        356,
+        358,
         "exec restore SIG_DFL",
     );
 }
