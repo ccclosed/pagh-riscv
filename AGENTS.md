@@ -361,7 +361,7 @@ fuzzing. That is a gap, not a policy — the rule stands:
 
 ## Versioning
 
-Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.11.0`,
+Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.12.0`,
 which `Cargo.lock` mirrors. **The two move together in one commit**: CI builds with
 `--locked`, and cargo refuses to rewrite the lock (`cannot update the lock file …
 because --locked was passed`), so a `Cargo.toml`-only bump fails the build job in
@@ -388,7 +388,9 @@ seconds. Verify locally with `cargo build --locked` after any version change.
   follow-up patch: TCP window/reconnect/timeout fixes, virtio-net RX ring
   preservation, bundle limits and a manifest-failure rollback; `0.11.0` adds the
   seven file-mutation syscalls (mkdirat/unlinkat/symlinkat/linkat/fchmodat/
-  ftruncate/renameat2) and the mutation half of the ABI fixture. The same rule applies
+  ftruncate/renameat2) and the mutation half of the ABI fixture; `0.12.0` adds
+  BSD sockets over the one TCP client and the POSIX memory/descriptor set:
+  mmap/munmap/mprotect, pipe2/dup/dup2/dup3, poll/ppoll. The same rule applies
   to both: the tag equals the manifest and the `Cargo.lock` entry, and the
   release is not optional.
 
