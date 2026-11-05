@@ -50,13 +50,13 @@
 | `task/selftest.rs` | пять проверок планировщика для `selftest` |
 | `user/mod.rs` | `run_image`/`run_file`: ELF → user-стек → SysV-кадр `argc/argv/envp` → задача → `sret` в U-mode → reap; `brk`-heap, `on_fault`, capture для ABI-теста; встроенные hello/fault/spin/argv/abi |
 | `user/elf.rs` | ELF64-загрузчик: валидация до первого кадра, `PT_LOAD` с `U=1`, потоковые сегменты кусками ≤ 512 B, откат кадров, `Loaded`/`ElfError` |
-| `user/syscall.rs` | native ABI: `read`/`write`/`openat`/`close`/`lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/`readlinkat`/`exit`/`sched_yield`/`getpid` + мутации `mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`/`ftruncate`; fd-таблица и таблица режимов на прогон, `copy_from_user`/`copy_to_user`, `sepc+4` |
+| `user/syscall.rs` | native ABI: `read`/`write`/`openat`/`close`/`lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/`readlinkat`/`exit`/`sched_yield`/`getpid` + мутации `mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`/`ftruncate` + сокеты `socket`/`connect`/`sendto`/`recvfrom`/`setsockopt`/`getsockopt`/`shutdown`; fd-таблица (включая `FdEntry::Socket`) и таблица режимов на прогон, `copy_from_user`/`copy_to_user`, `sepc+4` |
 | `user/selftest.rs` | десять проверок user-mode для `selftest` (argv-строка, все syscall'ы ABI, ELF-матрица, fault, таймер, 100 KiB) |
 | `net/mod.rs` | сетевой стек: состояние, ARP-кэш, `poll()`, диспетчер ARP/IPv4/ICMP/UDP/TCP, `ping`, DHCP-конфигурация |
 | `net/wire.rs` | чистые форматы Ethernet/ARP/IPv4/ICMP/UDP/TCP/DHCP/DNS и контрольные суммы (без устройства и часов) |
 | `net/dhcp.rs` | DHCP-клиент DISCOVER/OFFER/REQUEST/ACK |
 | `net/dns.rs` | stub-резолвер A-записей через UDP |
-| `net/tcp.rs` | минимальный active-open TCP-клиент для HTTP/1.0 |
+| `net/tcp.rs` | минимальный active-open TCP-клиент для HTTP/1.0; `recv_nonblocking` для socket `recv`, `peer()` для `recvfrom` |
 | `net/selftest.rs` | одиннадцать проверок сети для `selftest` (без NIC) |
 | `pkg/mod.rs` | нативный установщик `pkg`: `repo`/`index`/`list`/`install`/`remove`/`installed`, HTTP поверх `net::tcp`, индекс в фиксированных массивах, шлюз «размер + SHA-256» до разбора `PPKG0001`, `/mnt/pkg/<name>.manifest` |
 | `pkg/sha256.rs` | потоковый SHA-256 (FIPS 180-4) без аллокаций; `selftest()` для `pkg selftest` и `cfg(test)`-векторы |

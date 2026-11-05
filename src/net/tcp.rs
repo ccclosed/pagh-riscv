@@ -132,6 +132,9 @@ pub enum Error {
     Closed,
     /// A segment could not be built or sent.
     Send,
+    /// A non-blocking receive found no buffered payload and the peer has not
+    /// closed; the caller should poll again (the ABI's `-EAGAIN`).
+    WouldBlock,
 }
 
 impl core::fmt::Display for Error {
@@ -143,6 +146,7 @@ impl core::fmt::Display for Error {
             Error::Reset => f.write_str("connection reset"),
             Error::Closed => f.write_str("connection closed"),
             Error::Send => f.write_str("the segment could not be sent"),
+            Error::WouldBlock => f.write_str("no data buffered yet"),
         }
     }
 }
@@ -447,6 +451,36 @@ pub fn send(data: &[u8]) -> Result<usize, Error> {
     Ok(sent)
 }
 
+/// Copy buffered payload into `out` and shift the remainder down. Returns how
+/// many bytes were copied; the caller holds the socket lock.
+fn drain_rx(socket: &mut Socket, out: &mut [u8]) -> usize {
+    let buffered = socket.rx_len;
+    if buffered == 0 {
+        return 0;
+    }
+    let take = buffered.min(out.len());
+    out[..take].copy_from_slice(&socket.rx[..take]);
+    // The connection is small enough that a copy is cheaper than a ring
+    // buffer's bookkeeping.
+    socket.rx.copy_within(take..buffered, 0);
+    socket.rx_len = buffered - take;
+    take
+}
+
+/// The window-update segment that must follow [`drain_rx`], or `None` when the
+/// connection can no longer accept data. The caller sends it after releasing
+/// the socket lock: `send_segment` may poll the NIC and re-enter `on_segment`.
+fn window_update(socket: &Socket) -> Option<(u32, u32, u16)> {
+    match socket.state {
+        State::Established | State::Closing => Some((
+            socket.sequence,
+            socket.acknowledgement,
+            window_for(socket.rx_len),
+        )),
+        _ => None,
+    }
+}
+
 /// Read whatever payload is available, waiting up to a bounded time for the
 /// first byte. Returns `Ok(0)` when the peer has closed and the buffer is empty.
 pub fn recv(out: &mut [u8]) -> Result<usize, Error> {
@@ -468,31 +502,56 @@ pub fn recv(out: &mut [u8]) -> Result<usize, Error> {
             _ => Err(Error::Timeout),
         };
     }
-    let buffered = socket.rx_len;
-    let take = buffered.min(out.len());
-    out[..take].copy_from_slice(&socket.rx[..take]);
-    // Shift the remainder down; the connection is small enough that a copy is
-    // cheaper than a ring-buffer's bookkeeping.
-    socket.rx.copy_within(take..buffered, 0);
-    socket.rx_len = buffered - take;
+    let take = drain_rx(&mut socket, out);
     // The bytes just handed to the caller must be reflected in the advertised
     // window, or a sender that filled the old window has no way to learn that
     // space opened up (it would wait for a retransmission timer). Send the
     // window update *after* releasing the lock: `send_segment` can poll the NIC
     // and re-enter `on_segment`, which takes this lock.
-    let update = match socket.state {
-        State::Established | State::Closing => Some((
-            socket.sequence,
-            socket.acknowledgement,
-            window_for(socket.rx_len),
-        )),
-        _ => None,
-    };
+    let update = window_update(&socket);
     drop(socket);
     if let Some((sequence, acknowledgement, window)) = update {
         let _ = send_segment(sequence, acknowledgement, TCP_ACK, &[], window);
     }
     Ok(take)
+}
+
+/// One non-blocking receive: poll the NIC once, drain what is buffered, and
+/// return [`Error::WouldBlock`] when there is nothing yet. The caller (a
+/// socket `recv` syscall) turns that into `-EAGAIN`; the program polls.
+///
+/// A peer FIN is not an error: once the buffer is empty the result is `Ok(0)`,
+/// the ABI's end of stream.
+pub fn recv_nonblocking(out: &mut [u8]) -> Result<usize, Error> {
+    if out.is_empty() {
+        return Ok(0);
+    }
+    poll();
+    let mut socket = SOCKET.lock();
+    if socket.rx_len == 0 {
+        return match socket.state {
+            State::Closing | State::Closed => Ok(0),
+            State::Reset => Err(Error::Reset),
+            _ => Err(Error::WouldBlock),
+        };
+    }
+    let take = drain_rx(&mut socket, out);
+    let update = window_update(&socket);
+    drop(socket);
+    if let Some((sequence, acknowledgement, window)) = update {
+        let _ = send_segment(sequence, acknowledgement, TCP_ACK, &[], window);
+    }
+    Ok(take)
+}
+
+/// The current peer address and port, if a connection was started.
+pub fn peer() -> Option<(Ipv4, u16)> {
+    let socket = SOCKET.lock();
+    if socket.state == State::Closed {
+        None
+    } else {
+        Some((socket.remote, socket.remote_port))
+    }
 }
 
 /// Close the connection (FIN|ACK) and forget the socket.

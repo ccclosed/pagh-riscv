@@ -13,7 +13,7 @@
 |---|---|
 | `mod.rs` | `run_image(bytes, name)` / `run_image_with_args` для фикстур и `run_file(path)` / `run_file_with_args` / `run_file_with_argv0` для `run <path>` — весь сценарий запуска: ELF → user-стек → SysV-кадр `argc/argv/envp` → `spawn` задачи → `enter_user` (`a0=argc`, `a1=argv`, `sret`) → ожидание `Exited` → `reap` → снятие маппингов и heap-кадров; `FileSource` поверх `VfsNode` (потоковое чтение), `Exit`/`UserError`, `on_fault`, `RUN` (одна программа за раз), `brk` (user heap), capture для ABI-теста, встроенные фикстуры `HELLO_ELF`/`FAULT_ELF`/`SPIN_ELF`/`ARGV_ELF`/`ABI_ELF` |
 | `elf.rs` | ELF64-загрузчик: `ImageSource` (`len` + `read_at`) и потоковое чтение — заголовок, таблица program headers (≤ 8) и сегменты кусками ≤ 512 B в уже замапленные страницы, **без буфера размером с образ**; валидация заголовка/сегментов до первого кадра, `PT_LOAD`-страницы `U=1` в общей карте, нулевой `.bss`-хвост, откат кадров при любой ошибке; `Loaded { entry, pages(), release() }`, типизированные `ElfError`/`SourceError` |
-| `syscall.rs` | `dispatch(frame)`: `read(63)`, `write(64)`, `openat(56)`, `close(57)`, `lseek(62)`, `fstat(80)`, `getdents64(61)`, `brk(214)`, `clock_gettime(113)`, `nanosleep(101)`, `uname(160)`, `readlinkat(78)`, `exit(93)`, `sched_yield(124)`, `getpid(172)` + мутации `mkdirat(34)`, `unlinkat(35)`, `symlinkat(36)`, `linkat(37)`, `fchmodat(53)`, `ftruncate(46)`, `renameat2(276)`; таблица 16 fd на прогон, per-run таблица режимов для `fchmodat`/`fstat`, `copy_from_user`/`copy_to_user` (проверка `U/R/W` по PTE, `SUM` только вокруг копии), `-errno`/`-ENOSYS`, `ecall → sepc + 4`, счётчики для selftest |
+| `syscall.rs` | `dispatch(frame)`: `read(63)`, `write(64)`, `openat(56)`, `close(57)`, `lseek(62)`, `fstat(80)`, `getdents64(61)`, `brk(214)`, `clock_gettime(113)`, `nanosleep(101)`, `uname(160)`, `readlinkat(78)`, `exit(93)`, `sched_yield(124)`, `getpid(172)` + мутации `mkdirat(34)`, `unlinkat(35)`, `symlinkat(36)`, `linkat(37)`, `fchmodat(53)`, `ftruncate(46)`, `renameat2(276)` + сокеты `socket(198)`, `connect(203)`, `sendto(206)`, `recvfrom(207)`, `setsockopt(208)`, `getsockopt(209)`, `shutdown(210)`; таблица 16 fd на прогон (включая `FdEntry::Socket`), per-run таблица режимов для `fchmodat`/`fstat`, `copy_from_user`/`copy_to_user` (проверка `U/R/W` по PTE, `SUM` только вокруг копии), `-errno`/`-ENOSYS`, `ecall → sepc + 4`, счётчики для selftest |
 | `selftest.rs` | десять проверок для `selftest`: `user-abi-argv` (точная строка из фикстуры), `user-abi-syscalls` (все вызовы + мутационная половина: mkdir/rmdir, rename, link, symlink, chmod, ftruncate, unlink; с диском exit 0 и «все имена убраны», без `/mnt` — SKIP после no-fs половины), accept фикстуры, reject-матрица (14 мутаций заголовка/сегментов), отказ `run_image` на битом ELF, round-trip `hello`, fault-изоляция, запуск после fault, таймер-in-U и `user-run-large-file` (100 KiB образ с нулевым хвостом через `run_file`) |
 
 ## Вход в U-mode и начальный стек
@@ -51,6 +51,7 @@ NUL (запрос отклоняется до маппинга, `UserError::Argu
 | 0 | консольный ввод: `uart::try_get_byte()` → `virtio_input::try_key()`, иначе `-EAGAIN` |
 | 1, 2 | консольный вывод (один UART/экран) |
 | 3..15 | `Arc<dyn VfsNode>` + offset + flags `openat`; каталог хранит снимок детей |
+| 3..15 | один слот может быть `FdEntry::Socket { id, connected }`: TCP-сокет, `read`/`write`/`close` маршрутизируются в `net::tcp` |
 
 `close` освобождает узел; закрыть 0/1/2 можно, и до конца прогона это `-EBADF`.
 Лок таблицы **не держится** через VFS/block: `Arc` и offset копируются, I/O
@@ -112,6 +113,20 @@ S-mode page fault (тот напечатал бы и остановил hart). �
   `O_TRUNC` выполняет после установки fd и откатывает её при ошибке.
 * `clock_gettime` и `nanosleep` работают от 100 Гц тика: разрешение 10 ms,
   `nsec` всегда кратен миллиону.
+* **Сокеты — один TCP-клиент.** `socket` принимает только `AF_INET` +
+  `SOCK_STREAM` + 0, второй сокет при открытом первом — `-ENOSPC`. `connect`
+  валидирует 16-байтный `sockaddr_in` через `copy_from_user` (length, family,
+  port BE) и внутри `net::tcp::connect` крутит `net::poll()` до handshake.
+  `send` синхронный (ждёт ACK), `recv` **неблокирующий** (`-EAGAIN` — повтор,
+  0 — EOF). `connect`/`send`/`shutdown`/`close` на время ожидания включают
+  прерывания — иначе в trap-контексте тики стоят, дедлайн не работает и
+  планировщик не может вытеснить застрявшую программу; `net::poll()` при этом
+  вызывается на каждом шаге, потому что шелл в это время не в idle-цикле.
+  `read`/`write`/`close` на socket fd идут теми же путями. `shutdown` закрывает
+  оба направления, но оставляет fd (последующий `read` → 0, `write` →
+  `-EPIPE`); `close` освобождает слот. `listen`/`accept`/`bind`, UDP, IPv6,
+  DNS-вызов и TLS отсутствуют. Программа, вышедшая с открытым сокетом, закрывает
+  его в `release_fds` при teardown прогона.
 
 ## Раскладка адресов
 
@@ -181,6 +196,12 @@ S-mode page fault (тот напечатал бы и остановил hart). �
 9. **`RUN` не держится через блокирующее ожидание.** Лок берётся на захват,
    короткие обновления и снятие; `wait_for_exit` крутит `yield_now` без него;
    teardown делает раннер (trap-пути только читают/пишут запись).
+10. **Сокетный syscall сам опрашивает NIC.** Пока user-программа работает,
+    шелл стоит в `wait_for_exit` и `net::poll()` не вызывает; поэтому
+    `connect`/`send`/`shutdown`/`close` крутят опрос внутри `net::tcp` и на
+    время ожидания включают прерывания (как `nanosleep`), не держа локов.
+    Соединение одно, `recv` неблокирующий, sockaddr валидируется
+    `copy_from_user` до изменения состояния; второй `socket()` — `-ENOSPC`.
 
 ## Пределы (честно)
 
@@ -196,7 +217,10 @@ S-mode page fault (тот напечатал бы и остановил hart). �
   буфере возвращает 0; `lseek` на каталоге — `-EINVAL`;
   `clock_gettime`/`nanosleep` имеют разрешение тика 10 ms;
 - нет per-process page table/ASID (изоляция только «юзер vs ядро»), `mmap`,
-  `fork`/`exec`, сигналов, нескольких процессов; нет блокирующего `read(0)`.
+  `fork`/`exec`, сигналов, нескольких процессов; нет блокирующего `read(0)`;
+- ровно один TCP-сокет на прогон (`AF_INET`/`SOCK_STREAM`, IPv4-литерал, без
+  `listen`/`accept`/`bind`, UDP, DNS и TLS), `recv` неблокирующий, `shutdown`
+  без half-close.
 
 ## Как проверяется
 
@@ -219,8 +243,13 @@ selftest         # SELFTEST user-*: 10/10 с /mnt (8/10 + 2 SKIP без диск
 (`EISDIR`/`ENOTDIR`/`ENOTEMPTY`), `renameat2`, `linkat` (+`EISDIR`/`EINVAL`),
 `symlinkat`, `readlinkat`, `fchmodat` (+`ENOTSUP`), `ftruncate`
 (+`EINVAL`/`EBADF`/`EISDIR`), уборку всех имён и `ENAMETOOLONG` на 300-байтном
-пути. Без `/mnt` фикстура проходит no-fs половину и выходит 77, что selftest
-считает SKIP.
+пути. Сокетная секция фикстуры всегда проверяет bad args (`AF_UNIX`,
+`SOCK_DGRAM`, protocol 6 → `-EAFNOSUPPORT`; второй `socket` → `-ENOSPC`;
+`connect` с плохим указателем/длиной/family; `read`/`write`/`shutdown` до
+connect → `-ENOTCONN`; `setsockopt`/`getsockopt`; `EBADF` после `close`) и
+пытается подключиться к `10.0.2.2:8000`: без сервера это `SKIP` (не FAIL), с
+сервером — send/recv, `shutdown`, `read` → 0 и `write` → `-EPIPE`. Без `/mnt`
+фикстура проходит no-fs половину и выходит 77, что selftest считает SKIP.
 
 Два `selftest` подряд печатают одинаковые ledger'ы — это и есть доказательство,
 что не течёт ни образ, ни стек, ни стек задачи, ни heap-кадры, ни fd-узлы.

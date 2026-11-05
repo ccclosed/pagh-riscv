@@ -3,3 +3,4 @@
 *.img
 qemu_debug.log
 .cache/
+__pycache__/

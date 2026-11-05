@@ -43,9 +43,10 @@ fn syscall6(
     // arguments; the kernel restores the same `sp` and callee-saved registers.
     //
     // No `nostack` option: the kernel writes into buffers this program passes
-    // by address (path strings, `Stat`, `Uname`, the directory array), and some
-    // of them live on this stack frame. `nostack` promises the asm does not
-    // write the stack, which would be a false promise here.
+    // by address (path strings, `Stat`, `Uname`, socket addresses, the
+    // directory array), and some of them live on this stack frame. `nostack`
+    // promises the asm does not write the stack, which would be a false promise
+    // here.
     unsafe {
         core::arch::asm!(
             "ecall",
@@ -117,6 +118,19 @@ const SYS_LINKAT: usize = 37;
 const SYS_FCHMODAT: usize = 53;
 const SYS_FTRUNCATE: usize = 46;
 const SYS_RENAMEAT2: usize = 276;
+const SYS_SOCKET: usize = 198;
+const SYS_CONNECT: usize = 203;
+const SYS_SENDTO: usize = 206;
+const SYS_RECVFROM: usize = 207;
+const SYS_SETSOCKOPT: usize = 208;
+const SYS_GETSOCKOPT: usize = 209;
+const SYS_SHUTDOWN: usize = 210;
+
+const AF_INET: usize = 2;
+const SOCK_STREAM: usize = 1;
+const SOL_SOCKET: usize = 1;
+const SO_REUSEADDR: usize = 2;
+const SO_TYPE: usize = 3;
 
 const AT_REMOVEDIR: usize = 0x200;
 
@@ -152,6 +166,15 @@ const ENOTEMPTY: isize = -39;
 const EPIPE: isize = -32;
 const ENOTSUP: isize = -95;
 const ENAMETOOLONG: isize = -36;
+const ENOTSOCK: isize = -88;
+const ENOPROTOOPT: isize = -92;
+const EAFNOSUPPORT: isize = -97;
+const ENETUNREACH: isize = -101;
+const ENOSPC: isize = -28;
+const ENOTCONN: isize = -107;
+const ETIMEDOUT: isize = -110;
+const ECONNREFUSED: isize = -111;
+const EHOSTUNREACH: isize = -113;
 
 #[repr(C)]
 struct Stat {
@@ -1110,6 +1133,231 @@ pub extern "C" fn abi_main() -> i32 {
         "read on a directory",
     );
     check(syscall1(SYS_CLOSE, root as usize) == 0, 31, "close /");
+
+    // ── BSD sockets: AF_INET / SOCK_STREAM only, one connection at a time. The
+    // bad-argument half always runs. The connect probe to the QEMU host gateway
+    // is a SKIP (not a failure) when nothing is listening: CI has no host HTTP
+    // server, and a serial-only boot may have no NIC at all. ──
+    check(
+        syscall3(SYS_SOCKET, 1, SOCK_STREAM as usize, 0) == EAFNOSUPPORT,
+        140,
+        "socket(AF_UNIX)",
+    );
+    check(
+        syscall3(SYS_SOCKET, AF_INET, 2, 0) == EAFNOSUPPORT,
+        141,
+        "socket(SOCK_DGRAM)",
+    );
+    check(
+        syscall3(SYS_SOCKET, AF_INET, SOCK_STREAM as usize, 6) == EAFNOSUPPORT,
+        142,
+        "socket(protocol 6)",
+    );
+    let sock = syscall3(SYS_SOCKET, AF_INET, SOCK_STREAM as usize, 0);
+    check(sock >= 3, 143, "socket");
+    check(
+        syscall3(SYS_SOCKET, AF_INET, SOCK_STREAM as usize, 0) == ENOSPC,
+        144,
+        "second socket while one is open",
+    );
+
+    let mut address = [0u8; 16];
+    address[0..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+    address[2..4].copy_from_slice(&8000u16.to_be_bytes());
+    address[4..8].copy_from_slice(&[10u8, 0, 2, 2]);
+
+    check(
+        syscall3(SYS_CONNECT, sock as usize, 0x10, 16) == EFAULT,
+        145,
+        "connect bad pointer",
+    );
+    check(
+        syscall3(SYS_CONNECT, sock as usize, address.as_ptr() as usize, 8) == EINVAL,
+        146,
+        "connect addrlen",
+    );
+    let mut wrong_family = address;
+    wrong_family[0] = 1;
+    check(
+        syscall3(
+            SYS_CONNECT,
+            sock as usize,
+            wrong_family.as_ptr() as usize,
+            16,
+        ) == EAFNOSUPPORT,
+        147,
+        "connect family",
+    );
+    check(
+        syscall3(SYS_CONNECT, 99, address.as_ptr() as usize, 16) == EBADF,
+        148,
+        "connect bad fd",
+    );
+    check(
+        syscall3(SYS_CONNECT, 1, address.as_ptr() as usize, 16) == ENOTSOCK,
+        149,
+        "connect non-socket fd",
+    );
+    let mut scratch = [0u8; 4];
+    check(
+        syscall3(SYS_READ, sock as usize, scratch.as_mut_ptr() as usize, 4) == ENOTCONN,
+        150,
+        "read before connect",
+    );
+    check(
+        syscall3(SYS_WRITE, sock as usize, b"x".as_ptr() as usize, 1) == ENOTCONN,
+        151,
+        "write before connect",
+    );
+    check(
+        syscall2(SYS_SHUTDOWN, sock as usize, 0) == ENOTCONN,
+        152,
+        "shutdown before connect",
+    );
+
+    let mut option: u32 = 0;
+    let option_ptr = (&mut option as *mut u32) as usize;
+    check(
+        syscall5(
+            SYS_SETSOCKOPT,
+            sock as usize,
+            SOL_SOCKET,
+            SO_REUSEADDR,
+            option_ptr,
+            4,
+        ) == 0,
+        153,
+        "setsockopt SO_REUSEADDR",
+    );
+    check(
+        syscall5(SYS_SETSOCKOPT, sock as usize, 0x1234, 1, option_ptr, 4) == ENOPROTOOPT,
+        154,
+        "setsockopt unknown option",
+    );
+    let mut option_len: u32 = 4;
+    check(
+        syscall5(
+            SYS_GETSOCKOPT,
+            sock as usize,
+            SOL_SOCKET,
+            SO_TYPE,
+            option_ptr,
+            (&mut option_len as *mut u32) as usize,
+        ) == 0,
+        155,
+        "getsockopt SO_TYPE",
+    );
+    check(
+        option == SOCK_STREAM as u32 && option_len == 4,
+        156,
+        "getsockopt SO_TYPE value",
+    );
+
+    let connected = syscall3(
+        SYS_CONNECT,
+        sock as usize,
+        address.as_ptr() as usize,
+        16,
+    );
+    if connected == 0 {
+        print("abi: socket connected to 10.0.2.2:8000\n");
+        let request = b"GET / HTTP/1.0\r\nHost: 10.0.2.2\r\n\r\n";
+        let sent = syscall6(
+            SYS_SENDTO,
+            sock as usize,
+            request.as_ptr() as usize,
+            request.len(),
+            0,
+            0,
+            0,
+        );
+        print("abi: socket send returned ");
+        if sent < 0 {
+            print("-");
+            print_usize((-sent) as usize);
+        } else {
+            print_usize(sent as usize);
+        }
+        print(" bytes\n");
+        if sent == request.len() as isize {
+            let mut response = [0u8; 256];
+            let delay = Timespec {
+                seconds: 0,
+                nanos: 10_000_000,
+            };
+            let mut polls = 0;
+            let mut got = 0isize;
+            while polls < 100 {
+                let count = syscall6(
+                    SYS_RECVFROM,
+                    sock as usize,
+                    response.as_mut_ptr() as usize,
+                    response.len(),
+                    0,
+                    0,
+                    0,
+                );
+                if count > 0 {
+                    got = count;
+                    break;
+                }
+                if count == 0 {
+                    break;
+                }
+                check(count == EAGAIN, 158, "recv on connected socket");
+                let _ = syscall2(SYS_NANOSLEEP, &delay as *const Timespec as usize, 0);
+                polls += 1;
+            }
+            print("abi: socket recv got ");
+            print_usize(got as usize);
+            print(" bytes\n");
+        }
+        check(
+            syscall2(SYS_SHUTDOWN, sock as usize, 2) == 0,
+            157,
+            "shutdown connected socket",
+        );
+        let mut one = [0u8; 1];
+        check(
+            syscall3(SYS_READ, sock as usize, one.as_mut_ptr() as usize, 1) == 0,
+            159,
+            "read after shutdown is EOF",
+        );
+        check(
+            syscall3(SYS_WRITE, sock as usize, b"x".as_ptr() as usize, 1) == EPIPE,
+            160,
+            "write after shutdown is EPIPE",
+        );
+        print("abi: socket shutdown/EOF ok\n");
+    } else {
+        // A serial-only boot, no NIC, or a CI host without a listener: this is
+        // a SKIP. Any other errno means the kernel rejected a valid sockaddr,
+        // which is a real bug.
+        check(
+            connected == ECONNREFUSED
+                || connected == ETIMEDOUT
+                || connected == ENETUNREACH
+                || connected == EHOSTUNREACH
+                || connected == EAGAIN,
+            161,
+            "connect to 10.0.2.2:8000",
+        );
+        print("abi: socket SKIP connect (no host server on 10.0.2.2:8000)\n");
+    }
+    check(syscall1(SYS_CLOSE, sock as usize) == 0, 162, "close socket");
+    check(
+        syscall1(SYS_CLOSE, sock as usize) == EBADF,
+        163,
+        "double close socket",
+    );
+    // Closing frees the one connection slot: another socket must succeed.
+    let sock2 = syscall3(SYS_SOCKET, AF_INET, SOCK_STREAM as usize, 0);
+    check(sock2 >= 3, 164, "socket after close");
+    check(
+        syscall1(SYS_CLOSE, sock2 as usize) == 0,
+        165,
+        "close second socket",
+    );
 
     // ── the filesystem half: skip when the selftest could not provide /mnt ──
     let path = b"/mnt/abi-syscalls.txt\0";

@@ -12,7 +12,7 @@
 | `wire.rs` | чистые форматы: Ethernet, ARP, IPv4, ICMP, UDP, TCP, DHCP, DNS; контрольные суммы (RFC 1071 + pseudo-header) и текстовые помощники. Не знает ни устройства, ни часов — поэтому тестируется без QEMU |
 | `dhcp.rs` | DHCP-клиент: DISCOVER/OFFER/REQUEST/ACK, опции 1/3/6/50/51/53/54 |
 | `dns.rs` | stub-резолвер: A-запрос по UDP, разбор ответа с компрессией имён |
-| `tcp.rs` | минимальный active-open TCP-клиент для HTTP/1.0: handshake, seq/ack, приём данных, FIN; одно соединение |
+| `tcp.rs` | минимальный active-open TCP-клиент для HTTP/1.0: handshake, seq/ack, приём данных, FIN; одно соединение. `recv_nonblocking` — один `poll()` и `WouldBlock` для socket-ABI, `peer()` — адрес для `recvfrom` |
 | `selftest.rs` | 11 проверок для `selftest`: контрольные суммы, round-trip всех заголовков, разбор DHCP/DNS из фиксированных байт, TCP-сегмент |
 
 Драйвер — `src/drivers/virtio_net.rs`; его контракт с этим модулем: `mac()`,
@@ -66,6 +66,20 @@ limited-broadcast (`255.255.255.255`) кадры — именно так при�
 out-of-order reassembly, нет congestion control — это HTTP/1.0-клиент, а не
 замена Linux TCP. Ошибки типизированы (`tcp::Error`), а не «молча пусто».
 
+**Сокетный ABI для userland.** `src/user/syscall.rs` даёт минимальный BSD-набор
+поверх этого клиента: `socket` (только `AF_INET`/`SOCK_STREAM`, второй сокет при
+открытом первом — `-ENOSPC`), `connect` (16-байтный `sockaddr_in`, IPv4-литерал,
+ошибки `-ENETUNREACH`/`-EHOSTUNREACH`/`-ECONNREFUSED`/`-ETIMEDOUT`),
+`sendto`/`recvfrom` (их же форма — `send`/`recv`; `read`/`write` на socket fd
+маршрутизируются сюда), `setsockopt`/`getsockopt` (типовые опции принимаются и
+игнорируются) и `shutdown` (оба направления, fd остаётся). `recv`
+неблокирующий: `-EAGAIN` — «опять нет данных», 0 — peer закрылся. Соединение
+одно; `FdEntry::Socket { id, connected }` живёт в per-run таблице и закрывается
+при teardown. Пока user-программа работает, шелл не в idle-цикле, поэтому
+`connect`/`send`/`shutdown`/`close` включают прерывания на время ожидания и сами
+вызывают `net::poll()` на каждом шаге — иначе тики бы стояли, а NIC остался бы
+без опроса.
+
 ## Команды шелла
 
 | Команда | Что делает |
@@ -86,6 +100,9 @@ out-of-order reassembly, нет congestion control — это HTTP/1.0-клие�
   `virtio-net: virtio-net0 … MAC …` и `net         DHCP ip 10.0.2.15/24 …`;
   `ping 10.0.2.2` → 4/4 reply; `dns example.com`; `http` к серверу на хосте
   (`10.0.2.2` — это loopback хоста в QEMU user network).
+- Живой сокетный прогон: `python3 tools/test_sockets.py` (сервер на
+  `127.0.0.1:8000`, `http_get` на диске, `selftest` с реальным connect/recv/
+  shutdown и `run /mnt/http_get`); транскрипт — `docs/live-sockets.txt`.
 - CI: `python3 .github/smoke.py <elf> --net` — загрузка, DHCP, `net`, ping
   шлюза, `halt` (QEMU's slirp, без зависимости от интернета раннера).
 - Скриншот `docs/net.png` (`tools/run.py --net --keys "net\nping 10.0.2.2\n"`).
@@ -96,8 +113,10 @@ out-of-order reassembly, нет congestion control — это HTTP/1.0-клие�
   (vendored `embedded-tls` + OpenPGP-проверка, как на x86). Сейчас `http`, а не
   `https`.
 - IPv6, фрагментация, ICMP redirect/unreachable, UDP-сокеты как API (только
-  внутренние клиенты DHCP/DNS), прослушивание TCP, несколько соединений,
-  keepalive, Nagle/окна больше фиксированного.
+  внутренние клиенты DHCP/DNS), `bind`/`listen`/`accept`, несколько соединений,
+  keepalive, Nagle/окна больше фиксированного. `setsockopt`/`getsockopt`
+  принимают типовые опции, но ничего не настраивают; DNS из userland вызывается
+  только shell-командой `dns`, не сокетным syscall'ом; TLS нет.
 - Прерывания NIC: всё polled, `wfi`-idle шелла просыпается на тик и сам
   опрашивает сеть.
 - DHCP renewal по таймеру: `dhcp` — ручная команда; lease не обновляется сам.
