@@ -192,6 +192,8 @@ trap_return:
 /// Cause codes this kernel knows by name (`scause`).
 pub const CAUSE_ILLEGAL_INSTRUCTION: usize = 2;
 pub const CAUSE_BREAKPOINT: usize = 3;
+pub const CAUSE_LOAD_ADDRESS_MISALIGNED: usize = 4;
+pub const CAUSE_STORE_ADDRESS_MISALIGNED: usize = 6;
 pub const CAUSE_ECALL_FROM_USER: usize = 8;
 pub const CAUSE_INSTRUCTION_PAGE_FAULT: usize = 12;
 pub const CAUSE_LOAD_PAGE_FAULT: usize = 13;
@@ -209,6 +211,8 @@ pub fn cause_name(cause: usize) -> &'static str {
     match cause {
         CAUSE_ILLEGAL_INSTRUCTION => "illegal instruction",
         CAUSE_BREAKPOINT => "breakpoint",
+        CAUSE_LOAD_ADDRESS_MISALIGNED => "load address misaligned",
+        CAUSE_STORE_ADDRESS_MISALIGNED => "store address misaligned",
         CAUSE_ECALL_FROM_USER => "ecall from U-mode",
         CAUSE_INSTRUCTION_PAGE_FAULT => "instruction page fault",
         CAUSE_LOAD_PAGE_FAULT => "load page fault",

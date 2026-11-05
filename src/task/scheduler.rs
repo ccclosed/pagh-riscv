@@ -150,6 +150,9 @@ enum Reason {
     ProbeIdle,
     /// Idle has nothing to wait for yet: give the CPU back without queueing.
     IdleStep,
+    /// The current thread is being stopped by the default action of a
+    /// job-control signal: leave the ready queue until [`continue_task`].
+    Stop,
 }
 
 /// Where a thread is in its life.
@@ -165,6 +168,14 @@ pub enum State {
     /// until it is either woken or the run is torn down. A blocked thread does
     /// not consume CPU time; a tick can wake it at a deadline.
     Blocked,
+    /// Job-control stopped (`SIGSTOP`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU` with the
+    /// default action). Not in the ready queue and never selected until
+    /// [`continue_task`] makes it `Ready`. A stopped thread keeps its kernel
+    /// stack, its pending/blocked signal masks and its run membership; it is
+    /// still "live" for every liveness scan (`kill`, `kill_group`, the runner's
+    /// wait), which is what makes `kill(pid, 0)` answer "exists" and a stopped
+    /// main thread keep the run open.
+    Stopped,
     /// Returned from its entry point; waiting for the next reap to give its
     /// stack frames back to the PMM.
     Exited,
@@ -178,6 +189,7 @@ impl State {
             State::Ready => "ready",
             State::Running => "running",
             State::Blocked => "blocked",
+            State::Stopped => "stopped",
             State::Exited => "exited",
         }
     }
@@ -1003,6 +1015,62 @@ pub fn wake_task(id: u64) -> bool {
     false
 }
 
+/// Stop the calling thread until [`continue_task`] resumes it.
+///
+/// This is the scheduler half of the default action for `SIGSTOP`/`SIGTSTP`/
+/// `SIGTTIN`/`SIGTTOU`: the trap handler has already consumed the signal and
+/// calls here at the kernel-to-user boundary, so it is the *running* thread
+/// that leaves the queue. A normal scheduler switch runs somebody else (idle
+/// when nobody else is ready); when `continue_task` queues this slot again the
+/// function returns and the interrupted trap frame is restored exactly where
+/// it stopped. A stopped thread is not `Blocked`: `wake_task` must not resume
+/// it, only SIGCONT does.
+pub fn stop_current() {
+    schedule(Reason::Stop, None);
+}
+
+/// Resume a thread stopped by [`stop_current`]: `Stopped` -> `Ready`, queued
+/// behind whatever is runnable now.
+///
+/// Returns whether the slot was actually stopped. A signal-sent SIGCONT to a
+/// thread that is merely blocked, ready or running is a no-op here (the
+/// pending SIGCONT bit still reaches it through the ordinary delivery path);
+/// that is what keeps `kill(SIGCONT)` from turning a futex wait into a fake
+/// wakeup.
+pub fn continue_task(id: u64) -> bool {
+    let _mask = InterruptsOff::new();
+    let mut sched = SCHED.lock();
+    for slot in 0..MAX_TASKS {
+        let t = task(slot);
+        // SAFETY: `slot` is in range and the scheduler lock is held with
+        // interrupts masked.
+        unsafe {
+            if (*t).id == id && (*t).state == State::Stopped {
+                (*t).state = State::Ready;
+                (*t).wake_at = 0;
+                (*t).wake_reason = WakeReason::None;
+                push_ready(&mut sched, slot);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Threads currently in `Stopped` (the selftest requires 0 after a run).
+pub fn stopped_tasks() -> usize {
+    let _mask = InterruptsOff::new();
+    let _sched = SCHED.lock();
+    let mut count = 0usize;
+    for slot in 0..MAX_TASKS {
+        // SAFETY: `slot` is in range and the scheduler lock is held.
+        if unsafe { (*task(slot)).state } == State::Stopped {
+            count += 1;
+        }
+    }
+    count
+}
+
 /// Retire every non-current thread of `group`: mark it `Exited`, drop it from
 /// the ready queue and forget any timeout.
 ///
@@ -1025,9 +1093,12 @@ pub fn kill_group(group: u64) -> usize {
         let t = task(slot);
         // SAFETY: slot is in range and the scheduler lock is held with
         // interrupts masked; no thread can be running somewhere else on a
-        // single hart, so `Ready`/`Blocked` are the only live states here.
+        // single hart, so `Ready`/`Blocked`/`Stopped` are the only live states
+        // here.
         unsafe {
-            if (*t).group == group && matches!((*t).state, State::Ready | State::Blocked) {
+            if (*t).group == group
+                && matches!((*t).state, State::Ready | State::Blocked | State::Stopped)
+            {
                 (*t).state = State::Exited;
                 (*t).wake_at = 0;
                 (*t).wake_reason = WakeReason::None;
@@ -1193,7 +1264,10 @@ pub fn foreign_tasks() -> usize {
         let t = task(slot);
         // SAFETY: slot is in range and the scheduler lock is held.
         unsafe {
-            if matches!((*t).state, State::Ready | State::Running | State::Blocked) {
+            if matches!(
+                (*t).state,
+                State::Ready | State::Running | State::Blocked | State::Stopped
+            ) {
                 live += 1;
             }
         }
@@ -1275,7 +1349,7 @@ fn pick_next(
                 return None;
             }
         }
-        Reason::Exit | Reason::Block | Reason::ProbeIdle | Reason::IdleStep => {}
+        Reason::Exit | Reason::Block | Reason::ProbeIdle | Reason::IdleStep | Reason::Stop => {}
     }
 
     // Retire or requeue the outgoing thread.
@@ -1325,6 +1399,13 @@ fn pick_next(
             // SAFETY: as above; idle goes back to the fallback slot, unqueued.
             unsafe { (*outgoing).state = State::Ready };
         }
+        Reason::Stop => {
+            // SAFETY: as above. A stop is delivered in the running thread's
+            // own trap context, so this always leaves `Running`; the thread
+            // keeps its saved context (and therefore its user registers) on
+            // its own kernel stack until `continue_task` queues it again.
+            unsafe { (*outgoing).state = State::Stopped };
+        }
     }
 
     let next = match reason {
@@ -1336,7 +1417,7 @@ fn pick_next(
                 // A blocked thread with nothing else runnable hands the CPU to
                 // idle; the timer (or a wakeup, which queues the wakee) makes
                 // the next switch.
-                if reason == Reason::Block && current != IDLE_SLOT {
+                if matches!(reason, Reason::Block | Reason::Stop) && current != IDLE_SLOT {
                     IDLE_SLOT
                 } else {
                     // Idle stepping back with nothing queued means the probe was
@@ -1456,7 +1537,7 @@ pub fn stats() -> Stats {
                     live += 1;
                     ready += 1;
                 }
-                State::Running | State::Blocked | State::Exited => live += 1,
+                State::Running | State::Blocked | State::Stopped | State::Exited => live += 1,
             }
         }
     }
@@ -1497,7 +1578,11 @@ pub fn thread_group(id: u64) -> Option<u64> {
         let t = task(slot);
         // SAFETY: `slot` is in range and the scheduler lock is held.
         unsafe {
-            if (*t).id == id && matches!((*t).state, State::Ready | State::Running | State::Blocked)
+            if (*t).id == id
+                && matches!(
+                    (*t).state,
+                    State::Ready | State::Running | State::Blocked | State::Stopped
+                )
             {
                 return Some((*t).group);
             }
@@ -1524,7 +1609,10 @@ pub fn group_threads(group: u64, out: &mut [u64]) -> usize {
         // SAFETY: `slot` is in range and the scheduler lock is held.
         unsafe {
             if (*t).group == group
-                && matches!((*t).state, State::Ready | State::Running | State::Blocked)
+                && matches!(
+                    (*t).state,
+                    State::Ready | State::Running | State::Blocked | State::Stopped
+                )
             {
                 out[count] = (*t).id;
                 count += 1;

@@ -96,6 +96,7 @@ const SYS_FUTEX: usize = 98;
 // are pagh's own (see `pagh-api/docs/abi.md` and `src/user/signal.rs`).
 const SYS_KILL: usize = 129;
 const SYS_TGKILL: usize = 131;
+const SYS_SIGALTSTACK: usize = 132;
 const SYS_RT_SIGACTION: usize = 134;
 const SYS_RT_SIGPROCMASK: usize = 135;
 const SYS_RT_SIGRETURN: usize = 139;
@@ -953,6 +954,7 @@ pub fn dispatch(frame: &mut TrapFrame) {
         }
         SYS_SET_TID_ADDRESS => crate::user::thread_id() as isize,
         SYS_KILL => crate::user::signal::kill(frame.a0 as isize, frame.a1 as isize),
+        SYS_SIGALTSTACK => crate::user::signal::sigaltstack(frame.a0, frame.a1),
         SYS_TGKILL => crate::user::signal::tgkill(frame.a0, frame.a1, frame.a2 as isize),
         SYS_RT_SIGACTION => {
             crate::user::signal::rt_sigaction(frame.a0, frame.a1, frame.a2, frame.a3)
@@ -985,6 +987,15 @@ pub fn dispatch(frame: &mut TrapFrame) {
             ENOSYS
         }
     };
+    // `SA_RESTART` on the signal that interrupted `futex`/`nanosleep`: the
+    // syscall answered `-EINTR` and the handler is about to run at this
+    // boundary, but the trap frame must keep the original `a0..a5` and `sepc`
+    // so `rt_sigreturn` re-executes the `ecall` with its arguments intact.
+    // `take_restart` is armed only by `signal::interrupted`, i.e. only for the
+    // two wait syscalls that document restart support.
+    if result == EINTR && crate::user::signal::take_restart() {
+        return;
+    }
     frame.a0 = result as usize;
     // `sret` resumes at the saved `sepc`, which still points at the `ecall`
     // instruction. A returning syscall resumes at the instruction after it;
@@ -1003,8 +1014,9 @@ const CLONE_FS: usize = 0x0000_0200;
 /// `CLONE_FILES`: share the descriptor table (required by the implementation,
 /// though the native contract only demands `VM|THREAD`).
 const CLONE_FILES: usize = 0x0000_0400;
-/// `CLONE_SIGHAND`: share signal handlers. pagh has no signals; accepted for
-/// source compatibility and documented as a no-op.
+/// `CLONE_SIGHAND`: share signal handlers. Handlers are per run in pagh, so a
+/// `clone` child already shares them; this flag is accepted and changes
+/// nothing.
 const CLONE_SIGHAND: usize = 0x0000_0800;
 /// `CLONE_THREAD`: put the new task in the caller's thread group (required).
 const CLONE_THREAD: usize = 0x0001_0000;

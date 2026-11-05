@@ -23,7 +23,7 @@
 #![no_std]
 #![no_main]
 
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 
 core::arch::global_asm!(
     r#"
@@ -180,6 +180,7 @@ const SYS_TGKILL: usize = 131;
 const SYS_RT_SIGACTION: usize = 134;
 const SYS_RT_SIGPROCMASK: usize = 135;
 const SYS_RT_SIGRETURN: usize = 139;
+const SYS_SIGALTSTACK: usize = 132;
 
 const CLONE_VM: usize = 0x100;
 const CLONE_FS: usize = 0x200;
@@ -197,6 +198,17 @@ const FUTEX_REQUEUE: usize = 3;
 
 // ─── signals ───────────────────────────────────────────────────────────────
 const SA_RESTORER: usize = 0x0400_0000;
+const SA_ONSTACK: usize = 0x0800_0000;
+const SA_RESTART: usize = 0x1000_0000;
+const SA_NODEFER: usize = 0x4000_0000;
+const SA_RESETHAND: usize = 0x8000_0000;
+const SA_SIGINFO: usize = 0x0000_0004;
+const SS_ONSTACK: i32 = 1;
+const SS_DISABLE: i32 = 2;
+const MINSIGSTKSZ: usize = 4096;
+const SI_USER: i32 = 0;
+const SI_TKILL: i32 = -6;
+const SEGV_MAPERR: i32 = 1;
 const SIG_DFL: usize = 0;
 const SIG_IGN: usize = 1;
 const SIGKILL: usize = 9;
@@ -204,7 +216,9 @@ const SIGUSR1: usize = 10;
 const SIGSEGV: usize = 11;
 const SIGUSR2: usize = 12;
 const SIGCHLD: usize = 17;
+const SIGCONT: usize = 18;
 const SIGSTOP: usize = 19;
+const SIGTSTP: usize = 20;
 const SIG_BLOCK: usize = 0;
 const SIG_UNBLOCK: usize = 1;
 const SIG_SETMASK: usize = 2;
@@ -286,6 +300,68 @@ struct SigAction {
     mask: u64,
     restorer: usize,
 }
+
+/// `sigaltstack` argument/result: `{ ss_sp, ss_flags, pad, ss_size }`.
+#[repr(C)]
+struct SigAltStack {
+    ss_sp: usize,
+    ss_flags: i32,
+    _pad: i32,
+    ss_size: usize,
+}
+
+/// The pagh `siginfo_t`: signo, errno, code, then the 16-byte union slot
+/// (`si_pid`/`si_uid` or `si_addr`), `si_status`, padding to 128 bytes.
+#[repr(C)]
+struct SigInfo {
+    si_signo: i32,
+    si_errno: i32,
+    si_code: i32,
+    _pad: i32,
+    si_value: u64,
+    si_status: i32,
+    _pad2: i32,
+    _rest: [u8; 96],
+}
+
+impl SigInfo {
+    /// `si_pid` (low half of the union slot).
+    fn pid(&self) -> u32 {
+        self.si_value as u32
+    }
+
+    /// `si_uid` (high half of the union slot).
+    fn uid(&self) -> u32 {
+        (self.si_value >> 32) as u32
+    }
+
+    /// `si_addr` for a synchronous fault.
+    fn addr(&self) -> u64 {
+        self.si_value
+    }
+}
+
+/// The pagh `mcontext`: `gregs[0..32]` is x0..x31 and `pc` the interrupted
+/// `sepc`.
+#[repr(C)]
+struct MContext {
+    gregs: [u64; 32],
+    pc: u64,
+}
+
+/// The pagh `ucontext_t`: flags, previous context, handler mask, mcontext.
+#[repr(C)]
+struct UContext {
+    flags: u64,
+    link: u64,
+    sigmask: u64,
+    mcontext: MContext,
+}
+
+const _: () = assert!(core::mem::size_of::<SigAltStack>() == 24);
+const _: () = assert!(core::mem::size_of::<SigInfo>() == 128);
+const _: () = assert!(core::mem::size_of::<MContext>() == 264);
+const _: () = assert!(core::mem::size_of::<UContext>() == 288);
 
 #[repr(C)]
 struct PollFd {
@@ -933,6 +1009,14 @@ fn tgkill(tgid: usize, tid: usize, signal: usize) -> isize {
     syscall3(SYS_TGKILL, tgid, tid, signal)
 }
 
+fn sigaltstack(new: *const SigAltStack, old: *mut SigAltStack) -> isize {
+    syscall2(SYS_SIGALTSTACK, new as usize, old as usize)
+}
+
+fn getpid() -> isize {
+    syscall1(172, 0)
+}
+
 /// The signal acceptance section (runs with or without `/mnt`).
 ///
 /// It proves the handler path end to end: the kernel enters the Rust handler at
@@ -1015,7 +1099,7 @@ fn signal_section(stack: usize) {
     // ── sending ──
     check(kill(pid, 0) == 0, 224, "kill sig 0");
     check(kill(pid, 32) == EINVAL, 225, "kill bad signal");
-    check(kill(pid, SIGSTOP) == ENOSYS, 226, "kill SIGSTOP");
+    check(kill(-2, SIGUSR1) == ESRCH, 226, "kill invalid process group");
     check(kill(pid + 1, SIGUSR1) == ESRCH, 227, "kill unknown tid");
     check(kill(pid, SIGUSR1) == 0, 228, "kill SIGUSR1");
     check(
@@ -1249,6 +1333,683 @@ fn signal_section(stack: usize) {
         "signal count at the end",
     );
     print("abi: signals ok\n");
+}
+
+// ─── alternate stack, siginfo, SA_* flags, job control ─────────────────────
+
+static ALT_BASE: AtomicUsize = AtomicUsize::new(0);
+static ALT_TOP: AtomicUsize = AtomicUsize::new(0);
+static ALT_HITS: AtomicUsize = AtomicUsize::new(0);
+static ALT_HIT: AtomicUsize = AtomicUsize::new(0);
+static ALT_ONSTACK: AtomicUsize = AtomicUsize::new(0);
+static SIGINFO_OK: AtomicUsize = AtomicUsize::new(1);
+static SIGINFO_HITS: AtomicUsize = AtomicUsize::new(0);
+static SIGINFO_EXPECT_SIGNO: AtomicUsize = AtomicUsize::new(SIGUSR1);
+static SIGINFO_EXPECT_CODE: AtomicI32 = AtomicI32::new(SI_USER);
+static SIGINFO_EXPECT_MASK: AtomicUsize = AtomicUsize::new(0);
+static NODEFER_HITS: AtomicUsize = AtomicUsize::new(0);
+static NODEFER_MAX: AtomicUsize = AtomicUsize::new(0);
+static NODEFER_MASK_OK: AtomicUsize = AtomicUsize::new(0);
+static NODEFER_PID: AtomicUsize = AtomicUsize::new(0);
+static RESETHAND_HITS: AtomicUsize = AtomicUsize::new(0);
+static RESTART_READY: AtomicUsize = AtomicUsize::new(0);
+static RESTART_RESULT: AtomicUsize = AtomicUsize::new(0);
+static RESTART_HITS: AtomicUsize = AtomicUsize::new(0);
+static JOG_READY: AtomicUsize = AtomicUsize::new(0);
+static JOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static JOG_STOP: AtomicUsize = AtomicUsize::new(0);
+static STOP_READY: AtomicUsize = AtomicUsize::new(0);
+static STOP_RESULT: AtomicUsize = AtomicUsize::new(0);
+static STOP_GATE: AtomicU32 = AtomicU32::new(0);
+static RESTART_GATE: AtomicU32 = AtomicU32::new(0);
+
+/// Handler for the `SA_ONSTACK` test: proves the kernel entered it on the
+/// installed alternate stack, and that a query from inside the handler reports
+/// `SS_ONSTACK`.
+extern "C" fn altstack_handler(signo: usize, _info: usize) {
+    let _ = signo;
+    ALT_HITS.fetch_add(1, Ordering::SeqCst);
+    let sp: usize;
+    // SAFETY: reading `sp` is a pure register read; the handler runs on the
+    // stack the kernel chose, which is exactly what this test inspects.
+    unsafe { core::arch::asm!("mv {}, sp", out(reg) sp, options(nomem, nostack)) };
+    if sp >= ALT_BASE.load(Ordering::SeqCst) && sp < ALT_TOP.load(Ordering::SeqCst) {
+        ALT_HIT.store(1, Ordering::SeqCst);
+    }
+    let mut old = SigAltStack {
+        ss_sp: 0,
+        ss_flags: 0,
+        _pad: 0,
+        ss_size: 0,
+    };
+    if sigaltstack(core::ptr::null(), &mut old) == 0 && old.ss_flags & SS_ONSTACK != 0 {
+        ALT_ONSTACK.store(1, Ordering::SeqCst);
+    }
+}
+
+/// Shared validation for a `SA_SIGINFO` handler: every field the kernel
+/// promises for the expected source, plus the ucontext snapshot.
+fn siginfo_matches(signo: usize, info: *const SigInfo, uc: *const UContext) -> bool {
+    // SAFETY: the kernel passes both pointers into the live signal frame it
+    // just wrote below the handler's `sp`; they stay mapped for the call.
+    let info = unsafe { &*info };
+    // SAFETY: as above.
+    let uc = unsafe { &*uc };
+    let mut ok = true;
+    if info.si_signo as usize != signo
+        || signo != SIGINFO_EXPECT_SIGNO.load(Ordering::SeqCst)
+        || info.si_errno != 0
+        || info.si_code != SIGINFO_EXPECT_CODE.load(Ordering::SeqCst)
+    {
+        ok = false;
+    }
+    if signo == SIGSEGV {
+        if info.addr() != 0 {
+            ok = false;
+        }
+    } else if info.pid() as isize != getpid() || info.uid() != 0 {
+        ok = false;
+    }
+    if signo == SIGCHLD && info.si_status != 0 {
+        ok = false;
+    }
+    if uc.flags != 0 || uc.mcontext.gregs[0] != 0 || uc.mcontext.gregs[2] == 0 {
+        ok = false;
+    }
+    // The fixture is one static ELF: `.text` is the first segment at 0x10000.
+    let pc = uc.mcontext.pc as usize;
+    if !(0x1_0000..0x2_0000).contains(&pc) {
+        ok = false;
+    }
+    let expected_mask = SIGINFO_EXPECT_MASK.load(Ordering::SeqCst);
+    if expected_mask != 0 && (uc.sigmask as usize) & expected_mask != expected_mask {
+        ok = false;
+    }
+    ok
+}
+
+extern "C" fn siginfo_handler(signo: usize, info: *const SigInfo, uc: *const UContext) {
+    SIGINFO_OK.store(siginfo_matches(signo, info, uc) as usize, Ordering::SeqCst);
+    SIGINFO_HITS.fetch_add(1, Ordering::SeqCst);
+}
+
+/// SIGSEGV variant: it proves `si_addr` and the ucontext, then ends *its own*
+/// thread (returning through `rt_sigreturn` would re-execute the fault).
+extern "C" fn siginfo_segv_handler(signo: usize, info: *const SigInfo, uc: *const UContext) {
+    SIGINFO_OK.store(siginfo_matches(signo, info, uc) as usize, Ordering::SeqCst);
+    SIGINFO_HITS.fetch_add(1, Ordering::SeqCst);
+    let _ = syscall1(SYS_EXIT, 0);
+    loop {}
+}
+
+extern "C" fn siginfo_segv_child(_arg: usize) -> ! {
+    // SAFETY: the load is deliberate: address 0 is unmapped, and the kernel
+    // must deliver SIGSEGV with si_addr = 0 to the installed handler.
+    unsafe { core::ptr::read_volatile(0 as *const u64) };
+    let _ = syscall1(SYS_EXIT, 3);
+    loop {}
+}
+
+/// `SA_NODEFER`: the handler sends itself the same signal. Because the signal
+/// is not added to the mask, the nested delivery happens before this invocation
+/// returns, so the maximum depth is three (the third handler sends nothing).
+extern "C" fn nodefer_handler(signo: usize, _info: usize) {
+    let depth = NODEFER_HITS.fetch_add(1, Ordering::SeqCst) + 1;
+    if depth > NODEFER_MAX.load(Ordering::SeqCst) {
+        NODEFER_MAX.store(depth, Ordering::SeqCst);
+    }
+    let mut current = 0u64;
+    if rt_sigprocmask(SIG_BLOCK, core::ptr::null(), &mut current) == 0
+        && current & (1u64 << (signo - 1)) == 0
+    {
+        NODEFER_MASK_OK.store(1, Ordering::SeqCst);
+    }
+    if depth < 3 {
+        let _ = kill(NODEFER_PID.load(Ordering::SeqCst) as isize, SIGUSR1);
+    }
+}
+
+extern "C" fn resethand_handler(_signo: usize, _info: usize) {
+    RESETHAND_HITS.fetch_add(1, Ordering::SeqCst);
+}
+
+extern "C" fn restart_handler(_signo: usize, _info: usize) {
+    RESTART_HITS.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Block in `FUTEX_WAIT` with a 300 ms timeout. A `SA_RESTART` signal must
+/// re-enter the wait after the handler, so the observable result is
+/// `-ETIMEDOUT`, not `-EINTR`.
+extern "C" fn restart_entry(_arg: usize) -> ! {
+    RESTART_READY.store(1, Ordering::SeqCst);
+    let timeout = Timespec {
+        seconds: 0,
+        nanos: 300_000_000,
+    };
+    let result = futex_wait_word(
+        RESTART_GATE.as_ptr() as usize,
+        0,
+        &timeout as *const Timespec as usize,
+    );
+    RESTART_RESULT.store(result as usize, Ordering::SeqCst);
+    let _ = syscall1(SYS_EXIT, 0);
+    loop {}
+}
+
+/// Busy loop the job-control test stops and continues. It takes no syscalls,
+/// so only the timer tick can deliver the stop.
+extern "C" fn jog_entry(_arg: usize) -> ! {
+    JOG_READY.store(1, Ordering::SeqCst);
+    while JOG_STOP.load(Ordering::SeqCst) == 0 {
+        JOG_COUNTER.fetch_add(1, Ordering::SeqCst);
+        core::hint::spin_loop();
+    }
+    let _ = syscall1(SYS_EXIT, 0);
+    loop {}
+}
+
+/// Futex waiter used by the job-control test: a stop must wake it, stop it in
+/// the kernel, and SIGCONT must let the wait return `-EINTR`.
+extern "C" fn stop_wait_entry(_arg: usize) -> ! {
+    STOP_READY.store(1, Ordering::SeqCst);
+    let timeout = Timespec {
+        seconds: 0,
+        nanos: 300_000_000,
+    };
+    let result = futex_wait_word(
+        STOP_GATE.as_ptr() as usize,
+        0,
+        &timeout as *const Timespec as usize,
+    );
+    STOP_RESULT.store(result as usize, Ordering::SeqCst);
+    let _ = syscall1(SYS_EXIT, 0);
+    loop {}
+}
+
+fn null_action() -> *const SigAction {
+    core::ptr::null()
+}
+
+fn dfl_action() -> SigAction {
+    SigAction {
+        handler: SIG_DFL,
+        flags: 0,
+        mask: 0,
+        restorer: 0,
+    }
+}
+
+/// The extended signal acceptance: `sigaltstack` + `SA_ONSTACK`, the full
+/// `siginfo_t`/`ucontext` with `SA_SIGINFO`, `SA_NODEFER`, `SA_RESETHAND`,
+/// `SA_RESTART` and SIGSTOP/SIGTSTP/SIGCONT scheduler stops.
+fn signal_ext_section(stack: usize) {
+    let pid = getpid();
+    let tid = syscall1(SYS_GETTID, 0);
+    check(pid > 0 && tid > 0, 280, "getpid/gettid for extended signals");
+
+    // ── sigaltstack: validation, install, query, SS_DISABLE ──
+    let region = syscall6(
+        SYS_MMAP,
+        0,
+        0x4000,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        usize::MAX,
+        0,
+    );
+    check(region > 0, 281, "mmap alternate stack");
+    let alt_base = region as usize;
+    ALT_BASE.store(alt_base, Ordering::SeqCst);
+    ALT_TOP.store(alt_base + 0x4000, Ordering::SeqCst);
+
+    let mut old = SigAltStack {
+        ss_sp: 0,
+        ss_flags: 0,
+        _pad: 0,
+        ss_size: 0,
+    };
+    check(
+        sigaltstack(core::ptr::null(), &mut old) == 0 && old.ss_flags == SS_DISABLE,
+        282,
+        "sigaltstack initial query",
+    );
+    let too_small = SigAltStack {
+        ss_sp: alt_base,
+        ss_flags: 0,
+        _pad: 0,
+        ss_size: MINSIGSTKSZ - 1,
+    };
+    check(
+        sigaltstack(&too_small, core::ptr::null_mut()) == EINVAL,
+        283,
+        "sigaltstack below MINSIGSTKSZ",
+    );
+    let bad_flags = SigAltStack {
+        ss_sp: alt_base,
+        ss_flags: 3,
+        _pad: 0,
+        ss_size: 0x4000,
+    };
+    check(
+        sigaltstack(&bad_flags, core::ptr::null_mut()) == EINVAL,
+        284,
+        "sigaltstack bad flags",
+    );
+    let bad_pointer = SigAltStack {
+        ss_sp: 0xdead_0000,
+        ss_flags: 0,
+        _pad: 0,
+        ss_size: MINSIGSTKSZ,
+    };
+    check(
+        sigaltstack(&bad_pointer, core::ptr::null_mut()) == EFAULT,
+        285,
+        "sigaltstack unmapped range",
+    );
+    let install = SigAltStack {
+        ss_sp: alt_base,
+        ss_flags: 0,
+        _pad: 0,
+        ss_size: 0x4000,
+    };
+    check(
+        sigaltstack(&install, &mut old) == 0 && old.ss_flags == SS_DISABLE,
+        286,
+        "sigaltstack install",
+    );
+    check(
+        sigaltstack(core::ptr::null(), &mut old) == 0
+            && old.ss_sp == alt_base
+            && old.ss_size == 0x4000
+            && old.ss_flags == 0,
+        287,
+        "sigaltstack query installed",
+    );
+
+    let action = SigAction {
+        handler: altstack_handler as *const () as usize,
+        flags: SA_RESTORER | SA_ONSTACK,
+        mask: 0,
+        restorer: abi_sigrestorer as *const () as usize,
+    };
+    check(
+        rt_sigaction(SIGUSR1, &action, core::ptr::null_mut()) == 0,
+        288,
+        "install SA_ONSTACK handler",
+    );
+    ALT_HITS.store(0, Ordering::SeqCst);
+    ALT_HIT.store(0, Ordering::SeqCst);
+    ALT_ONSTACK.store(0, Ordering::SeqCst);
+    check(kill(pid, SIGUSR1) == 0, 289, "kill with SA_ONSTACK");
+    check(
+        ALT_HITS.load(Ordering::SeqCst) == 1
+            && ALT_HIT.load(Ordering::SeqCst) == 1
+            && ALT_ONSTACK.load(Ordering::SeqCst) == 1,
+        290,
+        "handler ran on the alternate stack",
+    );
+    check(
+        rt_sigaction(SIGUSR1, &dfl_action(), core::ptr::null_mut()) == 0,
+        291,
+        "restore SIGUSR1 after altstack",
+    );
+
+    // Disabling removes the stack; SA_ONSTACK then falls back to the normal
+    // stack, as POSIX permits. The handler still runs, just not inside the
+    // alternate range and with SS_DISABLE on the query.
+    let disable = SigAltStack {
+        ss_sp: 0,
+        ss_flags: SS_DISABLE,
+        _pad: 0,
+        ss_size: 0,
+    };
+    check(
+        sigaltstack(&disable, &mut old) == 0 && old.ss_flags == 0,
+        338,
+        "sigaltstack disable",
+    );
+    check(
+        sigaltstack(core::ptr::null(), &mut old) == 0 && old.ss_flags == SS_DISABLE,
+        339,
+        "sigaltstack disabled query",
+    );
+    check(
+        rt_sigaction(SIGUSR1, &action, core::ptr::null_mut()) == 0,
+        340,
+        "reinstall SA_ONSTACK without a stack",
+    );
+    ALT_HITS.store(0, Ordering::SeqCst);
+    ALT_HIT.store(0, Ordering::SeqCst);
+    ALT_ONSTACK.store(0, Ordering::SeqCst);
+    check(kill(pid, SIGUSR1) == 0, 341, "kill SA_ONSTACK fallback");
+    check(
+        ALT_HITS.load(Ordering::SeqCst) == 1
+            && ALT_HIT.load(Ordering::SeqCst) == 0
+            && ALT_ONSTACK.load(Ordering::SeqCst) == 0,
+        342,
+        "SA_ONSTACK fell back to the normal stack",
+    );
+    check(
+        rt_sigaction(SIGUSR1, &dfl_action(), core::ptr::null_mut()) == 0,
+        343,
+        "restore SIGUSR1 after altstack fallback",
+    );
+    print("abi: altstack ok\n");
+
+    // ── siginfo + ucontext through SA_SIGINFO ──
+    SIGINFO_EXPECT_SIGNO.store(SIGUSR1, Ordering::SeqCst);
+    SIGINFO_EXPECT_CODE.store(SI_USER, Ordering::SeqCst);
+    SIGINFO_EXPECT_MASK.store(
+        (1 << (SIGUSR1 - 1)) | (1 << (SIGUSR2 - 1)),
+        Ordering::SeqCst,
+    );
+    SIGINFO_OK.store(1, Ordering::SeqCst);
+    SIGINFO_HITS.store(0, Ordering::SeqCst);
+    let info_action = SigAction {
+        handler: siginfo_handler as *const () as usize,
+        flags: SA_RESTORER | SA_SIGINFO,
+        mask: 1 << (SIGUSR2 - 1),
+        restorer: abi_sigrestorer as *const () as usize,
+    };
+    check(
+        rt_sigaction(SIGUSR1, &info_action, core::ptr::null_mut()) == 0,
+        292,
+        "install SA_SIGINFO handler",
+    );
+    check(kill(pid, SIGUSR1) == 0, 293, "kill for SA_SIGINFO");
+    check(
+        SIGINFO_HITS.load(Ordering::SeqCst) == 1 && SIGINFO_OK.load(Ordering::SeqCst) == 1,
+        294,
+        "siginfo from kill",
+    );
+    SIGINFO_EXPECT_CODE.store(SI_TKILL, Ordering::SeqCst);
+    check(tgkill(pid as usize, tid as usize, SIGUSR1) == 0, 295, "tgkill for SA_SIGINFO");
+    check(
+        SIGINFO_HITS.load(Ordering::SeqCst) == 2 && SIGINFO_OK.load(Ordering::SeqCst) == 1,
+        296,
+        "siginfo code SI_TKILL",
+    );
+
+    // SIGCHLD is only reachable through kill here; its si_status must be 0.
+    SIGINFO_EXPECT_SIGNO.store(SIGCHLD, Ordering::SeqCst);
+    SIGINFO_EXPECT_CODE.store(SI_USER, Ordering::SeqCst);
+    SIGINFO_EXPECT_MASK.store(0, Ordering::SeqCst);
+    let chld_action = SigAction {
+        handler: siginfo_handler as *const () as usize,
+        flags: SA_RESTORER | SA_SIGINFO,
+        mask: 0,
+        restorer: abi_sigrestorer as *const () as usize,
+    };
+    check(
+        rt_sigaction(SIGCHLD, &chld_action, core::ptr::null_mut()) == 0,
+        297,
+        "install SIGCHLD handler",
+    );
+    check(kill(pid, SIGCHLD) == 0, 298, "kill SIGCHLD");
+    check(
+        SIGINFO_HITS.load(Ordering::SeqCst) == 3 && SIGINFO_OK.load(Ordering::SeqCst) == 1,
+        299,
+        "siginfo fields for SIGCHLD",
+    );
+    check(
+        rt_sigaction(SIGCHLD, &dfl_action(), core::ptr::null_mut()) == 0,
+        300,
+        "restore SIGCHLD",
+    );
+
+    // A synchronous fault carries si_addr; the child ends its own thread.
+    SIGINFO_EXPECT_SIGNO.store(SIGSEGV, Ordering::SeqCst);
+    SIGINFO_EXPECT_CODE.store(SEGV_MAPERR, Ordering::SeqCst);
+    SIGINFO_EXPECT_MASK.store(0, Ordering::SeqCst);
+    SIGINFO_OK.store(1, Ordering::SeqCst);
+    SIGINFO_HITS.store(0, Ordering::SeqCst);
+    let segv_action = SigAction {
+        handler: siginfo_segv_handler as *const () as usize,
+        flags: SA_RESTORER | SA_SIGINFO,
+        mask: 0,
+        restorer: abi_sigrestorer as *const () as usize,
+    };
+    check(
+        rt_sigaction(SIGSEGV, &segv_action, core::ptr::null_mut()) == 0,
+        301,
+        "install SA_SIGINFO SIGSEGV",
+    );
+    let segv_tid = spawn_thread(
+        THREAD_FLAGS,
+        stack,
+        siginfo_segv_child as *const () as usize,
+        0,
+    );
+    check(segv_tid > 0, 302, "spawn SA_SIGINFO faulting thread");
+    wait_millis(
+        || SIGINFO_HITS.load(Ordering::SeqCst) == 1,
+        1000,
+        303,
+        "SA_SIGINFO SIGSEGV handler ran",
+    );
+    wait_millis(
+        || kill(segv_tid, 0) == ESRCH,
+        1000,
+        304,
+        "SA_SIGINFO faulting thread exited",
+    );
+    check(SIGINFO_OK.load(Ordering::SeqCst) == 1, 305, "si_addr/ucontext for SIGSEGV");
+    check(
+        rt_sigaction(SIGSEGV, &dfl_action(), core::ptr::null_mut()) == 0,
+        306,
+        "restore SIGSEGV",
+    );
+    check(
+        rt_sigaction(SIGUSR1, &dfl_action(), core::ptr::null_mut()) == 0,
+        307,
+        "restore SIGUSR1 after SA_SIGINFO",
+    );
+    print("abi: siginfo ok\n");
+
+    // ── SA_NODEFER: recursive self-delivery with the own bit unblocked ──
+    NODEFER_HITS.store(0, Ordering::SeqCst);
+    NODEFER_MAX.store(0, Ordering::SeqCst);
+    NODEFER_MASK_OK.store(0, Ordering::SeqCst);
+    NODEFER_PID.store(pid as usize, Ordering::SeqCst);
+    let nodefer_action = SigAction {
+        handler: nodefer_handler as *const () as usize,
+        flags: SA_RESTORER | SA_NODEFER,
+        mask: 0,
+        restorer: abi_sigrestorer as *const () as usize,
+    };
+    check(
+        rt_sigaction(SIGUSR1, &nodefer_action, core::ptr::null_mut()) == 0,
+        308,
+        "install SA_NODEFER",
+    );
+    check(kill(pid, SIGUSR1) == 0, 309, "kill for SA_NODEFER");
+    check(
+        NODEFER_HITS.load(Ordering::SeqCst) == 3
+            && NODEFER_MAX.load(Ordering::SeqCst) == 3
+            && NODEFER_MASK_OK.load(Ordering::SeqCst) == 1,
+        310,
+        "SA_NODEFER nested delivery",
+    );
+    check(
+        rt_sigaction(SIGUSR1, &dfl_action(), core::ptr::null_mut()) == 0,
+        311,
+        "restore after SA_NODEFER",
+    );
+
+    // ── SA_RESETHAND: the disposition is SIG_DFL by the time we query it ──
+    RESETHAND_HITS.store(0, Ordering::SeqCst);
+    let reset_action = SigAction {
+        handler: resethand_handler as *const () as usize,
+        flags: SA_RESTORER | SA_RESETHAND,
+        mask: 0,
+        restorer: abi_sigrestorer as *const () as usize,
+    };
+    check(
+        rt_sigaction(SIGUSR1, &reset_action, core::ptr::null_mut()) == 0,
+        312,
+        "install SA_RESETHAND",
+    );
+    check(kill(pid, SIGUSR1) == 0, 313, "kill for SA_RESETHAND");
+    let mut after = SigAction {
+        handler: 0,
+        flags: 0,
+        mask: 0,
+        restorer: 0,
+    };
+    check(
+        rt_sigaction(SIGUSR1, null_action(), &mut after) == 0
+            && RESETHAND_HITS.load(Ordering::SeqCst) == 1
+            && after.handler == SIG_DFL
+            && after.flags == 0,
+        314,
+        "SA_RESETHAND reset to SIG_DFL",
+    );
+
+    // ── SA_RESTART: the interrupted futex wait is re-entered ──
+    RESTART_READY.store(0, Ordering::SeqCst);
+    RESTART_RESULT.store(0, Ordering::SeqCst);
+    RESTART_HITS.store(0, Ordering::SeqCst);
+    let restart_action = SigAction {
+        handler: restart_handler as *const () as usize,
+        flags: SA_RESTORER | SA_RESTART,
+        mask: 0,
+        restorer: abi_sigrestorer as *const () as usize,
+    };
+    check(
+        rt_sigaction(SIGUSR2, &restart_action, core::ptr::null_mut()) == 0,
+        315,
+        "install SA_RESTART",
+    );
+    let restart_tid = spawn_thread(
+        THREAD_FLAGS,
+        stack,
+        restart_entry as *const () as usize,
+        0,
+    );
+    check(restart_tid > 0, 316, "spawn SA_RESTART waiter");
+    wait_millis(
+        || RESTART_READY.load(Ordering::SeqCst) == 1,
+        1000,
+        317,
+        "SA_RESTART waiter ready",
+    );
+    let settle = Timespec {
+        seconds: 0,
+        nanos: 30_000_000,
+    };
+    let _ = syscall2(SYS_NANOSLEEP, &settle as *const Timespec as usize, 0);
+    check(kill(restart_tid, SIGUSR2) == 0, 318, "kill SA_RESTART waiter");
+    wait_millis(
+        || kill(restart_tid, 0) == ESRCH,
+        2000,
+        319,
+        "SA_RESTART waiter exited",
+    );
+    check(
+        RESTART_HITS.load(Ordering::SeqCst) == 1
+            && RESTART_RESULT.load(Ordering::SeqCst) as isize == ETIMEDOUT,
+        320,
+        "SA_RESTART re-entered futex wait",
+    );
+    check(
+        rt_sigaction(SIGUSR2, &dfl_action(), core::ptr::null_mut()) == 0,
+        321,
+        "restore SIGUSR2 after SA_RESTART",
+    );
+
+    // ── job control: SIGSTOP freezes a busy thread, SIGCONT resumes it ──
+    JOG_STOP.store(0, Ordering::SeqCst);
+    JOG_COUNTER.store(0, Ordering::SeqCst);
+    JOG_READY.store(0, Ordering::SeqCst);
+    let jog = spawn_thread(THREAD_FLAGS, stack, jog_entry as *const () as usize, 0);
+    check(jog > 0, 322, "spawn job-control thread");
+    wait_millis(
+        || JOG_READY.load(Ordering::SeqCst) == 1,
+        1000,
+        323,
+        "job-control thread ready",
+    );
+    let startup = Timespec {
+        seconds: 0,
+        nanos: 30_000_000,
+    };
+    let _ = syscall2(SYS_NANOSLEEP, &startup as *const Timespec as usize, 0);
+    check(JOG_COUNTER.load(Ordering::SeqCst) > 0, 324, "job-control thread runs");
+    check(kill(jog, SIGSTOP) == 0, 325, "kill SIGSTOP");
+    let paused = Timespec {
+        seconds: 0,
+        nanos: 60_000_000,
+    };
+    let _ = syscall2(SYS_NANOSLEEP, &paused as *const Timespec as usize, 0);
+    let frozen = JOG_COUNTER.load(Ordering::SeqCst);
+    let _ = syscall2(SYS_NANOSLEEP, &paused as *const Timespec as usize, 0);
+    check(
+        JOG_COUNTER.load(Ordering::SeqCst) == frozen,
+        326,
+        "SIGSTOP froze the thread",
+    );
+    check(kill(jog, 0) == 0, 327, "stopped thread still exists");
+    check(kill(jog, SIGCONT) == 0, 328, "kill SIGCONT");
+    wait_millis(
+        || JOG_COUNTER.load(Ordering::SeqCst) > frozen,
+        1000,
+        329,
+        "SIGCONT resumed the thread",
+    );
+    JOG_STOP.store(1, Ordering::SeqCst);
+    wait_millis(
+        || kill(jog, 0) == ESRCH,
+        1000,
+        330,
+        "job-control thread exited",
+    );
+
+    // A futex waiter stopped by SIGTSTP must not return while stopped; the
+    // SIGCONT lets it return `-EINTR`.
+    STOP_READY.store(0, Ordering::SeqCst);
+    STOP_RESULT.store(0, Ordering::SeqCst);
+    let waiter = spawn_thread(
+        THREAD_FLAGS,
+        stack,
+        stop_wait_entry as *const () as usize,
+        0,
+    );
+    check(waiter > 0, 331, "spawn stopped futex waiter");
+    wait_millis(
+        || STOP_READY.load(Ordering::SeqCst) == 1,
+        1000,
+        332,
+        "stopped futex waiter ready",
+    );
+    let settle = Timespec {
+        seconds: 0,
+        nanos: 30_000_000,
+    };
+    let _ = syscall2(SYS_NANOSLEEP, &settle as *const Timespec as usize, 0);
+    check(kill(waiter, SIGTSTP) == 0, 333, "kill SIGTSTP");
+    let paused = Timespec {
+        seconds: 0,
+        nanos: 30_000_000,
+    };
+    let _ = syscall2(SYS_NANOSLEEP, &paused as *const Timespec as usize, 0);
+    check(
+        kill(waiter, 0) == 0 && STOP_RESULT.load(Ordering::SeqCst) == 0,
+        334,
+        "stopped futex waiter is parked",
+    );
+    check(kill(waiter, SIGCONT) == 0, 335, "SIGCONT the futex waiter");
+    wait_millis(
+        || kill(waiter, 0) == ESRCH,
+        1000,
+        336,
+        "continued futex waiter exited",
+    );
+    check(
+        STOP_RESULT.load(Ordering::SeqCst) as isize == EINTR,
+        337,
+        "futex wait reported EINTR after stop/continue",
+    );
+    print("abi: jobcontrol ok\n");
 }
 
 // ─── the fixture ───────────────────────────────────────────────────────────
@@ -2251,6 +3012,7 @@ pub extern "C" fn abi_main() -> i32 {
     //    without /mnt; the child threads above have all exited, so kill(0) and
     //    kill(-1) address exactly the main thread) ──
     signal_section(thread_stack);
+    signal_ext_section(thread_stack);
 
     // ── the filesystem half: skip when the selftest could not provide /mnt ──
     let path = b"/mnt/abi-syscalls.txt\0";

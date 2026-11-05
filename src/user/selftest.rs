@@ -567,6 +567,10 @@ fn user_abi_syscalls(_buf: &mut Vec<u8>) -> Outcome {
         || signals.sigreturns <= signals_before.sigreturns
         || signals.delivered <= signals_before.delivered
         || signals.ignored <= signals_before.ignored
+        || signals.altstacks <= signals_before.altstacks
+        || signals.stops <= signals_before.stops
+        || signals.continues <= signals_before.continues
+        || signals.restarts <= signals_before.restarts
     {
         crate::kprintln!(
             "[selftest] user: signal counters did not move as expected (before {:?}, after {:?})",
@@ -589,6 +593,7 @@ fn user_abi_syscalls(_buf: &mut Vec<u8>) -> Outcome {
     if crate::user::signal::live_handlers() != 0
         || crate::user::signal::live_threads() != 0
         || crate::user::signal::live_pending() != 0
+        || crate::task::scheduler::stopped_tasks() != 0
     {
         crate::kprintln!(
             "[selftest] user: the ABI run left signal state ({} handler(s), {} thread(s), {} pending)",
