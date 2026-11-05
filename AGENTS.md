@@ -103,7 +103,7 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
   (+ `src/drivers/README.md`), `fs/{ext2,format_policy,selftest}.rs`
   (+ `src/fs/README.md`), `vfs/mod.rs` (+ `src/vfs/README.md`),
   `task/{mod,scheduler,selftest}.rs` (+ `src/task/README.md`),
-  `user/{mod,elf,syscall,selftest,futex}.rs` (+ `src/user/README.md`),
+  `user/{mod,signal,elf,syscall,selftest,futex}.rs` (+ `src/user/README.md`),
   `net/{mod,wire,dhcp,dns,tcp,selftest}.rs` (+ `src/net/README.md`),
   `pkg/{mod,sha256}.rs` (+ `src/pkg/README.md`), `console.rs`, `shell.rs`,
   `sync.rs`.
@@ -319,7 +319,8 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
 
 What exists: the in-QEMU suites (shell `selftest`: 7 memory + 4 block/pointer + 11 ext2/VFS
 + 4 interrupt/timer + 5 scheduler + 10 user-mode (including the native
-thread/futex section) + 11 network checks, idempotent, each group prints a
+thread/futex and the signal/altstack/siginfo/job-control sections) + 11 network
+checks, idempotent, each group prints a
 free-frame ledger), the headless QEMU smoke driver in six
 modes (serial, ramfb, disk-fresh, disk-existing, `--net`, `--keyboard`) — every mode attaches a
 virtio-tablet and the boot log must carry `virtio-input: tablet at 0x…` — including the M5
@@ -333,8 +334,11 @@ from `userland/argv.elf` captured from U-mode `write`, `userland/abi.elf`
 calling every syscall, including the mutation family (it exits 77 and becomes a
 SKIP when `/mnt` is absent after the filesystem-independent half passed; with a
 disk it creates, renames, hard-links, symlinks, truncates, unlinks and
-mkdir/rmdir's entries under `/mnt`, and the kernel verifies they are gone) and
-the socket section (bad args/EBADF always; `connect` to `10.0.2.2:8000` plus
+mkdir/rmdir's entries under `/mnt`, and the kernel verifies they are gone), the
+signal sections (markers `abi: altstack ok`, `abi: siginfo ok`,
+`abi: jobcontrol ok`; the kernel requires the altstack/stop/continue/restart
+counters to move and no live handler, pending bit or `Stopped` task to survive)
+and the socket section (bad args/EBADF always; `connect` to `10.0.2.2:8000` plus
 send/recv/shutdown/EOF only when a host server is listening, otherwise a
 `SKIP`, never a failure). `run demo` must print
 `run: demo exited with code 42`, `run fault` must be killed with cause 13 while
@@ -429,7 +433,7 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
 | The pointer/keyboard have **no IRQ**: both are polled from the shell's idle loop | a long-running command (or a blocking wait that does not poll) freezes the cursor and drops typed bytes; do not put input polling in a place that never returns to the idle loop |
 | The keyboard translates **US layout only** and ignores arrows/Home/End/dead keys | a program needing another layout or key semantics needs a keymap layer, not a driver tweak |
 | Clicks/selection are not consumed: `BTN_LEFT` is read and stored, nothing acts on it | mouse-driven editing/selection is a UI milestone, not a driver change |
-| One address space, one ASID: user pages carry `U=1` in the kernel's single Sv39 tree | two user programs are not isolated from each other; no per-process `satp`; `brk` is one fixed 1 MiB window, no `mmap`, `fork`/`exec`/signals; 16 fds, console reads are non-blocking (`-EAGAIN`), `getdents64` is a snapshot taken at `openat`, `openat`/`mkdirat` ignore `mode` and `fchmodat` is a per-run override never written to the inode or enforced; `run <path>` streams from the VFS and accepts images up to 1 MiB (`MAX_IMAGE_BYTES`), one image at a time |
+| One address space, one ASID: user pages carry `U=1` in the kernel's single Sv39 tree | two user programs are not isolated from each other; no per-process `satp`; `brk` is one fixed 1 MiB window, `fork`/`exec`/`wait` are another workstream; 16 fds, console reads are non-blocking (`-EAGAIN`), `getdents64` is a snapshot taken at `openat`, `openat`/`mkdirat` ignore `mode` and `fchmodat` is a per-run override never written to the inode or enforced; `run <path>` streams from the VFS and accepts images up to 1 MiB (`MAX_IMAGE_BYTES`), one image at a time |
 | The filesystem has **no journal** (M5 deliberately skipped the x86 WAL) | a power cut between two writes can leave an operation half-applied; do not claim crash consistency |
 | One block device slot, no partitions/hot-plug | a second disk is a design change, not a registration |
 | Formatting is the only destructive operation and is gated by `format_policy` | never format "to recover": a failed mount is not permission to erase |
@@ -437,6 +441,7 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
 | Screenshot pixels are not gated in CI yet (`--check-font` returns a non-zero code) | wiring it into the smoke job is an open task, not a reason to trust a shot by eye |
 | No host tests; state coverage is `selftest` only | you own the verification: extend the smoke driver or add a `SELFTEST` routine (the M6b suite is `src/user/selftest.rs`) |
 | Threads are a native MVP: `clone` with explicit entry, no TLS/`CLONE_SETTLS`, no join/waitid, no priorities or PI futexes, max 14 live threads per run | libc's `clone` wrapper cannot be mapped one-to-one; document the native signature and keep the futex table static (32 waiters / 16 addresses) rather than growing it silently |
+| Signals are a documented subset: no `sigqueue`/`sival_ptr`/queued signals, no SIGFPE producer, no tty/process groups, `SA_RESTART` only for `futex`/`nanosleep` (full timeout again), `SIGCHLD` has no child-exit source (si_status 0), and `kill(0, SIGSTOP)` can park a whole run | the frame/`siginfo_t`/`ucontext_t` layouts are the ABI (see invariant 41) and must move with `docs/architecture.md` + `userland/abi.rs`; do not claim Linux signal semantics, and add queueing/tty/process-group state as a real design change rather than a flag |
 | 19 compiler warnings remain (unused diagnostic helpers, `trap_entry as usize`, …) | do not add more; warning-cleanup PRs are welcome |
 | No `LICENSE` file although `Cargo.toml` says MIT | do not add a license your work does not own |
 | `src/memory/paging.rs` owns the only page table; `src/arch/riscv64/mmu.rs` is encoding only | do not map over the kernel image or drop the identity map while a device holds a physical address |
@@ -563,3 +568,26 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
     main thread's code if it already exited, otherwise the caller's. A fault is
     an `Exit::Fault` for the whole run. Do not make `exit` call
     `kill_group`, and do not let a thread return to U-mode after either call.
+
+41. **Signals deliver one fixed user frame; alt stacks and stops are scheduler
+    state.** The frame is 736 bytes below `sp` (or below the alternate-stack
+    top): saved `TrapFrame`, mask, magic, restorer, 128-byte `siginfo_t`,
+    `prev_frame`, signum, 288-byte `ucontext_t`, frame flags. The offsets are
+    asserted in `src/user/signal.rs` and documented in `docs/architecture.md`
+    §9.3; change both with `userland/abi.rs` in one commit. `siginfo_t` is
+    pagh's own (signo/errno/code at 0/4/8, `si_pid`+`si_uid` or `si_addr` at
+    16, `si_status` at 24) and `ucontext_t` is flags/link/sigmask followed by
+    32 `gregs` and `pc`. `SA_SIGINFO` selects the three-argument handler; without
+    it the native `(signo, *siginfo)` convention stays. Every page of the frame
+    and of the alternate-stack range is validated `U|R|W` before the copy: a bad
+    stack is a clean signal death, never a kernel fault. `sigaltstack` is
+    per-thread; `SS_ONSTACK` means `alt_active > 0`; nested delivery while
+    already on the alternate stack does not re-switch, and `rt_sigreturn` pops
+    exactly the level the frame recorded. Job control stops only the running
+    thread from its own `default_action` (`scheduler::stop_current`), never by
+    editing another task's context from `kill`; `State::Stopped` is not in the
+    ready queue, `wake_task` must not wake it, `SIGCONT` is `continue_task` plus
+    clearing pending stop bits, and `kill_group`/liveness scans include it.
+    `SA_RESTART` is honoured only for `futex`/`nanosleep` by leaving `sepc` on
+    the `ecall` and `a0` untouched; do not extend it to other syscalls without
+    an explicit restart contract.

@@ -46,13 +46,14 @@
 | `shell.rs` | цикл консоли, редактор строки, команды |
 | `arch/riscv64/switch.rs` | второй ABI ядра: `TaskContext` (ra/sp/s0–s11) и `task_switch` |
 | `task/mod.rs` | фасад планировщика |
-| `task/scheduler.rs` | таблица потоков, ready-queue, квант, стеки из PMM, `tick`/`yield`/`exit`/`reap`, `block_current`/`wake_task`/`kill_group`/`spawn_user_thread`, вытеснение таймером |
+| `task/scheduler.rs` | таблица потоков, ready-queue, квант, стеки из PMM, `tick`/`yield`/`exit`/`reap`, `block_current`/`wake_task`/`kill_group`/`spawn_user_thread`, `State::Stopped` + `stop_current`/`continue_task`/`stopped_tasks` для job control, вытеснение таймером |
 | `task/selftest.rs` | пять проверок планировщика для `selftest` |
 | `user/mod.rs` | `run_image`/`run_file`: ELF → user-стек → SysV-кадр `argc/argv/envp` → главный поток группы → `sret` в U-mode → ожидание `threads == 0` → reap; `brk`-heap, `on_fault` (убивает группу), `exit_thread`/`exit_group`, capture для ABI-теста; встроенные hello/fault/spin/argv/abi |
+| `user/signal.rs` | POSIX-подобные сигналы: `kill`/`tgkill`/`sigaltstack`/`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`, per-run обработчики, per-thread pending/blocked/altstack, кадр 736 B с `siginfo`/`ucontext`, `SA_SIGINFO`/`SA_ONSTACK`/`SA_NODEFER`/`SA_RESETHAND`/`SA_RESTART`, синхронные SIGSEGV/SIGILL/SIGBUS/SIGTRAP, job-control остановка/продолжение |
 | `user/futex.rs` | статическая futex-очередь: 32 ожидающих на 16 адресов, ключ `(run, uaddr)`, `wait`/`wake`/`clear_run` поверх `block_current`/`wake_task` |
 | `user/elf.rs` | ELF64-загрузчик: валидация до первого кадра, `PT_LOAD` с `U=1`, потоковые сегменты кусками ≤ 512 B, откат кадров, `Loaded`/`ElfError` |
-| `user/syscall.rs` | native ABI: `read`/`write`/`openat`/`close`/`lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/`readlinkat`/`exit`/`exit_group`/`set_tid_address`/`futex`/`sched_yield`/`getpid`/`gettid`/`clone` + мутации `mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`/`ftruncate` + сокеты `socket`/`connect`/`sendto`/`recvfrom`/`setsockopt`/`getsockopt`/`shutdown`; fd-таблица (включая `FdEntry::Socket`) и таблица режимов на прогон, `copy_from_user`/`copy_to_user`, `sepc+4` |
-| `user/selftest.rs` | десять проверок user-mode для `selftest` (argv-строка, все syscall'ы ABI + потоки/futex, ELF-матрица, fault, таймер, 100 KiB) |
+| `user/syscall.rs` | native ABI: `read`/`write`/`openat`/`close`/`lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/`readlinkat`/`exit`/`exit_group`/`set_tid_address`/`futex`/`sched_yield`/`getpid`/`gettid`/`clone` + сигналы `kill`/`tgkill`/`sigaltstack`/`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn` + мутации `mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`/`ftruncate` + сокеты `socket`/`connect`/`sendto`/`recvfrom`/`setsockopt`/`getsockopt`/`shutdown`; fd-таблица (включая `FdEntry::Socket`) и таблица режимов на прогон, `copy_from_user`/`copy_to_user`, `sepc+4` |
+| `user/selftest.rs` | десять проверок user-mode для `selftest` (argv-строка, все syscall'ы ABI + потоки/futex + сигналы/altstack/siginfo/job control, ELF-матрица, fault, таймер, 100 KiB) |
 | `net/mod.rs` | сетевой стек: состояние, ARP-кэш, `poll()`, диспетчер ARP/IPv4/ICMP/UDP/TCP, `ping`, DHCP-конфигурация |
 | `net/wire.rs` | чистые форматы Ethernet/ARP/IPv4/ICMP/UDP/TCP/DHCP/DNS и контрольные суммы (без устройства и часов) |
 | `net/dhcp.rs` | DHCP-клиент DISCOVER/OFFER/REQUEST/ACK |

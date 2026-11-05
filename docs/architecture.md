@@ -547,7 +547,7 @@ User-страницы кладутся в **ту же** Sv39-карту с `U=1`
 | 80 | `fstat` | нативный `Stat` (24 B): mode/kind/size/ino; синтетика — 0o755/0o644 |
 | 61 | `getdents64` | снимок детей на `openat`; `Dirent` = 12 B заголовок + имя, выравнивание 8; курсор двигается только за скопированные записи |
 | 78 | `readlinkat` | цель ссылки без NUL (`lookup_path`, последняя ссылка не разыменовывается); не ссылка — `-EINVAL` |
-| 101 | `nanosleep` | `Timespec` проверяется, округляется вверх до тика; ждёт `timer::sleep_ticks` с временно разрешёнными прерываниями (иначе тики не идут), `rem` игнорируется; deliverable-сигнал прерывает сон по одному тику за раз и возвращает `-EINTR` |
+| 101 | `nanosleep` | `Timespec` проверяется, округляется вверх до тика; ждёт `timer::sleep_ticks` с временно разрешёнными прерываниями (иначе тики не идут), `rem` игнорируется; deliverable-сигнал прерывает сон по одному тику за раз и возвращает `-EINTR`, а при `SA_RESTART` — перезапускает `ecall` (9.3) |
 | 113 | `clock_gettime` | id 0/1 — тиковое время (`Timespec`, 10 ms); иначе `-EINVAL` |
 | 160 | `uname` | 5×16 B: `pagh`, `pagh-riscv`, `0.10.0`, версия пакета, `riscv64` |
 | 214 | `brk` | окно 1 MiB в `0x2000_0000..0x2010_0000`, постранично из PMM, кадры в `RunState`; за окном — `-ENOMEM`, частичный рост откатывается |
@@ -559,11 +559,12 @@ User-страницы кладутся в **ту же** Sv39-карту с `U=1`
 | 172 | `getpid` | id главного потока прогона |
 | 178 | `gettid` | id вызывающего потока |
 | 220 | `clone` | `clone(flags, stack, entry, arg)`: `CLONE_VM|CLONE_THREAD` обязательны, `CLONE_SETTLS` — `-ENOTSUP`; ребёнок стартует на `entry(arg)` и не возвращается из syscall |
-| 129 | `kill` | `pid > 0` — tid потока прогона, `0`/`-1` — все живые потоки; `SIGSTOP`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU` — `-ENOSYS` (job control нет); `sig = 0` — проверка существования; иначе `-ESRCH`/`-EINVAL` (9.3) |
-| 131 | `tgkill` | `tgid == getpid()`, `tid` — живой поток прогона; иначе `-ESRCH`; доставка как у `kill` |
-| 134 | `rt_sigaction` | `struct sigaction { handler, flags, mask, restorer }` (32 B), `sigsetsize = 8`; `SIG_DFL`/`SIG_IGN`/функция+`SA_RESTORER`; SIGKILL/SIGSTOP — `-EINVAL`; таблица 1..31 на прогон |
+| 129 | `kill` | `pid > 0` — tid потока прогона, `0`/`-1` — все живые потоки; `sig = 0` — проверка существования; SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU с `SIG_DFL` паркуют поток (`State::Stopped`), SIGCONT возобновляет; иначе `-ESRCH`/`-EINVAL` (9.3) |
+| 131 | `tgkill` | `tgid == getpid()`, `tid` — живой поток прогона; иначе `-ESRCH`; доставка как у `kill`, `si_code = SI_TKILL` |
+| 132 | `sigaltstack` | 24-байтный `SigAltStack`; per-thread стек, `SS_DISABLE`/`SS_ONSTACK`, `MINSIGSTKSZ = 4096`, полная проверка `U|R|W`; `-EINVAL`/`-EFAULT` (9.3) |
+| 134 | `rt_sigaction` | `struct sigaction { handler, flags, mask, restorer }` (32 B), `sigsetsize = 8`; `SIG_DFL`/`SIG_IGN`/функция+`SA_RESTORER`; `SA_SIGINFO`/`SA_ONSTACK`/`SA_RESTART`/`SA_NODEFER`/`SA_RESETHAND`; SIGKILL/SIGSTOP — `-EINVAL`; таблица 1..31 на прогон |
 | 135 | `rt_sigprocmask` | `SIG_BLOCK`/`UNBLOCK`/`SETMASK`, маска 8 B (бит `n-1`), per-thread; SIGKILL/SIGSTOP не блокируются; `oldset` до установки |
-| 139 | `rt_sigreturn` | проверка кадра `U|R`, magic и активного указателя; восстановление `TrapFrame`, маски и безопасного `sstatus`; `sepc` не сдвигается; без кадра — `-EINVAL`, плохой указатель — `-EFAULT` |
+| 139 | `rt_sigreturn` | проверка кадра `U|R` (736 B), magic/signum/flags и активного указателя; восстановление `TrapFrame`, маски, глубины alt-стека и безопасного `sstatus`; `sepc` не сдвигается; без кадра — `-EINVAL`, плохой указатель — `-EFAULT` |
 | 34 | `mkdirat` | `dirfd`/`mode` игнорируются; `create_dir` родителя; 0o755 — дефолт VFS |
 | 35 | `unlinkat` | 0 — файл/ссылка (`lookup_path`, без разыменования последней ссылки), `0x200` — пустой каталог; тип проверяется до мутации: `-EISDIR`/`-ENOTDIR`, непустой — `-ENOTEMPTY` |
 | 36 | `symlinkat` | `a0` — цель (сырые байты, не резолвится), `a2` — путь; `create_symlink` |
@@ -732,29 +733,80 @@ wait/wake-rendezvous, `exit` не-главного потока и `exit_group` 
 Реализация — `src/user/signal.rs`; это **не** Linux-сигналы: структуры и порядок
 полей свои, и документированы здесь. Один прогон — один процесс: таблица
 обработчиков (1..=31) живёт в прогоне и сбрасывается в `run_source`
-(`signal::begin_run`) и после teardown (`signal::clear_run`); pending-биты и
-blocked-маски — у каждого потока (`ThreadSignal`, до `MAX_TASKS` записей).
+(`signal::begin_run`) и после teardown (`signal::clear_run`); pending-биты,
+blocked-маски, alt-стек и указатель на активный кадр — у каждого потока
+(`ThreadSignal`, до `MAX_TASKS` записей). С идентификатором pending-сигнала
+хранятся `si_pid`/`si_uid`/`si_code` отправителя: доставка происходит позже
+`kill`, и `siginfo` должен помнить, кто и как его послал.
 
-**Syscall'ы** `kill` (129), `tgkill` (131), `rt_sigaction` (134),
-`rt_sigprocmask` (135), `rt_sigreturn` (139). `struct sigaction` —
-`{ handler, flags, mask, restorer }` (32 B, порядок pagh, не Linux). Для
-функции-обработчика обязателен `SA_RESTORER=0x04000000` и restorer в
-user-странице `U|X`; другие биты `flags` — `-EINVAL` (нет `SA_RESTART`,
-`SA_NODEFER`, `SA_RESETHAND`, `SA_SIGINFO`). `SIG_DFL=0`, `SIG_IGN=1`.
-`rt_sigprocmask` принимает `sigsetsize = 8`; сигнал `n` — бит `n-1`; биты
-SIGKILL/SIGSTOP отбрасываются; `oldset` пишется до изменения маски.
+**Syscall'ы** `kill` (129), `tgkill` (131), `sigaltstack` (132),
+`rt_sigaction` (134), `rt_sigprocmask` (135), `rt_sigreturn` (139).
+`struct sigaction` — `{ handler, flags, mask, restorer }` (32 B, порядок pagh, не
+Linux). Для функции-обработчика обязательны `SA_RESTORER=0x04000000` и restorer в
+user-странице `U|X`. Остальные допустимые биты:
 
-**Доставка.** `kill`/`tgkill` только помечают pending (и `wake_task`, если
-`pending & !blocked` непусто); обработчик ставится на границе kernel→user —
-после syscall'а или после trap'а из U-mode (включая тик). Отсюда два следствия:
-работающий поток получает сигнал не позже одного тика, а `futex`-ожидание
-прерывается (`-EINTR`), потому что woken-поток проверяет pending сразу после
-`block_current`. `nanosleep` сам проверяет pending раз в тик и тоже возвращает
-`-EINTR`; `read(0)` неблокирующий, поэтому его сигнал не «прерывает» — он и так
-возвращает `-EAGAIN`. Заблокированный сигнал остаётся pending и доставляется
-после `rt_sigprocmask(SIG_UNBLOCK)`.
+| флаг | значение | смысл |
+|---|---:|---|
+| `SA_SIGINFO` | `0x00000004` | `handler(signo, *siginfo, *ucontext)` вместо `handler(signo, *siginfo)` |
+| `SA_ONSTACK` | `0x08000000` | доставка на per-thread alt-стек, если он установлен; иначе обычный стек |
+| `SA_RESTART` | `0x10000000` | перезапустить прерванный `futex`/`nanosleep` (полный таймаут заново, `rem` не отслеживается) |
+| `SA_NODEFER` | `0x40000000` | не блокировать доставленный сигнал в обработчике |
+| `SA_RESETHAND` | `0x80000000` | сбросить disposition в `SIG_DFL` при входе в обработчик |
 
-**Кадр сигнала** — user-память ниже текущего `sp`, 16-выровнена, 432 B:
+`SIG_DFL=0`, `SIG_IGN=1`; SIGKILL/SIGSTOP нельзя поймать
+(`rt_sigaction` — `-EINVAL`) или заблокировать. `rt_sigprocmask` принимает
+`sigsetsize = 8`; сигнал `n` — бит `n-1`; биты SIGKILL/SIGSTOP отбрасываются;
+`oldset` пишется до изменения маски.
+
+**`struct sigaltstack`** — 24 байта: `ss_sp` (u64), `ss_flags` (i32),
+padding (i32), `ss_size` (u64). `SS_DISABLE=2` выключает стек (адрес/размер
+игнорируются), `SS_ONSTACK=1` возвращается в `oldstack`, пока обработчик
+исполняется на нём. Новый стек требует `ss_size >= MINSIGSTKSZ = 4096` и
+`U|R|W` на каждой странице `[ss_sp, ss_sp+ss_size)`; ошибки — `-EINVAL`
+(флаги/размер/переполнение) и `-EFAULT` (несмапленный диапазон). Стек
+per-thread, сбрасывается вместе с `ThreadSignal`. `SA_ONSTACK` при
+неустановленном/выключенном стеке — документированный fallback на обычный
+стек (POSIX это разрешает). Уже идущий на alt-стеке обработчик получает
+вложенный сигнал на текущем стеке, а не на том же верху; глубина
+alt-стека хранится в `ThreadSignal::alt_active` и в frame flags, и
+`rt_sigreturn` уменьшает её на единицу. Если установленный стек успели
+размапить, доставка — `[user] … killed: bad alternate signal stack`, не
+kernel fault.
+
+**`siginfo_t` (128 B, little-endian, раскладка pagh):**
+
+| offset | поле |
+|---:|---|
+| 0 | `si_signo` (i32) |
+| 4 | `si_errno` (i32, 0) |
+| 8 | `si_code` (i32): `SI_USER=0`, `SI_KERNEL=0x80`, `SI_TKILL=-6`, `SEGV_MAPERR=1`, `BUS_ADRALN=1`, `TRAP_BRKPT=1` |
+| 12 | padding |
+| 16..24 | `si_pid` (u32) + `si_uid` (u32) для `kill`/`tgkill`; `si_addr` (u64) для синхронного fault |
+| 24 | `si_status` (i32, 0): поле child-exit `SIGCHLD`; своего производителя у `fork`/`wait` пока нет, поэтому явный `kill(SIGCHLD)` — `SI_USER` с нулём |
+| 28..128 | padding |
+
+`kill` заполняет `SI_USER` и pid/uid отправителя (uid всегда 0 — модели
+пользователей нет), `tgkill` — `SI_TKILL`. Для SIGSEGV/SIGILL/SIGBUS/SIGTRAP
+`si_addr` = `stval`, `si_code` — `SEGV_MAPERR`/`SI_KERNEL`/`BUS_ADRALN`/
+`TRAP_BRKPT` соответственно; SIGFPE аппаратного источника не имеет (деление
+RISC-V не ловит исключение), доставляется только `kill`/`tgkill`.
+
+**`ucontext_t` (288 B, закрытая раскладка pagh, не Linux):**
+
+| offset | поле |
+|---:|---|
+| 0 | `uc_flags` (u64, 0) |
+| 8 | `uc_link` (u64): `&ucontext` предыдущего кадра, 0 для внешнего |
+| 16 | `uc_sigmask` (u64): маска, действующая **внутри** обработчика (учитывает `SA_NODEFER` и `sa_mask`) |
+| 24 | `mcontext`: `gregs[32]` (u64, x0..x31; x0=0, x1=ra, x2=sp, x3=gp, x4=tp, далее в архитектурном порядке), затем `pc` (u64, прерванный `sepc`) |
+
+Обработчик с `SA_SIGINFO` входит как `handler(signo, *siginfo, *ucontext)`;
+без флага — прежний нативный `handler(signo, *siginfo)`, `a2=0`. `ucontext` —
+read-only снимок: `rt_sigreturn` восстанавливает сохранённый `TrapFrame`, а не
+правки user-памяти, поэтому запись в `ucontext` не меняет точку возврата.
+
+**Кадр сигнала** — user-память ниже текущего `sp` (или ниже верха alt-стека),
+16-выровнена, 736 B:
 
 | offset | поле |
 |---:|---|
@@ -762,56 +814,95 @@ SIGKILL/SIGSTOP отбрасываются; `oldset` пишется до изм�
 | 264 | blocked-маска, которую восстановит `rt_sigreturn` |
 | 272 | magic (`0x7061_6768_7369_6700`) |
 | 280 | restorer |
-| 288 | `siginfo` (128 B: signo, errno, code, затем `si_pid`/`si_uid` или `si_addr`) |
+| 288 | `siginfo` (128 B, таблица выше) |
 | 416 | указатель на предыдущий кадр (для вложенных обработчиков) |
 | 424 | signum |
+| 432 | `ucontext` (288 B, таблица выше) |
+| 720 | frame flags (бит 0: кадр переключился на alt-стек) |
+| 728 | reserved (0) |
 
-Перед записью проверяется каждая страница `[frame, frame+432)` на `U|R|W`;
+Перед записью проверяется каждая страница `[frame, frame+736)` на `U|R|W`;
 плохой `sp` — это `[user] … killed: bad signal stack`, а не kernel fault.
-Обработчик входит с `a0 = signum`, `a1 = &frame.siginfo`, `ra = restorer`,
+Обработчик входит с `a0 = signum`, `a1 = &frame.siginfo`,
+`a2 = &frame.ucontext` (только при `SA_SIGINFO`), `ra = restorer`,
 `sp = frame`; его `ret` попадает в restorer, а тот делает `ecall 139`.
-`rt_sigreturn` проверяет `U|R` диапазон, magic, `signum` и что `sp` равен
-активному кадру этого потока, затем копирует сохранённый `TrapFrame` обратно и
-**не** сдвигает `sepc`. `sstatus` при этом не берётся из user-памяти, а
-пересобирается (`SPP=0`, `SIE=0`, `SUM=0`, `SPIE=1`), поэтому подделанный кадр
-не может запросить S-mode. Маска и указатель на предыдущий кадр
-восстанавливаются в том же trap-контексте (`SIE=0`), то есть атомарно
-относительно планировщика.
+`rt_sigreturn` проверяет `U|R` диапазон, magic, signum, frame flags и что `sp`
+равен активному кадру этого потока, затем копирует сохранённый `TrapFrame`
+обратно, восстанавливает blocked-маску и глубину alt-стека и **не** сдвигает
+`sepc`. `sstatus` при этом не берётся из user-памяти, а пересобирается
+(`SPP=0`, `SIE=0`, `SUM=0`, `SPIE=1`), поэтому подделанный кадр не может
+запросить S-mode. Маска и указатель на предыдущий кадр восстанавливаются в том
+же trap-контексте (`SIE=0`), то есть атомарно относительно планировщика.
 
-**Default actions.** `SIG_DFL` для SIGTERM/SIGINT/SIGQUIT/SIGABRT/SIGSEGV/SIGILL/
-SIGFPE/SIGBUS/SIGKILL и остальных «фатальных» завершает **прогон**
-(`on_signal_death`: `kill_group` + `threads = 0`, как fault); SIGCHLD/SIGCONT/
-SIGURG/SIGWINCH игнорируются. Остановки (SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU) не
-реализованы: `kill` отвечает `-ENOSYS`, а SIGKILL/SIGSTOP нельзя поймать
-(`rt_sigaction` — `-EINVAL`) или заблокировать. `SIG_IGN` просто сбрасывает
-pending.
+**Доставка.** `kill`/`tgkill` только помечают pending (и `wake_task`, если
+`pending & !blocked` непусто); обработчик ставится на границе kernel→user —
+после syscall'а или после trap'а из U-mode (включая тик). Отсюда два следствия:
+работающий поток получает сигнал не позже одного тика, а `futex`-ожидание
+прерывается (`-EINTR`), потому что woken-поток проверяет pending сразу после
+`block_current`. `nanosleep` сам проверяет pending раз в тик и тоже возвращает
+`-EINTR`. Заблокированный сигнал остаётся pending и доставляется после
+`rt_sigprocmask(SIG_UNBLOCK)`. `read(0)` неблокирующий, поэтому его сигнал не
+«прерывает» — он и так возвращает `-EAGAIN`.
+
+**`SA_RESTART`.** `signal::interrupted` запоминает, что самый младший
+deliverable-сигнал имеет `SA_RESTART`, и `dispatch` в этом случае **не**
+записывает `-EINTR` в `a0` и **не** двигает `sepc`: после `rt_sigreturn`
+исполняется тот же `ecall` с исходными аргументами. Так реализованы только
+`futex` и `nanosleep` (других блокирующих syscall'ов с `-EINTR` нет);
+`nanosleep`/`FUTEX_WAIT` стартуют заново с полным запрошенным временем, а не с
+остатком. Остальные syscall'ы возвращают `-EINTR` как раньше.
+
+**Default actions и job control.** `SIG_DFL` для SIGTERM/SIGINT/SIGQUIT/
+SIGABRT/SIGSEGV/SIGILL/SIGFPE/SIGBUS/SIGKILL и остальных «фатальных» завершает
+**прогон** (`on_signal_death`: `kill_group` + `threads = 0`, как fault);
+SIGCHLD/SIGCONT/SIGURG/SIGWINCH игнорируются. SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU с
+`SIG_DFL` останавливают целевой поток: `default_action` вызывает
+`scheduler::stop_current`, который переводит running-задачу в
+`State::Stopped` (не в ready-очереди, стек и signal-состояние сохраняются).
+SIGCONT очищает pending stop-бит и делает `Stopped -> Ready`; ловимый
+SIGCONT с обработчиком доставляется как обычный сигнал. `kill(0/-1)` адресует
+все живые потоки прогона, включая остановленные, поэтому так можно остановить
+весь run. Tty и process-group модели нет: остановленный извне run некому
+возобновить, `SIGTSTP` от терминала не существует, а остановка всех потоков
+одного прогона `kill(0, SIGSTOP)` — документированный тупик. SIGKILL/SIGSTOP
+нельзя поймать или заблокировать; `SIG_IGN` просто сбрасывает pending.
 
 **Синхронные fault'ы.** `deliver_fault` в `trap_dispatch`: illegal instruction →
-SIGILL, breakpoint → SIGTRAP, instruction/load/store page fault → SIGSEGV. Если
-для сигнала установлен реальный обработчик, кадр строится как обычно, и
-`sepc` сохранённого кадра указывает на faulting-инструкцию; без обработчика
-остаётся прежний `user::on_fault` (убить прогон с диагностикой). `SIG_IGN` для
-синхронного сигнала не делает инструкцию успешной, поэтому тоже уходит в
-`on_fault`.
+SIGILL (`SI_KERNEL`), breakpoint → SIGTRAP (`TRAP_BRKPT`), load/store address
+misaligned → SIGBUS (`BUS_ADRALN`), instruction/load/store page fault → SIGSEGV
+(`SEGV_MAPERR`). Если для сигнала установлен реальный обработчик, кадр строится
+как обычно, `si_addr` = `stval`, а `sepc` сохранённого кадра указывает на
+faulting-инструкцию; без обработчика остаётся прежний `user::on_fault` (убить
+прогон с диагностикой). `SIG_IGN` для синхронного сигнала не делает инструкцию
+успешной, поэтому тоже уходит в `on_fault`.
 
 **Lock order.** `RUN → signal table` (id прогона читается до лока), а
 `scheduler → signal table` не бывает: цели `kill` резолвятся под
-scheduler-локом до взятия signal-лока, `wake_task` вызывается после его
-отпускания. Signal-лок никогда не удерживается через `copy_to_user`/`wake_task`;
-все его взятия маскируют прерывания, потому что `signal::interrupted` зовётся из
-`nanosleep` с `SIE = 1`.
+scheduler-локом до взятия signal-лока, `wake_task`/`continue_task` вызываются
+после его отпускания. Signal-лок никогда не удерживается через
+`copy_to_user`/`copy_from_user`/`wake_task`; все его взятия маскируют
+прерывания, потому что `signal::interrupted` зовётся из `nanosleep` с
+`SIE = 1`.
 
 **Тесты.** `userland/abi.rs`, секция signals: установка обработчика с
 asm-символом `abi_sigrestorer`, `kill(getpid(), SIGUSR1)` и ровно один инкремент
 после `rt_sigreturn`; `kill(0)`/`kill(-1)`/`tgkill`; `SIG_IGN`; block → kill →
-unblock; `SIGKILL`/`SIGSTOP`/битый signum/sigsetsize →
-`-EINVAL`/`-ENOSYS`; неверный pid → `-ESRCH`; плохой указатель кадра →
-`-EFAULT`, вызов без кадра → `-EINVAL`; отдельный поток, заблокированный в
-futex, получает SIGUSR2 и видит `-EINTR`; отдельный поток с synchronous SIGSEGV
-завершается обработчиком, а прогон продолжается. Маркер — `abi: signals ok`;
-`SELFTEST user-abi-syscalls` требует роста счётчиков
-`actions`/`procmasks`/`kills`/`sigreturns`/`delivered`/`ignored` и нулевых
-`live_handlers`/`live_threads`/`live_pending` после прогона.
+unblock; SIGKILL/SIGSTOP/битый signum/sigsetsize/неверный pid; плохой указатель
+кадра и вызов без кадра; отдельный поток, заблокированный в futex, получает
+SIGUSR2 и видит `-EINTR`; отдельный поток с synchronous SIGSEGV завершается
+обработчиком, а прогон продолжается. Расширенная секция (`signal_ext_section`)
+проверяет `sigaltstack` (валидация `MINSIGSTKSZ`, `SS_DISABLE`, `SS_ONSTACK` из
+обработчика, реальный `sp` внутри alt-стека), `SA_SIGINFO` (`si_pid`, `SI_USER`
+vs `SI_TKILL`, `si_addr`, `si_status`, `uc_sigmask`, `mcontext.pc/gregs`),
+`SA_NODEFER` (рекурсивная доставка, глубина 3), `SA_RESETHAND` (запрос после
+доставки видит `SIG_DFL`), `SA_RESTART` (futex после сигнала возвращает
+`-ETIMEDOUT`, а не `-EINTR`), SIGSTOP/SIGCONT на занятом потоке и
+SIGTSTP/SIGCONT на futex-ожидании. Маркеры — `abi: signals ok`,
+`abi: altstack ok`, `abi: siginfo ok`, `abi: jobcontrol ok`;
+`SELFTEST user-abi-syscalls` требует роста счётчиков `actions`/`procmasks`/
+`kills`/`sigreturns`/`delivered`/`ignored`/`altstacks`/`stops`/`continues`/
+`restarts` и нулевых `live_handlers`/`live_threads`/`live_pending`/
+`stopped_tasks` после прогона.
 
 ---
 

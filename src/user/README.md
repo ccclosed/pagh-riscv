@@ -12,10 +12,10 @@
 | Файл | Роль |
 |---|---|
 | `mod.rs` | `run_image(bytes, name)` / `run_image_with_args` для фикстур и `run_file(path)` / `run_file_with_args` / `run_file_with_argv0` для `run <path>` — весь сценарий запуска: ELF → user-стек → SysV-кадр `argc/argv/envp` → `spawn_in_group` главного потока → `enter_user` (`a0=argc`, `a1=argv`, `sret`) → ожидание `RunState::threads == 0` → `reap` → снятие маппингов, fd и heap-кадров; `FileSource` поверх `VfsNode` (потоковое чтение), `Exit`/`UserError`, `on_fault` (убивает группу), `RUN` (одна программа за раз), `brk` (user heap), `exit_thread`/`exit_group`/`process_id`, capture для ABI-теста, встроенные фикстуры `HELLO_ELF`/`FAULT_ELF`/`SPIN_ELF`/`ARGV_ELF`/`ABI_ELF` |
-| `signal.rs` | POSIX-подобные сигналы: per-run таблица `sigaction` (1..=31), per-thread `pending`/`blocked`/активный кадр, `kill`/`tgkill` (129/131), `rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn` (134/135/139), кадр 432 B в user-памяти, `deliver_pending` на границе kernel→user и `deliver_fault` для SIGILL/SIGSEGV/SIGTRAP; счётчики и `live_handlers`/`live_threads`/`live_pending` для selftest |
+| `signal.rs` | POSIX-подобные сигналы: per-run таблица `sigaction` (1..=31), per-thread `pending`/`blocked`/`altstack`/активный кадр, `kill`/`tgkill` (129/131), `sigaltstack` (132), `rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn` (134/135/139), кадр 736 B в user-памяти с 128-байтным `siginfo_t` и 288-байтным `ucontext_t`, `SA_SIGINFO`/`SA_ONSTACK`/`SA_NODEFER`/`SA_RESETHAND`/`SA_RESTART`, `deliver_pending` на границе kernel→user, `deliver_fault` для SIGILL/SIGSEGV/SIGBUS/SIGTRAP и job control через `scheduler::stop_current`/`continue_task`; счётчики и `live_handlers`/`live_threads`/`live_pending` для selftest |
 | `futex.rs` | статическая очередь ожидающих `(run, uaddr) -> tid`: 32 слота на 16 адресов, `wait` (регистрация → `scheduler::block_current` → снятие), `wake` (`wake_task`, не больше N), `clear_run` на teardown; лок очереди маскирует прерывания и **не** держится через блокировку; порядок `futex → scheduler` |
 | `elf.rs` | ELF64-загрузчик: `ImageSource` (`len` + `read_at`) и потоковое чтение — заголовок, таблица program headers (≤ 8) и сегменты кусками ≤ 512 B в уже замапленные страницы, **без буфера размером с образ**; валидация заголовка/сегментов до первого кадра, `PT_LOAD`-страницы `U=1` в общей карте, нулевой `.bss`-хвост, откат кадров при любой ошибке; `Loaded { entry, pages(), release() }`, типизированные `ElfError`/`SourceError` |
-| `syscall.rs` | `dispatch(frame)`: `read(63)`, `write(64)`, `openat(56)`, `close(57)`, `lseek(62)`, `fstat(80)`, `getdents64(61)`, `brk(214)`, `clock_gettime(113)`, `nanosleep(101)`, `uname(160)`, `readlinkat(78)`, `exit(93)`, `exit_group(94)`, `set_tid_address(96)`, `futex(98)`, `sched_yield(124)`, `getpid(172)`, `gettid(178)`, `clone(220)`, сигналы `kill(129)`, `tgkill(131)`, `rt_sigaction(134)`, `rt_sigprocmask(135)`, `rt_sigreturn(139)` + мутации `mkdirat(34)`, `unlinkat(35)`, `symlinkat(36)`, `linkat(37)`, `fchmodat(53)`, `ftruncate(46)`, `renameat2(276)` + сокеты `socket(198)`, `connect(203)`, `sendto(206)`, `recvfrom(207)`, `setsockopt(208)`, `getsockopt(209)`, `shutdown(210)`; таблица 16 fd на прогон (включая `FdEntry::Socket`), per-run таблица режимов для `fchmodat`/`fstat`, `copy_from_user`/`copy_to_user` (проверка `U/R/W` по PTE, `SUM` только вокруг копии), `-errno`/`-ENOSYS`, `ecall → sepc + 4`, счётчики для selftest |
+| `syscall.rs` | `dispatch(frame)`: `read(63)`, `write(64)`, `openat(56)`, `close(57)`, `lseek(62)`, `fstat(80)`, `getdents64(61)`, `brk(214)`, `clock_gettime(113)`, `nanosleep(101)`, `uname(160)`, `readlinkat(78)`, `exit(93)`, `exit_group(94)`, `set_tid_address(96)`, `futex(98)`, `sched_yield(124)`, `getpid(172)`, `gettid(178)`, `clone(220)`, сигналы `kill(129)`, `tgkill(131)`, `sigaltstack(132)`, `rt_sigaction(134)`, `rt_sigprocmask(135)`, `rt_sigreturn(139)` + мутации `mkdirat(34)`, `unlinkat(35)`, `symlinkat(36)`, `linkat(37)`, `fchmodat(53)`, `ftruncate(46)`, `renameat2(276)` + сокеты `socket(198)`, `connect(203)`, `sendto(206)`, `recvfrom(207)`, `setsockopt(208)`, `getsockopt(209)`, `shutdown(210)`; таблица 16 fd на прогон (включая `FdEntry::Socket`), per-run таблица режимов для `fchmodat`/`fstat`, `copy_from_user`/`copy_to_user` (проверка `U/R/W` по PTE, `SUM` только вокруг копии), `-errno`/`-ENOSYS`, `ecall → sepc + 4`, счётчики для selftest |
 | `selftest.rs` | десять проверок для `selftest`: `user-abi-argv` (точная строка из фикстуры), `user-abi-syscalls` (все вызовы + секции потоков/фьютексов и сигналов + мутационная половина: mkdir/rmdir, rename, link, symlink, chmod, ftruncate, unlink; с диском exit 0 и «все имена убраны», без `/mnt` — SKIP после no-fs половины), accept фикстуры, reject-матрица (14 мутаций заголовка/сегментов), отказ `run_image` на битом ELF, round-trip `hello`, fault-изоляция, запуск после fault, таймер-in-U и `user-run-large-file` (100 KiB образ с нулевым хвостом через `run_file`) |
 
 ## Вход в U-mode и начальный стек
@@ -198,40 +198,76 @@ wait/wake-rendezvous, `exit` не-главного, `exit_group` с заблок
 ## Сигналы (POSIX-подобные)
 
 `src/user/signal.rs`. Это нативный ABI, не Linux: `struct sigaction` — это
-`{ handler, flags, mask, restorer }` (32 B, порядок pagh), маска — 8 B, сигнал
-`n` — бит `n-1`, `sigsetsize = 8`.
+`{ handler, flags, mask, restorer }` (32 B, порядок pagh), `struct sigaltstack`
+— `{ ss_sp, ss_flags, pad, ss_size }` (24 B), маска — 8 B, сигнал `n` — бит
+`n-1`, `sigsetsize = 8`.
 
 * **Где что живёт.** Обработчики и `SIG_IGN` — в таблице прогона (сброс в
-  `begin_run`, очистка в `clear_run`); `pending`-биты, blocked-маска и указатель
-  на активный кадр — у каждого потока. `kill(pid > 0)` адресует tid прогона,
-  `kill(0)`/`kill(-1)` — все живые потоки, `tgkill` дополнительно требует
-  `tgid == getpid()`. Неизвестный tid — `-ESRCH`, signum вне 0..=31 — `-EINVAL`,
-  `SIGSTOP`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU` — `-ENOSYS` (job control нет),
-  `sig = 0` — проверка существования.
+  `begin_run`, очистка в `clear_run`); `pending`-биты, blocked-маска, alt-стек,
+  глубина `alt_active` и указатель на активный кадр — у каждого потока. С
+  каждым pending-битом хранятся `si_pid`/`si_uid`/`si_code` отправителя, потому
+  что доставка отложена до границы kernel→user. `kill(pid > 0)` адресует tid
+  прогона, `kill(0)`/`kill(-1)` — все живые потоки (включая остановленные),
+  `tgkill` дополнительно требует `tgid == getpid()`. Неизвестный tid —
+  `-ESRCH`, signum вне 0..=31 — `-EINVAL`, `sig = 0` — проверка существования.
 * **Доставка.** Пометка pending; если `pending & !blocked` непусто, ядро зовёт
   `scheduler::wake_task` (futex-wait просыпается и вернёт `-EINTR`). Обработчик
   ставится только на границе kernel→user: после syscall'а или после любого
   trap'а из U-mode, включая тик. Один сигнал на границу; вложенность идёт через
   `prev_frame` в кадре. `nanosleep` проверяет pending раз в тик и тоже
   возвращает `-EINTR`. Заблокированный сигнал остаётся pending.
-* **Кадр (432 B, ниже `sp`, 16-выровнен):** `TrapFrame` (264), blocked-маска
-  (8), magic (8), restorer (8), `siginfo` 128 B, `prev_frame` (8), signum (8).
-  Каждая страница проверяется на `U|R|W` до `copy_to_user`; плохой `sp` —
-  `on_signal_death("bad signal stack")`, не kernel fault. Обработчик входит с
-  `a0 = signum`, `a1 = &siginfo`, `ra = restorer`, `sp = frame`; `ret` из
-  обработчика попадает в restorer, тот делает `ecall 139`.
-* **`rt_sigreturn`.** Проверяет `U|R`-диапазон, magic, signum и что `sp` равен
-  активному кадру; иначе `-EFAULT` (плохой указатель) или `-EINVAL` (нет кадра /
-  чужой кадр). Восстанавливает `TrapFrame`, blocked-маску и `prev_frame`, затем
-  `sstatus` собирается заново (`SPP=0`, `SIE=0`, `SUM=0`, `SPIE=1`) — кадр из
-  user-памяти не может запросить S-mode. `sepc` не сдвигается.
+* **Кадр (736 B, ниже `sp` или верха alt-стека, 16-выровнен):** `TrapFrame`
+  (264), blocked-маска (8), magic (8), restorer (8), `siginfo` 128 B,
+  `prev_frame` (8), signum (8), `ucontext` 288 B, frame flags (8: бит 0 —
+  переключились на alt-стек), reserved (8). Каждая страница проверяется на
+  `U|R|W` до `copy_to_user`; плохой `sp` — `on_signal_death("bad signal
+  stack")`, размапленный alt-стек — `"bad alternate signal stack"`, не kernel
+  fault. Обработчик входит с `a0 = signum`, `a1 = &siginfo`,
+  `a2 = &ucontext` (только при `SA_SIGINFO`, иначе 0), `ra = restorer`,
+  `sp = frame`; `ret` из обработчика попадает в restorer, тот делает
+  `ecall 139`.
+* **`siginfo_t` (128 B).** 0 — signo, 4 — errno (0), 8 — code (`SI_USER=0`,
+  `SI_KERNEL=0x80`, `SI_TKILL=-6`, `SEGV_MAPERR=1`, `BUS_ADRALN=1`,
+  `TRAP_BRKPT=1`), 16..24 — `si_pid`+`si_uid` для `kill`/`tgkill` либо
+  `si_addr` для fault, 24..28 — `si_status` (child-exit SIGCHLD; без
+  `fork`/`wait` явный `kill(SIGCHLD)` даёт `SI_USER` и 0), дальше padding.
+* **`ucontext_t` (288 B, pagh).** 0 — flags (0), 8 — link на предыдущий
+  `ucontext`, 16 — `uc_sigmask` (маска внутри обработчика), 24 — `mcontext`:
+  `gregs[32]` (x0..x31, x2 = прерванный sp) + `pc` (прерванный sepc). Это
+  read-only снимок: `rt_sigreturn` восстанавливает `TrapFrame`, а не правки
+  user-памяти.
+* **`rt_sigreturn`.** Проверяет `U|R`-диапазон (736 B), magic, signum, frame
+  flags и что `sp` равен активному кадру; иначе `-EFAULT` (плохой указатель)
+  или `-EINVAL` (нет кадра / чужой кадр). Восстанавливает `TrapFrame`,
+  blocked-маску, `prev_frame` и глубину alt-стека, затем `sstatus` собирается
+  заново (`SPP=0`, `SIE=0`, `SUM=0`, `SPIE=1`) — кадр из user-памяти не может
+  запросить S-mode. `sepc` не сдвигается.
+* **`sigaltstack`.** `SS_DISABLE=2` выключает, `SS_ONSTACK=1` репортится, пока
+  обработчик на стеке; `ss_size >= MINSIGSTKSZ = 4096`, весь диапазон `U|R|W`,
+  иначе `-EINVAL`/`-EFAULT`. Стек per-thread; `SA_ONSTACK` без установленного
+  стека — fallback на обычный (POSIX разрешает). Вложенный сигнал на уже
+  активном alt-стеке пишется ниже текущего `sp`, а не на тот же верх.
+* **Флаги.** `SA_RESTORER=0x04000000` обязателен для функции; допустимы
+  `SA_SIGINFO=4`, `SA_ONSTACK=0x08000000`, `SA_RESTART=0x10000000`,
+  `SA_NODEFER=0x40000000`, `SA_RESETHAND=0x80000000`, остальные биты —
+  `-EINVAL`. `SA_NODEFER` не блокирует доставленный сигнал, `SA_RESETHAND`
+  сбрасывает disposition в `SIG_DFL` при входе. `SA_RESTART` реализован только
+  для `futex`/`nanosleep`: `dispatch` не пишет `-EINTR` в `a0` и не двигает
+  `sepc`, поэтому после `rt_sigreturn` тот же `ecall` повторяется с исходными
+  аргументами; таймаут при этом полный, а не остаток.
 * **Default actions.** `SIG_DFL` для фатальных сигналов (SIGTERM/SIGINT/SIGQUIT/
   SIGABRT/SIGSEGV/SIGILL/SIGFPE/SIGBUS/SIGKILL/…) завершает **прогон** через
   `on_signal_death` (`kill_group`, `threads = 0`, `Exit::Fault`);
-  SIGCHLD/SIGCONT/SIGURG/SIGWINCH игнорируются; SIGKILL/SIGSTOP нельзя поймать
+  SIGCHLD/SIGCONT/SIGURG/SIGWINCH игнорируются. SIGSTOP/SIGTSTP/SIGTTIN/
+  SIGTTOU с `SIG_DFL` вызывают `scheduler::stop_current`: поток уходит в
+  `State::Stopped`, не планируется, сохраняет стек и signal-состояние; SIGCONT
+  чистит pending stop и делает `Stopped -> Ready`. `kill(0)`/`kill(-1)`
+  останавливает все потоки прогона — tty/process-group нет, возобновить извне
+  некому (документированный предел). SIGKILL/SIGSTOP нельзя поймать
   (`rt_sigaction` — `-EINVAL`) или заблокировать. Синхронные SIGILL/SIGTRAP/
-  SIGSEGV доставляются установленному обработчику вместо `on_fault`; без
-  обработчика поведение прежнее.
+  SIGBUS/SIGSEGV доставляются установленному обработчику вместо `on_fault`
+  (`si_addr = stval`); без обработчика поведение прежнее. `SIGFPE` аппаратного
+  источника не имеет, `sigqueue`/`sival_ptr`/очередей сигналов нет.
 
 ## Раскладка адресов
 
@@ -307,25 +343,38 @@ wait/wake-rendezvous, `exit` не-главного, `exit_group` с заблок
    ровно тот `TrapFrame`, который собрал `trap_entry`; порядок полей не меняется,
    а `rt_sigreturn` восстанавливает его целиком и **не** делает `sepc + 4`.
    `sstatus` не копируется из кадра (только пересобирается), `sstatus.SPP` всегда
-   0 на возврате в U-mode. Все страницы кадра проверяются `U|R|W` до записи;
-   ошибка — смерть прогона, а не S-mode fault.
+   0 на возврате в U-mode. Кадр — 736 B: `TrapFrame`, маска, magic, restorer,
+   `siginfo`, `prev_frame`, signum, 288-байтный `ucontext`, frame flags; менять
+   смещения можно только вместе с `docs/architecture.md` и фикстурой. Все
+   страницы кадра проверяются `U|R|W` до записи; ошибка — смерть прогона, а не
+   S-mode fault.
 10. **Сигнальный лок — лист.** `RUN → signal table` (id прогона читается до
     лока); `kill` резолвит цели под scheduler-локом и отпускает его до
-    signal-лока; `wake_task` зовётся без signal-лока; `copy_to_user` — без лока.
-    Все взятия маскируют прерывания: `interrupted()` вызывается из
-    `nanosleep` с `SIE = 1`. Pending и blocked — разные битовые карты: доставка
-    только `pending & !blocked`, снятие pending — в момент доставки.
+    signal-лока; `wake_task`/`continue_task` зовутся без signal-лока;
+    `copy_to_user`/`copy_from_user` — без лока. Все взятия маскируют прерывания:
+    `interrupted()` вызывается из `nanosleep` с `SIE = 1`. Pending и blocked —
+    разные битовые карты: доставка только `pending & !blocked`, снятие pending —
+    в момент доставки.
 11. **`RUN` не держится через блокирующее ожидание.** Лок берётся на захват,
    короткие обновления и снятие; `wait_for_run_end` читает `threads` и крутит
    `yield_now` без него; teardown делает раннер (trap-пути только
    читают/пишут запись). `RUN` снимается только когда `threads == 0`: `clone`-
    ребёнок ещё исполняется в этом адресном пространстве.
-10. **Сокетный syscall сам опрашивает NIC.** Пока user-программа работает,
+11. **Сокетный syscall сам опрашивает NIC.** Пока user-программа работает,
     шелл стоит в `wait_for_run_end` и `net::poll()` не вызывает; поэтому
     `connect`/`send`/`shutdown`/`close` крутят опрос внутри `net::tcp` и на
     время ожидания включают прерывания (как `nanosleep`), не держа локов.
     Соединение одно, `recv` неблокирующий, sockaddr валидируется
     `copy_from_user` до изменения состояния; второй `socket()` — `-ENOSPC`.
+12. **Alt-стек и job control — состояние потока, но переключает планировщик.**
+    `sigaltstack` валидирует весь диапазон `U|R|W` и хранит его в
+    `ThreadSignal`; доставка с `SA_ONSTACK` выбирает верх стека и пишет кадр
+    туда, а frame flags/`alt_active` помнят, что `rt_sigreturn` должен снять
+    уровень. Остановка (`SIGSTOP`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU` + `SIG_DFL`)
+    делается только из контекста самой останавливаемой задачи в
+    `default_action` (`scheduler::stop_current`), а не из `kill`: sender не
+    трогает чужое `TaskContext`. SIGCONT — `continue_task` плюс очистка pending
+    stop; `wake_task` не должен будить `Stopped`-поток.
 
 ## Пределы (честно)
 
@@ -342,11 +391,14 @@ wait/wake-rendezvous, `exit` не-главного, `exit_group` с заблок
   `clock_gettime`/`nanosleep` имеют разрешение тика 10 ms;
 - нет per-process page table/ASID (изоляция только «юзер vs ядро»),
   `fork`/`exec`, нескольких процессов; нет блокирующего `read(0)`;
-- сигналы — 1..=31, один pending-бит на сигнал, один кадр 432 B на активный
-  обработчик; нет `sigaltstack`, `SA_RESTART`/`SA_SIGINFO`/`SA_NODEFER`, job
-  control (SIGSTOP и родственные — `-ENOSYS`) и детального `siginfo`; SIGKILL и
-  SIGSTOP не ловятся и не блокируются; доставка асинхронная — не позже тика,
-  futex-wait прерывается, `connect`/`send` сигналом не прерываются;
+- сигналы — 1..=31, один pending-бит на сигнал, один кадр 736 B на активный
+  обработчик; есть `sigaltstack`/`SA_ONSTACK`, `SA_SIGINFO` с полным
+  `siginfo_t`/`ucontext_t`, `SA_NODEFER`/`SA_RESETHAND`, `SA_RESTART` только для
+  `futex`/`nanosleep` (полный таймаут заново); SIGKILL/SIGSTOP не ловятся и не
+  блокируются; job control — только per-thread `Stopped`/SIGCONT, без tty и
+  process-group; `sigqueue`/`sival_ptr`/очередей и генератора SIGFPE нет;
+  доставка асинхронная — не позже тика, futex-wait прерывается,
+  `connect`/`send` сигналом не прерываются;
 - потоков ≤ 14 на прогон (16 слотов планировщика − `shell`/`idle`), у каждого
   kernel-стек 16 KiB + guard; TLS (`CLONE_SETTLS` — `-ENOTSUP`), PI/requeue
   фьютексы, `join`/`waitid` и приоритеты отсутствуют; futex-таблица 32/16;
@@ -376,7 +428,13 @@ selftest         # SELFTEST user-*: 10/10 с /mnt (8/10 + 2 SKIP без диск
 (`clone`/`gettid`/`set_tid_address`/futex/`exit`/`exit_group`), секцию сигналов
 (обработчик SIGUSR1 через `abi_sigrestorer`, `kill`/`kill(0)`/`kill(-1)`/`tgkill`,
 `SIG_IGN`, block→pending→unblock, SIGKILL/SIGSTOP/битые аргументы, `-EINTR` на
-futex-wait, synchronous SIGSEGV в отдельном потоке, плохой кадр `rt_sigreturn`),
+futex-wait, synchronous SIGSEGV в отдельном потоке, плохой кадр `rt_sigreturn`)
+и расширенную сигнальную секцию: `sigaltstack` с проверкой `sp` внутри стека и
+`SS_ONSTACK` из обработчика, `SA_SIGINFO` (`si_pid`/`SI_TKILL`/`si_addr`/
+`si_status`/`uc_sigmask`/`mcontext`), `SA_NODEFER` (рекурсия глубины 3),
+`SA_RESETHAND`, `SA_RESTART` (futex → `-ETIMEDOUT`), SIGSTOP/SIGCONT на занятом
+потоке и SIGTSTP/SIGCONT на futex-ожидании; маркеры `abi: altstack ok`,
+`abi: siginfo ok`, `abi: jobcontrol ok`,
 затем мутационную
 половину: `mkdirat` (+`EEXIST`, игнор `mode`), `unlinkat` с `AT_REMOVEDIR`
 (`EISDIR`/`ENOTDIR`/`ENOTEMPTY`), `renameat2`, `linkat` (+`EISDIR`/`EINVAL`),
