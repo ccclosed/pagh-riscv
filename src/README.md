@@ -21,7 +21,7 @@
 | `arch/riscv64/timer.rs` | тик 100 Гц через SBI TIME: абсолютный дедлайн, `sleep_ticks`, шов `set_tick_handler` для M6 |
 | `arch/riscv64/plic.rs` | PLIC из DTB: enable/priority/threshold, claim/complete, окна контекста S-mode |
 | `arch/riscv64/selftest.rs` | четыре проверки таймера/PLIC/кольца UART для `selftest` |
-| `arch/riscv64/mmu.rs` | примитивы Sv39: флаги PTE, `PageTable`, `vpn`, `satp_for`, `activate`, `sfence` — вызывает `memory::paging` |
+| `arch/riscv64/mmu.rs` | примитивы Sv39: флаги PTE, `PageTable`, `vpn`, `satp_for`/`satp_for_asid`/`satp_root`, `activate_satp`, `sfence` — вызывает `memory::paging` |
 | `fdt.rs` | минимальный читатель flattened device tree |
 | `memory/mod.rs` | фасад памяти: `init`, `stats`, `kernel_end`, `boot_stack`, `fdt_span` |
 | `memory/pmm.rs` | битовая карта физических кадров 4 KiB (окно 8 GiB) |
@@ -48,12 +48,13 @@
 | `task/mod.rs` | фасад планировщика |
 | `task/scheduler.rs` | таблица потоков, ready-queue, квант, стеки из PMM, `tick`/`yield`/`exit`/`reap`, `block_current`/`wake_task`/`kill_group`/`spawn_user_thread`, `State::Stopped` + `stop_current`/`continue_task`/`stopped_tasks` для job control, вытеснение таймером |
 | `task/selftest.rs` | пять проверок планировщика для `selftest` |
-| `user/mod.rs` | `run_image`/`run_file`: ELF → user-стек → SysV-кадр `argc/argv/envp` → главный поток группы → `sret` в U-mode → ожидание `threads == 0` → reap; `brk`-heap, `on_fault` (убивает группу), `exit_thread`/`exit_group`, capture для ABI-теста; встроенные hello/fault/spin/argv/abi |
-| `user/signal.rs` | POSIX-подобные сигналы: `kill`/`tgkill`/`sigaltstack`/`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`, per-run обработчики, per-thread pending/blocked/altstack, кадр 736 B с `siginfo`/`ucontext`, `SA_SIGINFO`/`SA_ONSTACK`/`SA_NODEFER`/`SA_RESETHAND`/`SA_RESTART`, синхронные SIGSEGV/SIGILL/SIGBUS/SIGTRAP, job-control остановка/продолжение |
-| `user/futex.rs` | статическая futex-очередь: 32 ожидающих на 16 адресов, ключ `(run, uaddr)`, `wait`/`wake`/`clear_run` поверх `block_current`/`wake_task` |
+| `user/mod.rs` | `run_image`/`run_file`: новый root/ASID → ELF → user-стек → SysV-кадр `argc/argv/envp` → главный поток процесса → `sret` в U-mode → ожидание `threads == 0` → reap; `brk`-heap, mmap, `on_fault` (убивает процесс), `exit_thread`/`exit_group`, `fork`/`execve`/`wait4`, очистка сирот, capture для ABI-теста; встроенные hello/fault/spin/argv/abi/exec-child |
+| `user/process.rs` | таблица процессов (≤ 6): pid/ppid, root/satp/asid, image/heap-списки, mmap, `threads`/`exit`/`signal`, `wait_tid`; `reserve`/`publish`/`with_slot_mut`/`slot_of`, `force_finish`/`ready_pids` для очистки сирот |
+| `user/signal.rs` | POSIX-подобные сигналы: `kill`/`tgkill`/`sigaltstack`/`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`, per-process обработчики (fork копирует, exec сбрасывает в `SIG_DFL`), per-thread pending/blocked/altstack, кадр 736 B с `siginfo`/`ucontext`, `SA_SIGINFO`/`SA_ONSTACK`/`SA_NODEFER`/`SA_RESETHAND`/`SA_RESTART`, синхронные SIGSEGV/SIGILL/SIGBUS/SIGTRAP, job-control остановка/продолжение |
+| `user/futex.rs` | статическая futex-очередь: 32 ожидающих на 16 адресов, ключ `(pid, uaddr)`, `wait`/`wake`/`clear_run` поверх `block_current`/`wake_task` |
 | `user/elf.rs` | ELF64-загрузчик: валидация до первого кадра, `PT_LOAD` с `U=1`, потоковые сегменты кусками ≤ 512 B, откат кадров, `Loaded`/`ElfError` |
-| `user/syscall.rs` | native ABI: `read`/`write`/`openat`/`close`/`lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/`readlinkat`/`exit`/`exit_group`/`set_tid_address`/`futex`/`sched_yield`/`getpid`/`gettid`/`clone` + сигналы `kill`/`tgkill`/`sigaltstack`/`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn` + мутации `mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`/`ftruncate` + сокеты `socket`/`connect`/`sendto`/`recvfrom`/`setsockopt`/`getsockopt`/`shutdown`; fd-таблица (включая `FdEntry::Socket`) и таблица режимов на прогон, `copy_from_user`/`copy_to_user`, `sepc+4` |
-| `user/selftest.rs` | десять проверок user-mode для `selftest` (argv-строка, все syscall'ы ABI + потоки/futex + сигналы/altstack/siginfo/job control, ELF-матрица, fault, таймер, 100 KiB) |
+| `user/syscall.rs` | native ABI: `read`/`write`/`openat`/`close`/`lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/`readlinkat`/`exit`/`exit_group`/`set_tid_address`/`futex`/`sched_yield`/`getpid`/`getppid`/`gettid`/`clone`/`fork`/`execve`/`wait4` + сигналы `kill`/`tgkill`/`sigaltstack`/`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn` + мутации `mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`/`ftruncate` + сокеты `socket`/`connect`/`sendto`/`recvfrom`/`setsockopt`/`getsockopt`/`shutdown`; per-process fd-таблица (включая `FdEntry::Socket`/`Unsupported`) и таблица режимов, `copy_from_user`/`copy_to_user`, `sepc+4` |
+| `user/selftest.rs` | десять проверок user-mode для `selftest` (argv-строка, все syscall'ы ABI + потоки/futex + сигналы/altstack/siginfo/job control + fork/wait/exec-маркеры, ELF-матрица, fault, таймер, 100 KiB) |
 | `net/mod.rs` | сетевой стек: состояние, ARP-кэш, `poll()`, диспетчер ARP/IPv4/ICMP/UDP/TCP, `ping`, DHCP-конфигурация |
 | `net/wire.rs` | чистые форматы Ethernet/ARP/IPv4/ICMP/UDP/TCP/DHCP/DNS и контрольные суммы (без устройства и часов) |
 | `net/dhcp.rs` | DHCP-клиент DISCOVER/OFFER/REQUEST/ACK |
@@ -86,7 +87,7 @@
 | 7 | разбор DTB, ошибка фатальна | `main.rs:65-72`, `fdt.rs:64-98` | описание машины нельзя угадывать |
 | 8 | память, timebase и адрес консоли — в лог | `main.rs:73-81` | — |
 | 9 | PMM: пул кадров минус образ ядра, стек и DTB; печать статистики | `main.rs:83-107`, `memory/mod.rs:75-77` | `alloc` уже существует — аллокатор должен быть готов до первой аллокации |
-| 10 | `paging::init`: identity-карта Sv39 (RAM + страница UART + окна virtio-mmio), `satp` | `main.rs` | все фазы после неё работают на карте, которую выбрало ядро |
+| 10 | `paging::init`: identity-карта Sv39 (RAM + страница UART + окна virtio-mmio), `satp`; позже `create_user_space` копирует supervisor-часть в root процесса | `main.rs`, `memory/paging.rs` | все фазы после неё работают на карте, которую выбрало ядро; user-процесс получает её копию с `U=0` |
 | 11 | `traps::init()`: `stvec` + `sstatus.SIE` | `main.rs`, `arch/riscv64/traps.rs` | ловушки раньше того, что может сбойнуть |
 | 11a | `timer::init`: первый дедлайн через SBI, затем `sie.STIE` | `main.rs`, `arch/riscv64/timer.rs` | `sie` = 0 до готового compare-регистра |
 | 11b | `plic::init` (DBT-база/source) → `uart::enable_rx_interrupt()` → `sie.SEIE` | `main.rs`, `arch/riscv64/plic.rs`, `drivers/uart.rs` | контроллер разводит линию раньше, чем UART её поднимает |

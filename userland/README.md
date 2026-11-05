@@ -1,6 +1,6 @@
 # `userland/` — статические RV64-программы для M6b и native ABI
 
-Пять крошечных программ без рантайма и libc — ровно столько, чтобы проверить
+Шесть крошечных программ без рантайма и libc — ровно столько, чтобы проверить
 точки входа ядра и контракт `pagh-api/docs/abi.md`. Все собраны в ELF заранее;
 ядро встраивает их через `include_bytes!` (`src/user/mod.rs`), поэтому чистый
 checkout собирается **без** кросс-компилятора.
@@ -11,7 +11,8 @@ checkout собирается **без** кросс-компилятора.
 | `fault.rs` / `fault.elf` | `getpid`, затем `ld` с адреса 0 | fault из U убивает задачу, а не машину; `run_image` возвращает `Exit::Fault` |
 | `spin.rs` / `spin.elf` | `rdtime`-цикл на 0.2 s (~20 тиков), `getpid`, `exit(7)` | таймерное прерывание, взятое в U-mode, обрабатывается и возвращается в U |
 | `argv.rs` / `argv.elf` | проверяет `a0=argc`, `a1=argv`, `sp`, `envp = argv+argc+1`, NULL-терминаторы и выравнивание; печатает `argv: argc=3 argv[0]=argv.elf argv[1]=alpha argv[2]=beta env[0]=PWD=/` | SysV-кадр входа и точную строку, которую selftest сравнивает побайтно |
-| `abi.rs` / `abi.elf` | `write`, `openat` (существующий файл, создание, `O_APPEND`, `O_TRUNC`), `read`, `fstat`, `lseek`, `getdents64`, `readlinkat`, `brk` с паттерном, `clock_gettime`, `nanosleep`, `uname`, `getpid`, `close`, `-EFAULT`/`-ENOSYS`/`-EBADF`/`-ENOMEM`; **секция потоков**: `gettid`/`set_tid_address`, матрица ошибок `clone`, два потока с общим atomic-счётчиком, futex wait/wake-rendezvous, `exit` не-главного, `exit_group`; **секция сигналов**: обработчик с restorer'ом, `kill`/`tgkill`, маски/pending, `SIG_IGN`, `-EINTR`, synchronous SIGSEGV и расширенная половина — `sigaltstack`+`SA_ONSTACK` (sp внутри стека, `SS_ONSTACK`, fallback), `SA_SIGINFO` (`si_pid`/`si_code`/`si_addr`/`si_status`, `ucontext.mcontext`), `SA_NODEFER` (рекурсия), `SA_RESETHAND`, `SA_RESTART` (futex → `-ETIMEDOUT`) и SIGSTOP/SIGTSTP/SIGCONT; мутационная половина: `mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`/`ftruncate` и их ошибки; сокетная секция: `socket` (bad domain/type/protocol, второй сокет), `connect` к `10.0.2.2:8000` (без сервера — `SKIP`, не fail), `setsockopt`/`getsockopt`, `send`/`recv`, `shutdown`, EOF и `-EPIPE`; без `/mnt` выходит 77 после no-fs половины, оставляя живой tail-поток | весь native ABI без libpagh: файлы, каталоги, символические ссылки, мутации, heap, время, ошибки, один TCP-сокет, `clone`/futex/`exit_group` |
+| `abi.rs` / `abi.elf` | `write`, `openat` (существующий файл, создание, `O_APPEND`, `O_TRUNC`), `read`, `fstat`, `lseek`, `getdents64`, `readlinkat`, `brk` с паттерном, `clock_gettime`, `nanosleep`, `uname`, `getpid`, `close`, `-EFAULT`/`-ENOSYS`/`-EBADF`/`-ENOMEM`; **секция потоков**: `gettid`/`set_tid_address`, матрица ошибок `clone`, два потока с общим atomic-счётчиком, futex wait/wake-rendezvous, `exit` не-главного, `exit_group`; **секция сигналов**: обработчик с restorer'ом, `kill`/`tgkill`, маски/pending, `SIG_IGN`, `-EINTR`, synchronous SIGSEGV и расширенная половина — `sigaltstack`+`SA_ONSTACK` (sp внутри стека, `SS_ONSTACK`, fallback), `SA_SIGINFO` (`si_pid`/`si_code`/`si_addr`/`si_status`, `ucontext.mcontext`), `SA_NODEFER` (рекурсия), `SA_RESETHAND`, `SA_RESTART` (futex → `-ETIMEDOUT`) и SIGSTOP/SIGTSTP/SIGCONT, **секция процессов**: `fork`/`getppid`/`wait4` (включая `WNOHANG`, `ECHILD`, `EINVAL`), fork-ребёнок печатает `abi: fork ok`, родитель — `abi: wait ok`, дочерний `execve` заменяет образ и печатает `abi: exec ok`/`abi: exec wait ok`; мутационная половина: `mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`/`ftruncate` и их ошибки; сокетная секция: `socket` (bad domain/type/protocol, второй сокет), `connect` к `10.0.2.2:8000` (без сервера — `SKIP`, не fail), `setsockopt`/`getsockopt`, `send`/`recv`, `shutdown`, EOF и `-EPIPE`; без `/mnt` выходит 77 после no-fs половины, оставляя живой tail-поток | весь native ABI без libpagh: файлы, каталоги, символические ссылки, мутации, heap, время, ошибки, один TCP-сокет, `clone`/futex/`exit_group` |
+| `exec.rs` / `exec-child.elf` | цель `execve`: проверяет, что ядро собрало `argv[1] = "exec-arg"` и `envp[0] = "PWD=/mnt"`, печатает `abi: exec ok argc=2 argv=exec-arg env=PWD=/mnt`, выходит 0 | замена образа/стека/регистров при `execve`, сохранение pid/ppid/fd, сброс обработчиков сигналов |
 | `user.ld` | линковка: `_start` = `0x1_0000`, PT_LOAD-раскладка | совпадает с окном из `src/user/elf.rs` |
 
 ELF-файлы **закоммичены** — это часть дерева, как шрифт `assets/font8x18.bin`.
@@ -40,17 +41,23 @@ toolchain: `TOOLCHAIN=nightly-... ./userland/build.sh`. `strip=debuginfo`
   `getdents64=61`, `lseek=62`, `fstat=80`, `readlinkat=78`, `nanosleep=101`,
   `clock_gettime=113`, `uname=160`, `brk=214`, `exit=93`, `exit_group=94`,
   `set_tid_address=96`, `futex=98`, `sched_yield=124`, `getpid=172`,
-  `gettid=178`, `clone=220`, `socket=198`, `connect=203`, `sendto=206`,
+  `getppid=173`, `gettid=178`, `clone=220`, `fork=1000` (pagh-native),
+  `execve=221`, `wait4=260`, `socket=198`, `connect=203`, `sendto=206`,
   `recvfrom=207`, `setsockopt=208`, `getsockopt=209`, `shutdown=210`.
   `clone` — **нативная** подпись `clone(flags, stack, entry, arg)`, не Linux-raw:
-  ребёнок стартует на `entry(arg)`, из syscall не возвращается. Регистры: `a7` —
-  номер,
+  ребёнок стартует на `entry(arg)`, из syscall не возвращается. `fork=1000` —
+  pagh-native (asm-generic номера fork нет); `clone(0,0,0,0)` принимается как его
+  алиас. `fork` возвращает pid ребёнка родителю и 0 ребёнку; `wait4(pid, *status,
+  WNOHANG, 0)` отдаёт `pid`, 0 (жив), `-ECHILD` или `-EINVAL`, статус — POSIX
+  `code << 8` либо номер сигнала в младших 7 битах; `getppid` — 0 у программы из
+  шелла. Регистры: `a7` — номер,
   `a0..a5` — аргументы, `a0` — результат
   (`-errno`); диспетчер — `src/user/syscall.rs`.
 - Вход: `a0 = argc`, `a1 = argv`, `sp` — 16-выровненный SysV-кадр
   `[argc][argv…][NULL][envp…][NULL][строки]`; `argv[0]` — путь как набран,
   `envp = argv + argc + 1`. У `hello`/`fault`/`spin`/`abi` `argc = 1`; `argv.elf`
-  запускается selftest'ом с тремя аргументами и `PWD=/`.
+  запускается selftest'ом с тремя аргументами и `PWD=/`, `exec-child.elf` —
+  с `argv = ["exec-child", "exec-arg"]` и `PWD=/mnt`.
 - Никакого `std`/libc: `core::arch::global_asm!` для `_start` и голые `ecall`.
   `abi.rs`/`argv.rs` — `no_std` Rust без аллокатора; `panic_handler` паркует
   программу, поэтому проверки сделаны возвратными кодами, а не паниками.
@@ -59,10 +66,15 @@ toolchain: `TOOLCHAIN=nightly-... ./userland/build.sh`. `strip=debuginfo`
 - Пределы: 16 fd, путь ≤ 256 B, heap ровно 1 MiB (`brk`), `read(0)` неблокирующий
   (`-EAGAIN`), `getdents64` — снимок на `openat`; один TCP-сокет
   (`AF_INET`/`SOCK_STREAM`, IPv4-литерал), `recv` неблокирующий, без
-  `listen`/`accept`/UDP/DNS/TLS. Потоков ≤ 14 на прогон, у каждого 16 KiB
-  kernel-стека + guard; TLS/`CLONE_SETTLS`, PI/requeue-фьютексы и `join`/`waitid`
+  `listen`/`accept`/UDP/DNS/TLS. Потоков ≤ 14 на процесс, у каждого 16 KiB
+  kernel-стека + guard; одновременно живых процессов ≤ 6, у каждого своё Sv39
+  root/ASID. TLS/`CLONE_SETTLS`, PI/requeue-фьютексы и `join`/`waitid`
   отсутствуют; futex-таблица 32 ожидающих на 16 адресов; user-стек выделяет
-  вызывающий.
+  вызывающий. `fork` — глубокая копия user-страниц (не COW), `wait4` без
+  `SIGCHLD` и без `WNOWAIT`; сирот убивает и хоронит раннер фонового `run`, а не
+  init. `execve` сбрасывает все обработчики сигналов в `SIG_DFL`, отключает
+  alt-стек и сохраняет blocked-маску; fd/pipe наследуются, сокет в ребёнке
+  становится `-ENOTSUP`, offset файла копируется, а не делится.
 
 ## Как это видно из шелла
 
@@ -80,5 +92,5 @@ pagh:rv64> run spin
 run: spin exited with code 7
 pagh:rv64> selftest
 SELFTEST user-abi-argv PASS
-SELFTEST user-abi-syscalls PASS     # с /mnt (включая abi: threads ok и abi: mutations ok); без него SKIP
+SELFTEST user-abi-syscalls PASS     # с /mnt (abi: threads/signals/fork/wait/exec/mutations ok); без него SKIP
 ```

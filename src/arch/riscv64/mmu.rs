@@ -123,10 +123,10 @@ impl Flags {
     /// User read/write, no execute: a user stack or a writable data page.
     ///
     /// `U` makes the page reachable from U-mode; the kernel's own pages never
-    /// carry it, which is what keeps a user program out of the kernel despite
-    /// the single address space (see `memory::paging`). `G` is deliberately
-    /// clear: a user page belongs to one address space, not to every ASID, and
-    /// this kernel has exactly one ASID anyway.
+    /// carry it, which is what keeps a user program out of the kernel even
+    /// though every process root contains the kernel map (see
+    /// `memory::paging`). `G` is deliberately clear: a user leaf is private to
+    /// one process root/ASID and must not survive a switch.
     pub const fn user_rw() -> Self {
         Flags(PTE_V | PTE_R | PTE_W | PTE_U | PTE_A | PTE_D)
     }
@@ -287,13 +287,45 @@ pub const fn is_canonical(va: usize) -> bool {
     upper == 0 || upper == (1usize << (64 - VA_BITS + 1)) - 1
 }
 
-/// The `satp` value that selects Sv39 with `root` as its root table.
+/// Mask selecting the ASID field of `satp` (bits 59..44).
+pub const SATP_ASID_MASK: usize = (1usize << 16) - 1;
+
+/// The `satp` value that selects Sv39 with `root` as its root table and `asid`
+/// as its address-space tag.
 ///
-/// MODE in bits 63..60, ASID in 59..44, PPN in 43..0. The ASID stays 0: this
-/// kernel has one address space, and a nonzero ASID would promise the hardware a
-/// tag that nothing maintains yet.
+/// MODE in bits 63..60, ASID in 59..44, PPN in 43..0. A process gets a nonzero
+/// ASID from `memory::paging`; the kernel address space keeps ASID 0. The tag is
+/// only a TLB namespace here — every switch still flushes, because two roots
+/// that reused an ASID must never inherit each other's translations.
+pub const fn satp_for_asid(root: usize, asid: usize) -> usize {
+    (SATP_MODE_SV39 << 60)
+        | ((asid & SATP_ASID_MASK) << 44)
+        | ((root >> PAGE_SHIFT) & ((1usize << PPN_BITS) - 1))
+}
+
+/// The `satp` value that selects Sv39 with `root` as its root table, ASID 0.
+///
+/// This is the kernel's own address space and the value every non-user task
+/// carries while a process is not running.
 pub const fn satp_for(root: usize) -> usize {
-    (SATP_MODE_SV39 << 60) | ((root >> PAGE_SHIFT) & ((1usize << PPN_BITS) - 1))
+    satp_for_asid(root, 0)
+}
+
+/// The root-table physical address encoded in a `satp` value.
+pub const fn satp_root(satp: usize) -> usize {
+    (satp & ((1usize << PPN_BITS) - 1)) << PAGE_SHIFT
+}
+
+/// Install an already-built `satp` value and drop every cached translation.
+///
+/// The scheduler calls this when it switches to a task with a different address
+/// space. The unconditional flush is the honest choice for this MVP: the ASID
+/// allocator is monotonic, but a root frame can be reused after its process is
+/// reaped, and a stale translation for a reused ASID would be a silent
+/// cross-process alias.
+pub fn activate_satp(satp: usize) {
+    csr::write_satp(satp);
+    sfence_vma_all();
 }
 
 /// Read `satp`.
@@ -389,6 +421,10 @@ const _: () = {
 
     // satp: mode 8 in bits 63..60, the root's PPN in 43..0, ASID 0.
     assert!(satp_for(0x8020_0000) == 0x8000_0000_0008_0200);
+    // ...and ASID 7 in 59..44, with the root round-tripping out of the PPN.
+    assert!(satp_for_asid(0x8020_0000, 7) == 0x8000_7000_0008_0200);
+    assert!(satp_root(satp_for_asid(0x8020_0000, 7)) == 0x8020_0000);
+    assert!(satp_for_asid(0x8020_0000, 0) == satp_for(0x8020_0000));
 
     // Canonicality: the lower half ends at 2^38, the upper half begins at
     // 2^64 - 2^38, and the bit between them is not an address.

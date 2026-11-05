@@ -134,13 +134,16 @@ TTF-парсер (только офлайн-растетризованный а�
 | Round-robin и вытеснение по таймеру | **готово** | квант 8 тиков, готовые потоки FIFO; одна строка `timer::set_tick_handler(tick_from_timer)`; `sleep 1` двигает счётчики демо-потоков без `yield` (258 → 358 тиков, 32 → 44 переключения) |
 | Планировщик не аллоцирует и не берёт лок через switch | **готово** | `schedule()` выбирает под локом, отпускает и только потом `task_switch`; тик/switch без аллокаций; контракт в `src/task/README.md` |
 | Проверки машинные и идемпотентные | **готово** | `SELFTEST task-* 5/5`: interleave (130 switch-out), exit-stack, layout/guard, canary, idle; ledger `62650 -> 62650` в двух прогонах |
-| User mode + syscall'ы + ELF из шелла | **готово** | M6b: `sret` с `SPP=0`/`SPIE=1`/`SUM=0`, `sscratch`-контракт ловушек, `ecall`-диспетчер (`write`/`exit`/`sched_yield`/`getpid`, `sepc+4`, проверка user-указателей по PTE U\|R), ELF64-загрузчик с откатом кадров и потоковым чтением `ImageSource` (≤ 4 KiB за чтение, без буфера размером с файл), `run <path>` до 1 MiB и фикстуры `demo`/`fault`/`spin`; `SELFTEST user-* 8/8` с диском (7/8 + SKIP без `/mnt`), включая `user-run-large-file` (100 KiB образ с нулевым хвостом через `run_file`), ledger 62582 → 62582 дважды; `run demo` → 42, `run fault` → killed, `run spin` → 7 (таймер-in-U) |
+| User mode + syscall'ы + ELF из шелла | **готово** | M6b: `sret` с `SPP=0`/`SPIE=1`/`SUM=0`, `sscratch`-контракт ловушек, `ecall`-диспетчер (52 номера, `sepc+4`, проверка user-указателей по PTE U\|R), ELF64-загрузчик с откатом кадров и потоковым чтением `ImageSource` (≤ 512 B за чтение, без буфера размером с файл), per-process Sv39-root/ASID, `run <path>` до 1 MiB и фикстуры `demo`/`fault`/`spin`/`argv`/`abi`/`exec-child`; `SELFTEST user-* 10/10` с диском (8/10 + 2 SKIP без `/mnt`), включая `user-run-large-file` (100 KiB образ с нулевым хвостом через `run_file`), ledger совпадает в двух прогонах; `run demo` → 42, `run fault` → killed, `run spin` → 7 (таймер-in-U), маркеры `abi: threads/signals/altstack/siginfo/jobcontrol/fork/wait/exec/exec wait ok` |
 | Прерывание таймера, взятое в U-mode | **готово** | `trap_entry` U-путь + `SPP`-разбор эпилога; счётчик `traps::user_timer_ticks()` растёт на `run spin` (0.2 s в U-mode), selftest это проверяет |
 | Linux-compat слой из x86 | **нет** | после M6b и только когда есть userland, которому он нужен |
 
-Не входит в M6: SMP-планирование, приоритеты, реальное время, блокирующий I/O,
-несколько адресных пространств на поток (одна Sv39-карта, один ASID), сигналы и
-`fork`/`exec`. Это записано в `README.md` → «Чего нет».
+Не входит в M6: SMP-планирование, приоритеты, реальное время и блокирующий I/O.
+Пер-процессные адресные пространства, сигналы и `fork`/`execve`/`wait4`
+добавлены после M6b (native-proc, раздел 9.4 `docs/architecture.md`); остаются
+их ограничения — `fork` без COW, `mmap`/`brk` без demand paging, `SIGCHLD` без
+child-exit источника, сирот убивает foreground-раннер, `MAX_PROCESSES = 6`.
+Это записано в `README.md` → «Чего нет».
 
 Релиз **0.5.0** — это M6b: версия в `Cargo.toml`/`Cargo.lock`, тег `0.5.0`,
 GitHub release, скриншот `docs/user.png`.

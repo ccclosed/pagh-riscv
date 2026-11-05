@@ -205,8 +205,8 @@ SELFTEST SUMMARY: 7/7 passed
 | Блочное устройство | готово | virtio-mmio (modern virtio 1.x, version 2), polled: окна транспорта находятся через DTB, read/write/flush, опрос завершения с ограничением и FAILED после таймаута; `-global virtio-mmio.force-legacy=false` обязателен (иначе QEMU даёт legacy-транспорт) | `src/drivers/block.rs`, `src/drivers/virtio_mmio.rs` |
 | Файловая система (ext2) | готово | чтение/запись файлов (direct + single/double indirect), truncate, каталоги, create/unlink/mkdir/rmdir/rename, симлинки; совместимо с образом хостового `mkfs.ext2 -t ext2`; форматируется только пустое устройство (MBR/GPT/чужие данные — отказ с причиной); журнала/WAL нет | `src/fs/ext2/`, `src/fs/format_policy.rs` |
 | VFS | готово | `VfsNode`, синтетический корень, монтирование в `/mnt`, два примитива разрешения путей (`lookup_path` без последней симлинки / `walk` с переходом и бюджетом) | `src/vfs/mod.rs` |
-| Планировщик, потоки ядра (M6a) | готово | контекстный switch (callee-saved ABI), до 16 слотов (14 user-потоков на прогон), round-robin, квант 8 тиков, стек 16 KiB + guard из PMM, состояния `Ready/Running/Blocked/Exited`, `block_current`/`wake_task` с тиковым дедлайном, вытеснение тиком таймера из trap-контекста (включая вытеснение U-mode), `tasks`/`spawn`/`yield`; exit возвращает кадры | `src/arch/riscv64/switch.rs`, `src/task/` |
-| User mode, syscalls, ELF, native ABI (M6b) | готово | `sret` в U-mode (`SPP=0`, `SPIE=1`, `SUM=0`, `sscratch`-контракт); нативные потоки `clone`/`gettid`/`set_tid_address`/`exit`/`exit_group`/`futex` (общие RunState, файловая таблица, heap и mmap; своё ядро-стек и user-стек вызывающего), фьютексы `WAIT`/`WAKE`; вход `a0=argc`, `a1=argv`, SysV-кадр `argc/argv/envp` с `argv[0]` как набран и `PWD=<cwd>`; `ecall`-диспетчер: `read`/`write`/`openat`/`close`/`lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/`readlinkat`/`exit`/`sched_yield`/`getpid` + `mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`/`ftruncate` (мутации через `parent_and_leaf` + `walk(parent, true)`, per-run режим для `fstat`), `sepc+4`, таблица 16 fd на прогон, `copy_from_user`/`copy_to_user` с проверкой `U/R/W` и `SUM` вокруг копии, heap-окно 1 MiB с возвратом кадров; ELF64-загрузчик с откатом кадров и **потоковым чтением** `ImageSource` (сегменты кусками ≤ 512 B, без буфера размером с файл), `run <path> [args...]` до 1 MiB и фикстуры `demo`/`fault`/`spin`/`argv`/`abi`; BSD-сокеты `socket`/`connect`/`sendto`/`recvfrom`/`setsockopt`/`getsockopt`/`shutdown` (один TCP-клиент, IPv4-литералы) и маршрутизация `read`/`write`/`close` на сокет; POSIX-подобные сигналы `kill`/`tgkill`/`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`/`sigaltstack` (обработчики на прогон; pending/blocked/altstack на поток; user-кадр 736 B с полным `siginfo_t` и `ucontext_t`; `SA_SIGINFO`/`SA_ONSTACK`/`SA_NODEFER`/`SA_RESETHAND`/`SA_RESTART`; job control `SIGSTOP`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU` + `SIGCONT`); synchronous SIGSEGV/SIGILL/SIGBUS/SIGTRAP при установленном обработчике; fault из U без обработчика убивает задачу; таймер вытесняет U-mode | `src/user/`, `src/user/signal.rs`, `userland/` |
+| Планировщик, потоки ядра (M6a) | готово | контекстный switch (callee-saved ABI), до 16 слотов (14 user-потоков на процесс), round-robin, квант 8 тиков, стек 16 KiB + guard из PMM, состояния `Ready/Running/Blocked/Stopped/Exited`, `block_current`/`wake_task` с тиковым дедлайном, `stop_current`/`continue_task` для job control, `Task::satp` + `install_satp` перед switch, вытеснение тиком таймера из trap-контекста (включая вытеснение U-mode), `tasks`/`spawn`/`yield`; exit возвращает кадры | `src/arch/riscv64/switch.rs`, `src/task/` |
+| User mode, syscalls, ELF, native ABI (M6b) | готово | `sret` в U-mode (`SPP=0`, `SPIE=1`, `SUM=0`, `sscratch`-контракт); нативные потоки `clone`/`gettid`/`set_tid_address`/`exit`/`exit_group`/`futex` (общие Process/root, fd-таблица, heap и mmap; своё ядро-стек и user-стек вызывающего), фьютексы `WAIT`/`WAKE`; процессы `fork`(1000)/`execve`(221)/`wait4`(260)/`getppid`(173): свой Sv39-root/ASID, глубокая копия страниц, наследование fd/pipe/обработчиков, замена образа и статус `wait`, очистка сирот раннером; вход `a0=argc`, `a1=argv`, SysV-кадр `argc/argv/envp` с `argv[0]` как набран и `PWD=<cwd>`; `ecall`-диспетчер: `read`/`write`/`openat`/`close`/`lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/`readlinkat`/`exit`/`sched_yield`/`getpid` + `mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`/`ftruncate` (мутации через `parent_and_leaf` + `walk(parent, true)`, per-process режим для `fstat`), `sepc+4`, таблица 16 fd на процесс, `copy_from_user`/`copy_to_user` с проверкой `U/R/W` и `SUM` вокруг копии, heap-окно 1 MiB с возвратом кадров; ELF64-загрузчик с откатом кадров и **потоковым чтением** `ImageSource` (сегменты кусками ≤ 512 B, без буфера размером с файл), `run <path> [args...]` до 1 MiB и фикстуры `demo`/`fault`/`spin`/`argv`/`abi`; BSD-сокеты `socket`/`connect`/`sendto`/`recvfrom`/`setsockopt`/`getsockopt`/`shutdown` (один TCP-клиент, IPv4-литералы) и маршрутизация `read`/`write`/`close` на сокет; POSIX-подобные сигналы `kill`/`tgkill`/`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`/`sigaltstack` (обработчики на процесс: fork копирует, exec сбрасывает; pending/blocked/altstack на поток; user-кадр 736 B с полным `siginfo_t` и `ucontext_t`; `SA_SIGINFO`/`SA_ONSTACK`/`SA_NODEFER`/`SA_RESETHAND`/`SA_RESTART`; job control `SIGSTOP`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU` + `SIGCONT`); synchronous SIGSEGV/SIGILL/SIGBUS/SIGTRAP при установленном обработчике; fault из U без обработчика убивает процесс; таймер вытесняет U-mode | `src/user/`, `src/user/process.rs`, `src/user/signal.rs`, `src/memory/paging.rs`, `userland/` |
 | Сеть (M7) | готово | virtio-net (modern, polled) + свой стек: Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP-клиент, DNS-резолвер, `net`/`dhcp`/`ping`/`dns`/`http`; без smoltcp и внешних крейтов. Для userland — один active-open TCP-сокет (`AF_INET`/`SOCK_STREAM`, IPv4-литерал), syscall'ы которого сами опрашивают NIC; `read`/`write` работают на сокете | `src/net/`, `src/drivers/virtio_net.rs`, `src/user/syscall.rs` |
 | Пакеты (`pkg`) | MVP | нативный установщик (не apt): плоский `index` и `.ppkg` с репозитория по **plain HTTP** (`http://IP:port/`, в QEMU хост — `10.0.2.2`), потоковая загрузка в `/mnt/pkg` кусками 4 KiB, шлюз «размер + SHA-256 из индекса» **до** разбора `PPKG0001`; `kind=app` → `/mnt/bin/<name>`, `applet-bundle` → `/mnt/bin/paghbox` + симлинки; манифест в `/mnt/pkg/<name>.manifest`; TLS/OpenPGP/apt по-прежнему нет | `src/pkg/` |
 | apt / TLS / OpenPGP | **нет** | apt намеренно не подключён, пока нет vendored TLS + проверки подписей Debian; `pkg` — отдельный нативный путь для портов | — |
@@ -309,18 +309,22 @@ selftest        # + SELFTEST user-*: 10/10 с /mnt (без диска 8/10 + 2 S
 | 101 | `nanosleep` | `Timespec` проверяется и округляется **вверх** до тика; `rem` игнорируется; ждёт в `wfi` с разрешёнными прерываниями |
 | 160 | `uname` | 5×16 байт: `pagh`, `pagh-riscv`, `0.10.0`, версия пакета, `riscv64` |
 | 78 | `readlinkat` | цель символической ссылки без NUL; не ссылка — `-EINVAL` |
-| 172 | `getpid` | id главного потока прогона (один pid на программу) |
+| 172 | `getpid` | id процесса (`Process.pid`), один на все его потоки; у процесса из шелла положительный, pid 0 зарезервирован |
+| 173 | `getppid` | pid родителя: у программы, запущенной шеллом, — 0; у `fork`-ребёнка — pid родителя; после `execve` сохраняется |
 | 178 | `gettid` | id вызывающего потока (уникален в прогоне) |
 | 96 | `set_tid_address` | принимается и игнорируется; возвращает tid вызывающего |
 | 124 | `sched_yield` | добровольное переключение |
 | 93 | `exit` | завершает **вызывающий поток**; если он последний — прогон кончается, `run_source` возвращает код главного потока (код не-главного отбрасывается); не возвращается |
 | 94 | `exit_group` | завершает все потоки прогона (готовые и заблокированные) и возвращает код главного, если он уже вышел, иначе код вызывающего; не возвращается |
-| 220 | `clone` | нативный `clone(flags, stack, entry, arg)`: `CLONE_VM|CLONE_THREAD` обязательны, `CLONE_FS/FILES/SIGHAND` принимаются (общие и так), `CLONE_SETTLS` — `-ENOTSUP`, неизвестный бит — `-EINVAL`; дочерний поток стартует в U-mode на `entry(arg)` со `sp=stack` и не возвращается из syscall (и `entry` не должен возвращаться — трамплина нет); родитель получает tid (>0) |
+| 220 | `clone` | нативный `clone(flags, stack, entry, arg)`: `CLONE_VM|CLONE_THREAD` обязательны, `CLONE_FS/FILES/SIGHAND` принимаются (общие и так), `CLONE_SETTLS` — `-ENOTSUP`, неизвестный бит — `-EINVAL`; дочерний поток стартует в U-mode на `entry(arg)` со `sp=stack` и не возвращается из syscall (и `entry` не должен возвращаться — трамплина нет); родитель получает tid (>0). `clone(0,0,0,0)` — алиас `fork` |
+| 1000 | `fork` | pagh-native (в asm-generic номера нет): глубокая копия user-страниц (image, heap, mmap, 64 KiB стек) в новый root/ASID, копия fd-таблицы (pipe — +1 ссылка на ring, сокет — `-ENOTSUP` в ребёнке), копия обработчиков/blocked/altstack, без pending и чужих потоков; ребёнок получает 0, родитель — pid, обе стороны продолжают с `sepc+4`; ошибки `-EAGAIN`/`-EINVAL` |
+| 221 | `execve` | абсолютный путь, `argv`/`envp` через `copy_from_user`; новый root, ELF, 64 KiB стек и SysV-кадр; старые image/heap/mmap/стек освобождаются, `pid`/`ppid`/fd/blocked-маска сохраняются, все обработчики → `SIG_DFL`, alt-стек выключен, pending погашен, sibling-потоки сняты; `a0=argc`, `a1=argv`, `sepc` не сдвигается; ошибки `-ENOENT`/`-ENOEXEC`/`-EISDIR`/`-E2BIG`/`-EFAULT`/`-ENOMEM` не меняют образ |
+| 260 | `wait4` | `pid > 0` — конкретный ребёнок, `0`/`-1` — любой, `pid < -1` — `-EINVAL`; `options & !WNOHANG` — `-EINVAL`; возвращает pid зомби, 0 при `WNOHANG`, `-ECHILD`, `-EFAULT`; статус — `code << 8` либо номер сигнала в младших 7 битах; блокирует вызывающий поток и просыпается на exit/exit_group/fault ребёнка; `SIGCHLD` не генерируется |
 | 98 | `futex` | `uaddr, op, val, timeout, uaddr2, val3`: `FUTEX_WAIT` (0) проверяет `*uaddr == val` и блокирует до `FUTEX_WAKE`/тикового дедлайна; `FUTEX_WAKE` (1) будит не больше `val`; `FUTEX_PRIVATE_FLAG` принимается; `WAKE_OP`/requeue/PI — `-ENOSYS`; `-EAGAIN`/`-ETIMEDOUT`/`-ENOMEM`, как в POSIX |
 | 129 | `kill` | `pid > 0` — tid потока прогона, `0`/`-1` — все живые потоки; `sig = 0` — только проверка существования; неизвестный pid — `-ESRCH`, signum вне 0..31 — `-EINVAL`; SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU с `SIG_DFL` останавливают поток (per-thread `Stopped` в планировщике), SIGCONT возобновляет; signal помечается pending, а заблокированный `FUTEX_WAIT` будится (wait вернёт `-EINTR`, либо перезапустится при `SA_RESTART`) |
 | 131 | `tgkill` | `tgid` обязан совпадать с `getpid()`, `tid` — живой поток прогона; иначе `-ESRCH`; доставка как у `kill`, `si_code = SI_TKILL` |
 | 132 | `sigaltstack` | `*SigAltStack { ss_sp, ss_flags, pad, ss_size }` (24 B), `*oldstack`; `SS_DISABLE=2` выключает, `SS_ONSTACK=1` репортится на активном стеке; размер ≥ `MINSIGSTKSZ = 4096`, весь диапазон `U|R|W`, иначе `-EINVAL`/`-EFAULT`; стек per-thread |
-| 134 | `rt_sigaction` | `struct sigaction { handler, flags, mask, restorer }` (32 B), `sigsetsize = 8`; `SIG_DFL=0`, `SIG_IGN=1`; для функции обязательны `SA_RESTORER=0x04000000` и restorer в user-exec странице; допустимы `SA_ONSTACK=0x08000000`, `SA_RESTART=0x10000000`, `SA_NODEFER=0x40000000`, `SA_RESETHAND=0x80000000`, `SA_SIGINFO=4`; другие биты — `-EINVAL`; SIGKILL/SIGSTOP — `-EINVAL`; таблица 1..31 на прогон |
+| 134 | `rt_sigaction` | `struct sigaction { handler, flags, mask, restorer }` (32 B), `sigsetsize = 8`; `SIG_DFL=0`, `SIG_IGN=1`; для функции обязательны `SA_RESTORER=0x04000000` и restorer в user-exec странице; допустимы `SA_ONSTACK=0x08000000`, `SA_RESTART=0x10000000`, `SA_NODEFER=0x40000000`, `SA_RESETHAND=0x80000000`, `SA_SIGINFO=4`; другие биты — `-EINVAL`; SIGKILL/SIGSTOP — `-EINVAL`; таблица 1..31 на процесс (fork копирует, exec сбрасывает) |
 | 135 | `rt_sigprocmask` | `how` 0/1/2 (`SIG_BLOCK`/`SIG_UNBLOCK`/`SIG_SETMASK`), маска 8 B, сигнал `n` — бит `n-1`; маска per-thread; биты SIGKILL/SIGSTOP отбрасываются; `oldset` пишется до установки новой маски; `sigsetsize != 8` — `-EINVAL` |
 | 139 | `rt_sigreturn` | вызывается restorer'ом при `sp` на кадр сигнала; проверяет `U|R` весь кадр (736 B), magic, signum, frame flags и активный кадр потока, восстанавливает `TrapFrame` (`sepc/sp/regs`), blocked-маску, глубину alt-стека и `sstatus` (`SPP=0`, `SUM=0`, `SPIE=1`); без кадра/чужой кадр — `-EINVAL`, плохой указатель — `-EFAULT`; `sepc` не сдвигается (при `SA_RESTART` `sepc` остаётся на `ecall` и syscall повторяется) |
 | 34 | `mkdirat` | создать каталог; `dirfd` игнорируется, `mode` принимается и **игнорируется** (в VFS нет `set_mode`, ext2 даёт 0o755) |
@@ -328,8 +332,16 @@ selftest        # + SELFTEST user-*: 10/10 с /mnt (без диска 8/10 + 2 S
 | 36 | `symlinkat` | создать ссылку: `a0` — цель (сырая строка, **не** резолвится), `a1` — `dirfd` (игнорируется), `a2` — путь |
 | 37 | `linkat` | жёсткая ссылка; оба `dirfd` игнорируются, `flags` обязан быть 0; каталог — `-EISDIR` |
 | 276 | `renameat2` | переименование/перенос одной транзакцией VFS; `flags` обязан быть 0; межмонтовый перенос — `-ENOTSUP` |
-| 53 | `fchmodat` | `mode & 0o7777` пишется в per-run таблицу по `fs_ino`; `fstat` видит новые биты до конца прогона, на диск не пишется; синтетический узел — `-ENOTSUP` |
+| 53 | `fchmodat` | `mode & 0o7777` пишется в per-process таблицу по `fs_ino`; `fstat` видит новые биты до конца процесса, на диск не пишется; синтетический узел — `-ENOTSUP`; ребёнок после `fork` таблицу не наследует |
 | 46 | `ftruncate` | изменить размер открытого regular-файла; fd 0/1/2 — `-EINVAL`, каталог — `-EISDIR`, read-only fd — `-EBADF` |
+| 23 | `dup` | копия дескриптора в первый свободный слот; файл/каталог/pipe делят объект (pipe — ещё одна ссылка на ring); нет слота — `-ENOSPC`, плохой fd — `-EBADF` |
+| 24 | `dup2` | копия в `newfd`, старый occupant закрывается; `flags = 0`, `newfd >= 16` — `-EBADF`, `oldfd == newfd` — возврат без изменений; `dup3`-семантики (`-EINVAL` при равенстве) нет |
+| 59 | `pipe2` | `fds` — два `i32`; ring 4 KiB, read/write концы; `flags` обязан быть 0 (`O_NONBLOCK` уже единственный режим, `O_CLOEXEC` не реализован); ошибка не оставляет ни fd, ни ring; pipe наследуется `fork` с +1 ссылкой |
+| 7 | `poll` | `pollfd[16]`, `timeout_ms`: 0 — один неблокирующий скан, <0 — без дедлайна; `POLLIN/POLLOUT/POLLERR/POLLHUP/POLLNVAL`; сам опрашивает UART/клавиатуру/NIC; для сокета — `net::poll` |
+| 72 | `ppoll` | `Timespec` округляется вверх до мс, `NULL` — навсегда; `sigmask`/`sigsetsize` принимаются и игнорируются; остальное как `poll` |
+| 222 | `mmap` | только `MAP_PRIVATE|MAP_ANONYMOUS`, `fd = -1`, `offset = 0`; `PROT_READ|WRITE|EXEC`, W^X (W и X вместе — `-EINVAL`), `PROT_NONE` — `-EINVAL`; `addr` — подсказка, окно `USER_MMAP_BASE..TOP`; кадры выделяются и обнуляются сразу, ошибка откатывает всё; предел 256 страниц/регионов 8 |
+| 215 | `munmap` | только страницы, созданные `mmap` этого процесса; `addr` выровнен, `length > 0`; частичный unmap делит регион; чужая страница/дырка — `-EINVAL` |
+| 226 | `mprotect` | `PROT_*` как у `mmap`; все страницы диапазона обязаны быть живыми user-leaf (`U|R`) до первой записи PTE; W^X; смена прав сохраняет кадр и делает `fence.i` |
 | 198 | `socket` | только `AF_INET` (2), `SOCK_STREAM` (1), protocol 0; иначе `-EAFNOSUPPORT`; fd ≥ 3, второе соединение при открытом первом — `-ENOSPC` |
 | 203 | `connect` | `a1` — 16-байтный `sockaddr_in` (family u16 LE, port u16 BE, addr[4], padding), `a2 = 16`; указатель и family валидируются, ошибки — `-EFAULT`/`-EINVAL`/`-EAFNOSUPPORT`/`-ENETUNREACH`/`-EHOSTUNREACH`/`-ECONNREFUSED`/`-ETIMEDOUT`; внутри опрашивает NIC до готовности handshake |
 | 206 | `sendto` | `send` на connected-сокете: `flags = 0`, `dest` опционален (валидируется и игнорируется); TCP-send синхронный (ждёт ACK с ограниченным опросом), ошибки — `-ENOTCONN`/`-EPIPE`/`-ECONNRESET`/`-ETIMEDOUT` |
@@ -338,14 +350,15 @@ selftest        # + SELFTEST user-*: 10/10 с /mnt (без диска 8/10 + 2 S
 | 209 | `getsockopt` | `SO_TYPE` → `SOCK_STREAM`, `SO_ERROR` → 0, таймауты → 0, `TCP_NODELAY` → 0; остальное — `-ENOPROTOOPT` |
 | 210 | `shutdown` | `how` 0/1/2 валидируется, но half-close нет: закрываются оба направления, fd остаётся открытым (последующий `read` → 0, `write` → `-EPIPE`) до `close` |
 
-Пределы и отличия, которые важно знать userland'у: 16 дескрипторов включая
-0/1/2 (кончились — `-ENOSPC`); путь ≤ 256 байт с NUL; `argv`+`env` ≤ 64 строк и
-≤ 16 KiB; heap — ровно 1 MiB в `0x2000_0000..0x2010_0000`, кадры под него
-возвращаются в PMM после прогона (включая fault). Потоков — до 14 на прогон
+Пределы и отличия, которые важно знать userland'у: 16 дескрипторов **на
+процесс** включая 0/1/2 (кончились — `-ENOSPC`); путь ≤ 256 байт с NUL;
+`argv`+`env` ≤ 64 строк и ≤ 16 KiB; heap — ровно 1 MiB в
+`0x2000_0000..0x2010_0000`, кадры под него возвращаются в PMM после процесса
+(включая fault). Процессов — до 6 (`MAX_PROCESSES`), потоков — до 14 на процесс
 (главный + 13 `clone`; 16 слотов планировщика минус `shell` и `idle`); у каждого
-свой kernel-стек 16 KiB + guard из PMM, user-стек передаёт вызывающий и ядро его
-не освобождает; futex-таблица — 32 ожидающих на 16 адресов; TLS/PI/requeue и
-`fork`/`exec` нет. Сигналы — узкое POSIX-подмножество: 31 номер, один pending-бит
+потока свой kernel-стек 16 KiB + guard из PMM, user-стек передаёт вызывающий и
+ядро его не освобождает; futex-таблица — 32 ожидающих на 16 адресов; TLS/PI/
+requeue и `join`/`waitid` нет. Сигналы — узкое POSIX-подмножество: 31 номер, один pending-бит
 на сигнал и один кадр 736 B на активный обработчик (вложенность допустима),
 per-thread alt-стек через `sigaltstack`/`SA_ONSTACK`, полный 128-байтный
 `siginfo_t` (`si_pid`/`si_uid`/`si_code`/`si_addr`/`si_status`) и 288-байтный
@@ -353,10 +366,43 @@ per-thread alt-стек через `sigaltstack`/`SA_ONSTACK`, полный 128-
 реализованы; `SA_RESTART` перезапускает только `futex`/`nanosleep` и с полным
 таймаутом заново. Job control — только остановка потоков: SIGSTOP/SIGTSTP/
 SIGTTIN/SIGTTOU паркуют поток в планировщике, SIGCONT возвращает его в очередь;
-tty и process-group модели нет, поэтому остановить весь прогон `kill(0, SIGSTOP)`
-можно, а возобновить извне — некому. SIGKILL/SIGSTOP нельзя поймать или
+tty и process-group модели нет, поэтому остановить весь процесс
+`kill(0, SIGSTOP)` можно, а возобновить извне — некому. SIGKILL/SIGSTOP нельзя поймать или
 заблокировать; `sigqueue`, `sival_ptr`, очередей сигналов и SIGFPE-генератора
 нет.
+**Процессы (native-proc).** `fork(1000)` — pagh-native номер (asm-generic его
+не имеет), `clone(0,0,0,0)` — алиас; `execve(221)`, `wait4(260)` и `getppid(173)`
+— обычные номера. У процесса свой Sv39-root и ненулевой 16-битный ASID:
+`paging::create_user_space` копирует в него все supervisor-отображения ядра, а
+user-страницы добавляет только этот процесс. Поэтому два процесса не видят
+память друг друга, но ядро и устройства доступны из любого root'а; `satp`
+переключается в `scheduler::install_satp` перед `task_switch`, и, хотя ASID —
+метка TLB, смена root всегда сопровождается полным `sfence.vma` (кадр таблицы
+может быть переиспользован). `fork` — **глубокая копия**, не COW: image, heap,
+mmap и 64 KiB user-стека копируются постранично; fd-строка копируется (pipe
+получает +1 ссылку на общий ring, сокет в ребёнке становится `-ENOTSUP`, offset
+файла копируется, а не делится); обработчики, blocked-маска и altstack
+наследуются, pending-биты — нет. Ребёнок возвращается с `a0 = 0`, родитель — с
+pid; обе стороны продолжают с `sepc + 4`.
+
+`execve` собирает ELF, стек и SysV-кадр в новом root'е и подменяет образ
+атомарно: старые image/heap/mmap/стек освобождаются, `pid`/`ppid`/fd и
+blocked-маска сохраняются, все обработчики сбрасываются в `SIG_DFL` (даже
+`SIG_IGN` — отличие от POSIX), alt-стек выключается, pending гасится,
+sibling-потоки снимаются. На успехе `dispatch` не пишет `a0` и не двигает
+`sepc`: кадр уже указывает на `entry` с `a0=argc`, `a1=argv`. Ошибка не меняет
+старый образ.
+
+`wait4` возвращает pid зомби, `0` при `WNOHANG`, `-ECHILD` или `-EINVAL`;
+статус — `code << 8` для обычного выхода либо номер сигнала в младших 7 битах
+(core-бита нет). `SIGCHLD` **не генерируется**: родителя будит прямой
+`notify_parent` из `exit`/`exit_group`/`on_fault`, а `siginfo.si_status` для
+явно посланного SIGCHLD остаётся 0. Init-процесса нет, поэтому сироту (ребёнка,
+пережившего foreground-`run`, или внука после `wait4` его родителя) раннер
+убивает и хоронит `cleanup_orphans`: `kill_group` → `force_finish` → `reap` →
+освобождение fd/сигналов/страниц. Приглашение шелла возвращается только когда
+таблица процессов и PMM-ledger пусты.
+
 Мутации каталога (`mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`)
 идут через `parent_and_leaf` + `walk(parent, true)` и одну VFS-транзакцию:
 ошибка не оставляет полусостояния, а неудачный `openat(O_CREAT)` (кончились fd)
@@ -587,28 +633,33 @@ IPv4, ICMP и UDP, а `dhcp`/`dns`/`tcp` — маленькие клиенты. 
 Этот список — часть документации, а не извинение. Если подсистемы здесь нет,
 значит её нет в коде.
 
-* **Нет адресного пространства на процесс.** Sv39 включён, но карта одна:
-  identity для RAM, плюс user-окно с `U=1` (образ, стек, heap) в той же таблице.
-  `satp.ASID = 0`, VMM/mprotect/разделяемых страниц нет; два user-процесса друг
-  от друга не защищены — только юзер от ядра. `run_image` держит «одна программа
-  за раз».
-* **Нет `mmap`, `mprotect`, `fork`/`exec` и динамического ELF.**
-  `brk` есть, но это одно фиксированное окно 1 MiB (`0x2000_0000`), а не общий
-  менеджер памяти; `read(0)` неблокирующий (`-EAGAIN`), `getdents64` отдаёт
-  снимок каталога на момент `openat`, `openat(... O_CREAT)` игнорирует `mode`
-  (в VFS нет `set_mode`).
-* **Нет `fork`/`exec` и динамического ELF.** Загрузчик понимает только
-  статические `ET_EXEC`/`ET_DYN` без интерпретатора; userland — голые `ecall`.
-  `run <path>` читает файл *ядром* потоково, частями не больше 512 B, и грузит
-  его в user-окно; предел образа — 1 MiB (`MAX_IMAGE_BYTES`), одновременно
-  исполняется один user-образ, отдельного адресного пространства процесса и
-  отображения `/mnt` в него нет.
+* **Адресное пространство — per-process, но без COW и demand paging.**
+  `fork`/`exec` дают каждому процессу свой Sv39-root и 16-битный ASID; ядро
+  копирует supervisor-карту, user-страницы приватны. Ограничения: не больше
+  6 процессов, `fork` копирует все страницы целиком (COW нет), страницы `mmap`
+  и `brk` выделяются сразу (нет fault-подкачки), `MAP_SHARED`/`MAP_FIXED`/
+  file-backed `mmap` и разделяемая память отсутствуют, ASID не используется для
+  пропуска `sfence.vma`, а один hart остаётся. Foreground-`run` по-прежнему один:
+  второй параллельный запуск ждёт, пока шелл не вернётся из первого.
+* **`mmap`/`mprotect`/`brk` есть, но окна фиксированы.** `brk` — ровно 1 MiB
+  (`0x2000_0000..0x2010_0000`), `mmap` — анонимный `MAP_PRIVATE` в окне
+  `USER_MMAP_BASE..TOP`, не больше 256 страниц и 8 регионов; W^X соблюдается,
+  `PROT_NONE` не выражается. `read(0)` неблокирующий (`-EAGAIN`), `getdents64`
+  отдаёт снимок каталога на момент `openat`, `openat(... O_CREAT)` игнорирует
+  `mode` (в VFS нет `set_mode`).
+* **ELF только статический, без интерпретатора.** Загрузчик понимает
+  `ET_EXEC`/`ET_DYN` без `PT_INTERP`; userland — голые `ecall`. `run <path>`
+  читает файл *ядром* потоково, частями не больше 512 B, и грузит его в root
+  процесса; предел образа — 1 MiB (`MAX_IMAGE_BYTES`). `execve` принимает только
+  абсолютный путь и тот же формат; динамического линкера, PIE-загрузки и
+  отображения `/mnt` «само собой» нет.
 * **Потоки — MVP, не POSIX threads.** `clone` создаёт поток только с явным
   `entry(arg)` и `CLONE_VM|CLONE_THREAD`; TLS (`CLONE_SETTLS` — `-ENOTSUP`),
-  `fork`/`exec`, `join`/`waitid`, приоритеты и priority-inheritance
-  фьютексы отсутствуют. Максимум — 14 живых потоков на прогон; user-стек
-  выделяет и освобождает вызывающий; код не-главного потока при `exit`
-  отбрасывается. Планировщик по-прежнему round-robin без приоритетов.
+  `join`/`waitid`, приоритеты и priority-inheritance фьютексы отсутствуют.
+  Максимум — 14 живых потоков на процесс; user-стек выделяет и освобождает
+  вызывающий; код не-главного потока при `exit` отбрасывается. `fork`
+  поддерживает только один вызывающий поток (копирует именно его), а
+  планировщик по-прежнему round-robin без приоритетов.
 * **Сигналы — узкое подмножество POSIX, не Linux.** Один кадр на обработчик
   (736 B, вложенность через `prev_frame`), есть `sigaltstack`/`SA_ONSTACK`,
   `SA_RESTART` (только `futex`/`nanosleep`, полный таймаут заново),
@@ -619,7 +670,12 @@ IPv4, ICMP и UDP, а `dhcp`/`dns`/`tcp` — маленькие клиенты. 
   SIGKILL/SIGSTOP нельзя поймать или заблокировать. Синхронный fault
   доставляется установленному обработчику, но вернуться из него можно только
   изменив сохранённый кадр или завершив поток; автоматического «пропустить
-  инструкцию» нет.
+  инструкцию» нет. Обработчики принадлежат процессу: `fork` их копирует,
+  `execve` сбрасывает все в `SIG_DFL` (даже `SIG_IGN`) и выключает alt-стек,
+  blocked-маску сохраняет. `SIGCHLD` не генерируется: `wait4` будит родителя
+  напрямую, `si_status` для SIGCHLD остаётся 0, а `si_pid`/`si_uid` есть только
+  у `kill`/`tgkill`. Межпроцессного `kill` нет (нет прав/process group), сирот
+  убивает раннер foreground-`run`, а не init.
 * **Нет журнала/WAL в ext2.** Сбой между двумя записями может оставить операцию
   недоделанной; crash-consistency не заявляется.
 * **Один блочный слот, нет разделов/hot-plug.** Второй диск — изменение дизайна.
@@ -641,7 +697,7 @@ IPv4, ICMP и UDP, а `dhcp`/`dns`/`tcp` — маленькие клиенты. 
   это предполагают.
 * **Нет восстановления после S-mode исключения.** Сбой в ядре — печать и
   остановка hart. Сбой в U-mode (page fault, illegal instruction) завершает
-  только задачу.
+  процесс, а не машину.
 * **Нет host-тестов.** Логика ядра покрыта in-QEMU `selftest` и smoke-тестом;
   чистая логика (`src/fdt.rs`) не покрыта ничем.
 * **Нет поддержки реального железа.** Адреса UART и `fw_cfg` захардкожены,
@@ -659,14 +715,15 @@ src/arch/riscv64/csr.rs        типизированный доступ к CSR
 src/arch/riscv64/traps.rs      trap_entry, кадр на 264 байта, диспетчер
 src/arch/riscv64/sbi.rs        ecall в M-mode (SRST)
 src/arch/riscv64/mmu.rs        примитивы Sv39 (PTE, PageTable, satp, sfence)
-src/memory/paging.rs           identity-карта ядра, map/unmap/translate, satp
+src/memory/paging.rs           identity-карта ядра, per-process root/ASID, map/unmap/translate, satp
 src/fdt.rs                     минимальный читатель flattened device tree
 src/memory/{mod,pmm}.rs        пул физических кадров (битовая карта 4 KiB)
 src/memory/heap.rs             куча: free-list поверх чанков по 64 KiB
 src/memory/selftest.rs         in-QEMU self-tests памяти (selftest)
-src/user/mod.rs                run_image: ELF -> user-стек -> задача -> sret в U-mode
-src/user/elf.rs                ELF64-загрузчик: валидация, PT_LOAD с U=1, откат кадров
-src/user/syscall.rs            ecall-диспетчер: read/write/openat/close/lseek/fstat/getdents64/brk/time/uname/readlinkat + mkdirat/unlinkat/symlinkat/linkat/renameat2/fchmodat/ftruncate + socket/connect/sendto/recvfrom/setsockopt/getsockopt/shutdown + clone/gettid/set_tid_address/exit/exit_group/futex
+src/user/mod.rs                run_image: root/ASID -> ELF -> user-стек -> задача -> sret; fork/execve/wait4, очистка сирот
+src/user/process.rs            таблица процессов: root/satp/asid, threads/exit/wait, image/heap-списки
+src/user/elf.rs                ELF64-загрузчик: load_in(root), PT_LOAD с U=1, откат кадров
+src/user/syscall.rs            ecall-диспетчер: 52 номера — файлы/ФС, mmap/munmap/mprotect, pipe/dup/poll, сигналы, сокеты, clone/fork/execve/wait4/getppid
 src/user/futex.rs              статическая futex-очередь (32 ожидающих / 16 адресов) поверх block_current/wake_task
 src/user/selftest.rs           in-QEMU self-tests user mode (10 проверок)
 src/net/mod.rs                 сетевой стек: poll, ARP-кэш, диспетчер кадров, ping

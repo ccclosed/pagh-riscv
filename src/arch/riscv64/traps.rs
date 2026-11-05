@@ -19,6 +19,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// architectural register numbering, because that is what the offsets can be
 /// checked against.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct TrapFrame {
     pub ra: usize,
     pub sp: usize,
@@ -53,6 +54,51 @@ pub struct TrapFrame {
     pub t6: usize,
     pub sepc: usize,
     pub sstatus: usize,
+}
+
+impl TrapFrame {
+    /// A frame whose every register is zero.
+    ///
+    /// Used by the native-thread and fork entry paths, which overwrite the
+    /// fields they mean to define and deliberately leave the rest at zero so a
+    /// U-mode program never inherits kernel register state.
+    pub const fn zeroed() -> Self {
+        TrapFrame {
+            ra: 0,
+            sp: 0,
+            gp: 0,
+            tp: 0,
+            t0: 0,
+            t1: 0,
+            t2: 0,
+            s0: 0,
+            s1: 0,
+            a0: 0,
+            a1: 0,
+            a2: 0,
+            a3: 0,
+            a4: 0,
+            a5: 0,
+            a6: 0,
+            a7: 0,
+            s2: 0,
+            s3: 0,
+            s4: 0,
+            s5: 0,
+            s6: 0,
+            s7: 0,
+            s8: 0,
+            s9: 0,
+            s10: 0,
+            s11: 0,
+            t3: 0,
+            t4: 0,
+            t5: 0,
+            t6: 0,
+            sepc: 0,
+            sstatus: 0,
+        }
+    }
 }
 
 // The assembly hard-codes the 264-byte size (`addi sp, sp, -264`); a field added

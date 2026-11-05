@@ -28,3 +28,4 @@ build fault.rs fault.elf
 build spin.rs spin.elf
 build argv.rs argv.elf
 build abi.rs abi.elf
+build exec.rs exec-child.elf

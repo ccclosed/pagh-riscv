@@ -468,13 +468,14 @@ SELFTEST SUMMARY: 6/6 passed
 Ядро умеет запускать несколько потоков: контекстный switch, round-robin
 очередь, вытеснение по таймеру. В M6b поверх этого появился user mode:
 user-программа — та же задача, у которой подготовлен кадр возврата в U-mode
-(раздел 9.1).
+(раздел 9.1). С native-proc у задачи есть `satp`: поток процесса исполняется в
+root/ASID своего процесса, а switch переключает адресное пространство (9.4).
 
 | Что | Файлы | Контракт |
 |---|---|---|
 | контекст потока | `src/arch/riscv64/switch.rs` | второй ABI ядра: `TaskContext` = `ra`, `sp`, `s0`–`s11` (14 pointer-sized полей) и `task_switch(from, to)`. Сохраняются только callee-saved регистры: `switch` вызывается как обычная `extern "C"` функция, caller-saved регистры компилятор и так считает испорченными. Смещения asm берутся из layout'а структуры (`global_asm!` const-операнды), а `const _` ловит изменение размера. Trap frame не трогается: поток, вытесненный внутри обработчика, держит свой кадр на своём стеке и при возобновлении просто доходит до `sret` |
-| задачи | `src/task/scheduler.rs` | до `MAX_TASKS = 16` слотов: `shell`(0) на загрузочном стеке, `idle`(1) со стеком из PMM, `task-N`/`thread-N` — демо и user-потоки. Состояния `Free/Ready/Running/Blocked/Exited`; FIFO ready-queue, квант `QUANTUM_TICKS = 8` тиков; `spawn(fn)`/`spawn_user_thread` дают 16 KiB стек + 4 KiB guard (PMM, `alloc_frames_contiguous`), вышедший поток возвращает кадры (`reap`); `block_current`/`wake_task`/`kill_group` — примитивы user-потоков (9.2) |
-| вытеснение | таймер (M3) | `timer::set_tick_handler(task::scheduler::tick_from_timer)` — одна строка в `kmain`. Тик срабатывает в trap-контексте: `tick_from_timer` помечает аппаратные часы привязанными и вызывает `schedule()`. Переключение из обработчика корректно именно потому, что кадр прерывания лежит на стеке вытесняемого потока |
+| задачи | `src/task/scheduler.rs` | до `MAX_TASKS = 16` слотов: `shell`(0) на загрузочном стеке, `idle`(1) со стеком из PMM, `task-N`/`thread-N` — демо и user-потоки. Состояния `Free/Ready/Running/Blocked/Stopped/Exited`; FIFO ready-queue, квант `QUANTUM_TICKS = 8` тиков; `spawn(fn)`/`spawn_user_thread`/`spawn_user_frame` дают 16 KiB стек + 4 KiB guard (PMM, `alloc_frames_contiguous`), вышедший поток возвращает кадры (`reap`); `block_current`/`wake_task`/`kill_group` — примитивы user-потоков (9.2); `Task::satp` и `install_satp` — переключение root'а (9.4) |
+| вытеснение | таймер (M3) | `timer::set_tick_handler(task::scheduler::tick_from_timer)` — одна строка в `kmain`. Тик срабатывает в trap-контексте: `tick_from_timer` помечает аппаратные часы привязанными и вызывает `schedule()`. Переключение из обработчика корректно именно потому, что кадр прерывания лежит на стеке вытесняемого потока; `install_satp` до `task_switch` успевает поставить root входящего потока |
 | программные часы | `scheduler::pump` | без таймера (машина без timebase) шелл и демо-потоки «тикают» сами; после привязки таймера `pump` — no-op. Это нужно, чтобы M6a проверялся и на машине без M3 |
 | lock-дисциплина | `scheduler.rs` | очередь под спинлоком с замаскированными прерываниями; `schedule()` берёт lock, выбирает следующий слот, отпускает lock и только потом делает `task_switch` — switch не выполняется с удержанным локом; в тике/switch нет аллокаций |
 
@@ -486,20 +487,27 @@ user-программа — та же задача, у которой подго
 layout/guard-страница, детект переполнения канарейки, вход/выход idle-потока.
 Ledger'ы PMM после task-набора совпадают в двух прогонах.
 
-Не входит в M6a: user mode, syscall'ы, отдельные адресные пространства, ELF,
-приоритеты, SMP-планирование и блокирующий I/O как общий слой. Явная граница:
-`MAX_TASKS = 16` слотов, из них два системных (`shell`, `idle`), поэтому один
-user-прогон может держать не больше 14 живых потоков (главный + 13 `clone`);
-`spawn` демо-когорты принимает до 14 потоков за раз. User-потоки получают
-`Blocked` и тиковый дедлайн через `block_current`, но очереди sleep/wakeup вне
-этих двух примитивов по-прежнему нет.
+Не входит в M6a: user mode, syscall'ы, ELF, приоритеты, SMP-планирование и
+блокирующий I/O как общий слой. Явная граница: `MAX_TASKS = 16` слотов, из них
+два системных (`shell`, `idle`), поэтому один процесс может держать не больше
+14 живых потоков (главный + 13 `clone`); `spawn` демо-когорты принимает до 14
+потоков за раз. User-потоки получают `Blocked` и тиковый дедлайн через
+`block_current`, `Stopped` — через `stop_current` (job control), но очереди
+sleep/wakeup вне этих примитивов по-прежнему нет. Адресное пространство
+per-process появилось в native-proc (9.4), а не в M6a.
 
 ### 9.1 U-mode, syscall'ы, ELF и native ABI (M6b)
 
-User-страницы кладутся в **ту же** Sv39-карту с `U=1` (`src/user/elf.rs`), ядро не
-переключает `satp`. Изоляция — ровно один бит: страницы ядра и устройств идут без
-`U`, поэтому U-mode их не читает и не исполняет. Два user-процесса друг от друга
-не защищены; `src/user/mod.rs::RUN` держит «одна программа за раз» (`Busy`).
+Каждый процесс получает **свой** Sv39-root: `memory::paging::create_user_space`
+копирует в него все supervisor-листья kernel-root'а (RAM identity map, UART,
+PLIC, virtio-окна), а `elf::load_in` добавляет поверх только страницы этого
+процесса с `U=1`. Изоляция — два бита: `U` не даёт U-mode трогать ядро и
+устройства, а отдельный root/ASID не даёт двум процессам видеть user-страницы
+друг друга. `Process.root/satp/asid` — источник истины; `Task.satp` каждого
+потока указывает на root его процесса, `scheduler::install_satp` переключает
+`satp` перед `task_switch` (9.4). Foreground-`run` по-прежнему один: шелл
+запускает программу и ждёт её `Process::threads == 0`, а `fork`-дети живут
+параллельно и репаются `wait4`/раннером.
 
 **Вход.** `run <path> [args...]` входит в U-mode по контракту
 `pagh-api/docs/abi.md`: `a0 = argc`, `a1 = argv`, `sp` выровнен на 16 байт и
@@ -515,20 +523,25 @@ User-страницы кладутся в **ту же** Sv39-карту с `U=1`
 **Жизненный цикл** (`user::run_image` для фикстур, `user::run_file` для
 `run <path>`):
 
-1. `elf::load` читает образ потоково через `ImageSource` — заголовок, таблицу
-   program headers и сегменты кусками ≤ 512 B, без буфера размером с файл;
-   валидирует заголовок/program headers и только потом мапит `PT_LOAD`-страницы;
-   любая ошибка откатывает уже замапленное (ledger — тест). 512 B, а не 4 KiB,
-   потому что `run_file` — самый глубокий путь на 128 KiB boot-стеке шелла;
-2. 16 contiguous-кадров под 64 KiB user-стека, маппинг `U|R|W`, обнуление;
-3. кадр `argc/argv/envp` (см. выше), сброс таблицы fd;
-4. `spawn_in_group(user_task, run_id)`; шелл ждёт `RunState::threads == 0`,
-   крутя `yield_now` — таймер продолжает вытеснять, включая user-потоки. Поток
-   считается живым, пока не вышел сам или пока `exit_group`/fault не снял его
-   группу;
-5. `reap` kernel-стеков всех потоков, `unmap` user-стека, `Loaded::release`,
-   освобождение fd-таблицы, futex-очереди прогона и heap/mmap-кадров, снятие
-   `RUN`.
+1. `paging::create_user_space` даёт root/ASID; `elf::load_in(root, …)` читает
+   образ потоково через `ImageSource` — заголовок, таблицу program headers и
+   сегменты кусками ≤ 512 B, без буфера размером с файл; валидирует
+   заголовок/program headers и только потом мапит `PT_LOAD`-страницы; любая
+   ошибка откатывает уже замапленное и таблицы (ledger — тест). 512 B, а не
+   4 KiB, потому что `run_file` — самый глубокий путь на 128 KiB boot-стеке
+   шелла;
+2. 16 contiguous-кадров под 64 KiB user-стека, `map_in(root, …)` `U|R|W`,
+   обнуление;
+3. кадр `argc/argv/envp` пишется через `paging::translate_in(root, …)` (см.
+   выше), сброс строки fd процесса (`reset_fds(slot)`);
+4. `spawn_in_group_satp(user_task, pid, root_satp)`; шелл ждёт
+   `Process::threads == 0`, крутя `yield_now` — таймер продолжает вытеснять,
+   включая user-потоки. Процесс считается живым, пока не вышел последний поток
+   или пока `exit_group`/fault не снял группу;
+5. `reap` kernel-стеков всех потоков; `release_process_memory` снимает image,
+   heap, mmap и user-стек, освобождает таблицы root'а; `release_fds`/`clear_process`
+   освобождают fd и signal-строку, `futex::clear_run(pid)` — очередь. Затем
+   `cleanup_orphans` убивает и хоронит всех, кто пережил foreground (9.4).
 
 **Syscall-ABI** (`src/user/syscall.rs`) — номера Linux/RISC-V; регистры: `a7`
 номер, `a0..a5` аргументы, `a0` результат; `ecall` → `dispatch` → `sepc += 4`.
@@ -550,19 +563,23 @@ User-страницы кладутся в **ту же** Sv39-карту с `U=1`
 | 101 | `nanosleep` | `Timespec` проверяется, округляется вверх до тика; ждёт `timer::sleep_ticks` с временно разрешёнными прерываниями (иначе тики не идут), `rem` игнорируется; deliverable-сигнал прерывает сон по одному тику за раз и возвращает `-EINTR`, а при `SA_RESTART` — перезапускает `ecall` (9.3) |
 | 113 | `clock_gettime` | id 0/1 — тиковое время (`Timespec`, 10 ms); иначе `-EINVAL` |
 | 160 | `uname` | 5×16 B: `pagh`, `pagh-riscv`, `0.10.0`, версия пакета, `riscv64` |
-| 214 | `brk` | окно 1 MiB в `0x2000_0000..0x2010_0000`, постранично из PMM, кадры в `RunState`; за окном — `-ENOMEM`, частичный рост откатывается |
+| 214 | `brk` | окно 1 MiB в `0x2000_0000..0x2010_0000`, постранично из PMM в **root процесса**, кадры в `process::HEAPS`; за окном — `-ENOMEM`, частичный рост откатывается |
 | 93 | `exit` | завершает вызывающий поток; последний закрывает прогон, `run_source` возвращает код главного; код не-главного отбрасывается; не возвращается |
 | 94 | `exit_group` | снимает все потоки группы (`kill_group`), `threads = 0`, код главного (если он уже вышел) иначе вызывающего; не возвращается |
 | 96 | `set_tid_address` | указатель игнорируется, возвращается tid |
 | 98 | `futex` | `WAIT`/`WAKE` + `PRIVATE_FLAG`, ключ `(run, uaddr)`, статическая таблица 32/16 (9.2) |
 | 124 | `sched_yield` | `scheduler::yield_now()`, возврат в U |
-| 172 | `getpid` | id главного потока прогона |
+| 172 | `getpid` | id процесса (`Process.pid`), общий для всех его потоков |
+| 173 | `getppid` | pid родителя (`0` у программы из шелла; у fork-ребёнка — pid родителя; переживает `execve`) |
 | 178 | `gettid` | id вызывающего потока |
-| 220 | `clone` | `clone(flags, stack, entry, arg)`: `CLONE_VM|CLONE_THREAD` обязательны, `CLONE_SETTLS` — `-ENOTSUP`; ребёнок стартует на `entry(arg)` и не возвращается из syscall |
+| 220 | `clone` | `clone(flags, stack, entry, arg)`: `CLONE_VM|CLONE_THREAD` обязательны, `CLONE_SETTLS` — `-ENOTSUP`; ребёнок стартует на `entry(arg)` и не возвращается из syscall; `clone(0,0,0,0)` — алиас `fork` |
+| 1000 | `fork` | pagh-native (asm-generic номера нет): новый root/ASID, глубокая копия image/heap/mmap/стека, копия fd-таблицы/обработчиков/blocked/altstack; ребёнок получает `a0=0`, родитель — pid, обе стороны с `sepc+4` |
+| 221 | `execve` | абсолютный путь; новый root/ELF/стек/SysV-кадр, замена image/heap/mmap, fd/pid/ppid/blocked сохраняются, обработчики → `SIG_DFL`, alt-стек выключен, sibling-потоки сняты; `a0=argc`, `a1=argv`, `sepc` не двигается |
+| 260 | `wait4` | `pid>0` — конкретный ребёнок, `0`/`-1` — любой; `options & !WNOHANG` — `-EINVAL`; возвращает pid/0/`-ECHILD`/`-EFAULT`; статус `code<<8` или номер сигнала в младших 7 битах; блокирует вызывающий поток, `SIGCHLD` не генерируется |
 | 129 | `kill` | `pid > 0` — tid потока прогона, `0`/`-1` — все живые потоки; `sig = 0` — проверка существования; SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU с `SIG_DFL` паркуют поток (`State::Stopped`), SIGCONT возобновляет; иначе `-ESRCH`/`-EINVAL` (9.3) |
 | 131 | `tgkill` | `tgid == getpid()`, `tid` — живой поток прогона; иначе `-ESRCH`; доставка как у `kill`, `si_code = SI_TKILL` |
 | 132 | `sigaltstack` | 24-байтный `SigAltStack`; per-thread стек, `SS_DISABLE`/`SS_ONSTACK`, `MINSIGSTKSZ = 4096`, полная проверка `U|R|W`; `-EINVAL`/`-EFAULT` (9.3) |
-| 134 | `rt_sigaction` | `struct sigaction { handler, flags, mask, restorer }` (32 B), `sigsetsize = 8`; `SIG_DFL`/`SIG_IGN`/функция+`SA_RESTORER`; `SA_SIGINFO`/`SA_ONSTACK`/`SA_RESTART`/`SA_NODEFER`/`SA_RESETHAND`; SIGKILL/SIGSTOP — `-EINVAL`; таблица 1..31 на прогон |
+| 134 | `rt_sigaction` | `struct sigaction { handler, flags, mask, restorer }` (32 B), `sigsetsize = 8`; `SIG_DFL`/`SIG_IGN`/функция+`SA_RESTORER`; `SA_SIGINFO`/`SA_ONSTACK`/`SA_RESTART`/`SA_NODEFER`/`SA_RESETHAND`; SIGKILL/SIGSTOP — `-EINVAL`; таблица 1..31 на процесс (fork копирует, exec сбрасывает) |
 | 135 | `rt_sigprocmask` | `SIG_BLOCK`/`UNBLOCK`/`SETMASK`, маска 8 B (бит `n-1`), per-thread; SIGKILL/SIGSTOP не блокируются; `oldset` до установки |
 | 139 | `rt_sigreturn` | проверка кадра `U|R` (736 B), magic/signum/flags и активного указателя; восстановление `TrapFrame`, маски, глубины alt-стека и безопасного `sstatus`; `sepc` не сдвигается; без кадра — `-EINVAL`, плохой указатель — `-EFAULT` |
 | 34 | `mkdirat` | `dirfd`/`mode` игнорируются; `create_dir` родителя; 0o755 — дефолт VFS |
@@ -570,7 +587,7 @@ User-страницы кладутся в **ту же** Sv39-карту с `U=1`
 | 36 | `symlinkat` | `a0` — цель (сырые байты, не резолвится), `a2` — путь; `create_symlink` |
 | 37 | `linkat` | жёсткая ссылка через `link`; `flags` = 0, каталог — `-EISDIR` |
 | 276 | `renameat2` | `vfs::rename` после проверки источника и родителя назначения; одна транзакция ext2 |
-| 53 | `fchmodat` | `mode & 0o7777` в per-run таблицу по `fs_ino`; `fstat` её читает, inode не меняется; синтетика — `-ENOTSUP` |
+| 53 | `fchmodat` | `mode & 0o7777` в per-process таблицу по `fs_ino`; `fstat` её читает, inode не меняется; синтетика — `-ENOTSUP`; fork таблицу не наследует |
 | 46 | `ftruncate` | `VfsNode::truncate`; 0/1/2 — `-EINVAL`, каталог — `-EISDIR`, read-only fd — `-EBADF` |
 | 198 | `socket` | `AF_INET`/`SOCK_STREAM`/0; fd в таблице как `FdEntry::Socket { id, connected }`; второе соединение при открытом первом — `-ENOSPC` |
 | 203 | `connect` | 16-байтный `sockaddr_in` через `copy_from_user`; family/port/addr проверяются, вызов идёт в `net::tcp::connect` и опрашивает NIC до handshake или дедлайна; ошибки — `-ENETUNREACH`/`-EHOSTUNREACH`/`-ECONNREFUSED`/`-ETIMEDOUT` |
@@ -593,14 +610,20 @@ User-страницы кладутся в **ту же** Sv39-карту с `U=1`
 `fs_ino` (до 16 inode'ов, затем `-ENOSPC`), `fstat` отдаёт его до конца
 прогона, на диск и на права он не влияет — это задокументированный разрыв ABI.
 
-**Fd-таблица** — одна статическая на прогон, 16 слотов: 0 stdin, 1/2 stdout/stderr,
-3.. — `Arc<dyn VfsNode>` + offset + flags; сбрасывается перед спавном и
-освобождается после задачи, поэтому узел не переживает fault. Блокировка
+**Fd-таблица** — по одной на процесс (`FdTables`, строка `MAX_PROCESSES`), 16
+слотов: 0 stdin, 1/2 stdout/stderr, 3.. — `Arc<dyn VfsNode>` + offset + flags,
+pipe-конец или сокет. `reset_fds(slot)` вызывается перед спавном;
+`release_fds(slot)` — после последнего потока, поэтому узел не переживает
+fault. `fork` копирует строку: файл/pipe/`Arc` клонируются (pipe-ring получает
++1 ссылку), сокет заменяется на `FdEntry::Unsupported` — единственное
+TCP-соединение остаётся у родителя. `execve` строку сохраняет; offset файла
+копируется, а не делится (отличие от POSIX open-file-description). Блокировка
 таблицы не держится через VFS/block-вызов: `Arc` и offset копируются, I/O идёт
-без лока, новый offset публикуется после.
+без лока, новый offset публикуется после. `release_fds` собирает pipe-ссылки и
+признак сокета под локом, отпускает ссылки и закрывает TCP уже без него.
 
 **Сокеты** — единственный сетевой API для userland, и он намеренно узкий.
-`FdEntry::Socket { id, connected }` живёт в той же per-run таблице; один
+`FdEntry::Socket { id, connected }` живёт в per-process таблице; один
 статический TCP-клиент (`net::tcp`) допускает одно соединение, поэтому второй
 `socket()` — `-ENOSPC`, а `close`/`shutdown` освобождают слот. `connect`
 валидирует 16-байтный `sockaddr_in` (`copy_from_user`, family, port big-endian)
@@ -615,9 +638,9 @@ User-страницы кладутся в **ту же** Sv39-карту с `U=1`
 оставленный программой открытым, до следующего `run`.
 
 **User heap** — 1 MiB в `0x2000_0000` (выше максимального образа, ниже стека, вне
-окон устройств). `brk` мапит кадры PMM по требованию и обнуляет их; `RunState`
-хранит список кадров, раннер освобождает их до возврата из `run_source` — это и
-проверяет PMM-ledger. `brk(0)` — запрос; значение меньше базы прижимается к базе;
+окон устройств). `brk` мапит кадры PMM в root процесса и обнуляет их;
+`process::HEAPS` хранит список кадров, раннер/`wait4`/`execve` освобождает их до
+возврата из `run_source` — это и проверяет PMM-ledger. `brk(0)` — запрос; значение меньше базы прижимается к базе;
 за `USER_HEAP_TOP` — `-ENOMEM`.
 
 **Таймер в U-mode** доказывается не словами: `trap_dispatch` считает тики с
@@ -628,33 +651,35 @@ User-страницы кладутся в **ту же** Sv39-карту с `U=1`
 **Пределы**: образ ≤ 1 MiB (`MAX_IMAGE_BYTES`) / 256 страниц / 8 `PT_LOAD`;
 `run <path>` читает файл **потоково** (заголовок, program headers, сегменты по
 ≤ 512 B) и не грузит его целиком в heap, поэтому работает и на 100 KiB, и на
-1 MiB — но одновременно исполняется один user-образ; нет `fork`/`exec`,
-динамического ELF и per-process page table; сигналы — §9.3. 16 fd (не более одного —
-сокет), ровно один TCP-клиент без `listen`/`accept`/UDP/DNS/TLS, heap ровно
-1 MiB, `getdents64` без места в буфере отдаёт 0 (неотличимо от конца каталога —
-буфер на 264 B покрывает имя ext2), `openat`/`mkdirat` игнорируют `mode`,
-`chmod` живёт только до конца прогона, `uname.release` намеренно `0.10.0` при
-`Cargo.toml` 0.10.1 (версию поднимет release-коммит). Потоков ≤ 14 на прогон
-(16 слотов минус `shell`/`idle`), у каждого свой kernel-стек 16 KiB + guard;
-user-стек — память вызывающего, ядро её не освобождает. TLS/PI/requeue,
-`join`/`waitid` и приоритеты отсутствуют; futex-таблица — 32 ожидающих на 16
-адресов.
+1 MiB. `run` по-прежнему один foreground-образ, но `fork` создаёт второй
+процесс с собственным root/ASID, а `execve`/`wait4` работают (9.4); динамического
+ELF нет. 16 fd на процесс (не более одного сокета на ядро), ровно один TCP-клиент
+без `listen`/`accept`/UDP/DNS/TLS, heap ровно 1 MiB, `getdents64` без места в
+буфере отдаёт 0 (неотличимо от конца каталога — буфер на 264 B покрывает имя
+ext2), `openat`/`mkdirat` игнорируют `mode`, `chmod` живёт только до конца
+процесса, `uname.release` намеренно `0.10.0` (стабильная строка ABI) при
+`Cargo.toml` 0.16.0. Процессов ≤ 6, потоков ≤ 14 на процесс (16 слотов минус
+`shell`/`idle`), у каждого свой kernel-стек 16 KiB + guard; user-стек — память
+вызывающего, ядро её не освобождает. TLS/PI/requeue, `join`/`waitid` и
+приоритеты отсутствуют; futex-таблица — 32 ожидающих на 16 адресов. `fork` —
+deep copy без COW, `SIGCHLD` не генерируется, сирот убивает раннер foreground.
 ### 9.2 Нативные потоки и фьютексы (native-thread)
 
-User-программа — это **группа потоков в одном `RunState`**, а не один поток.
+User-программа — это **процесс** (`Process`) с группой потоков, а не один поток.
 Главный поток создаётся `run_source`, остальные — syscall'ом `clone`; адресное
-пространство, fd-таблица, heap `brk`, mmap-регионы и таблица режимов общие на
-всю группу. Одновременно исполняется один user-образ: второй `run` получает
-`Busy`, пока жив хотя бы один поток первого.
+пространство (root/ASID), fd-таблица, heap `brk`, mmap-регионы, таблица режимов
+и таблица обработчиков общие на всю группу. `fork` создаёт второй `Process` с
+копией этих ресурсов; foreground-`run` один, но fork-дети исполняются
+параллельно и репаются `wait4`/раннером.
 
 **Что у потока своё, а что общее.**
 
-| Своё у потока | Общее у прогона |
+| Своё у потока | Общее у процесса |
 |---|---|
-| tid (`gettid`), запись в task-таблице планировщика | `RunState` под `RUN`: адресное пространство, heap, mmap, fd-таблица, сокет |
+| tid (`gettid`), запись в task-таблице планировщика | `Process`: root/ASID, heap, mmap, fd-таблица, сокет, таблица обработчиков |
 | kernel-стек 16 KiB + 4 KiB guard из PMM | user-стек **не** общий: адрес передаёт вызывающий, ядро его не выделяет и не освобождает |
-| сохранённый `TaskContext` и trap frame (на своём kernel-стеке) | код образа, `.bss`/`.data` (одна Sv39-карта) |
-| user-регистры (вход `a0 = arg`, `sp = stack`) | pid (`getpid` = tid главного), код выхода прогона (код главного) |
+| сохранённый `TaskContext`/`satp` и trap frame (на своём kernel-стеке) | код образа, `.bss`/`.data` в root'е процесса |
+| user-регистры (вход `a0 = arg`, `sp = stack`), blocked/pending/altstack | pid (`getpid`), ppid, код выхода (код главного) |
 
 **Старт ребёнка — это trap-return, а не второй кадр.** `spawn_user_thread`
 выделяет kernel-стек, кладёт на его верх `TrapFrame` (`sp = stack`,
@@ -677,13 +702,14 @@ U-поток: он восстанавливает все GPR, `sepc`, `sstatus`,
 неудаче, так что счётчик не расходится с таблицей задач.
 
 **`gettid`** (178) — id потока; **`set_tid_address`** (96) — указатель
-принимается и игнорируется, возвращается tid; **`getpid`** (172) — id главного
-потока, один на прогон.
+принимается и игнорируется, возвращается tid; **`getpid`** (172) — id процесса,
+один на все его потоки; **`getppid`** (173) — pid родителя (0 у шелла).
 
 **`exit`** (93) завершает только вызывающий поток: `threads -= 1`, код главного
 запоминается в `main_code` (даже если он вышел первым), код не-главного
-отбрасывается. Когда уходит последний поток, в `RunState.exit` кладётся
-`Exit::Code(main_code.unwrap_or(последний код))`, и `run_source` просыпается.
+отбрасывается. Когда уходит последний поток, в `Process.exit` кладётся
+`Exit::Code(main_code.unwrap_or(последний код))` в `Process`, и
+`run_source`/`wait4` просыпаются.
 **`exit_group`** (94) снимает всех остальных (`scheduler::kill_group`: `Ready` и
 `Blocked` → `Exited`, очередь чистится `compact_ready`), ставит `threads = 0` и
 возвращает код главного (если он уже вышел) либо вызывающего. **Fault любого
@@ -700,9 +726,9 @@ U-поток: он восстанавливает все GPR, `sepc`, `sstatus`,
 навсегда). `WAKE_OP`, `REQUEUE`/`CMP_REQUEUE`, PI-семейство — `-ENOSYS`.
 `uaddr` обязан быть 4-выровнен, иначе `-EINVAL`. Таблица: **32 ожидающих на 16
 различных адресов**; переполнение — `-EAGAIN`/`-ENOMEM` до блокировки. Ключ —
-`(RunState::id, uaddr)`, id монотонный, поэтому stale-запись убитого прогона не
-разбудит поток следующего; `run_source` дополнительно чистит очередь
-(`futex::clear_run`).
+`(Process.pid, uaddr)`, pid монотонный, поэтому stale-запись убитого процесса не
+разбудит поток следующего; `run_source`/`wait4`/`execve` дополнительно чистят
+очередь (`futex::clear_run`).
 
 **Lock order**: futex-очередь → планировщик; очередь **не** удерживается через
 `block_current` — вставка, unlock, блокировка, на возврате снова lock и
@@ -711,14 +737,15 @@ U-поток: он восстанавливает все GPR, `sepc`, `sstatus`,
 делает поток `Ready` и не переключается. Тик сканирует `wake_at` под
 scheduler-локом (`wake_expired`) и не берёт futex-лок; следовательно,
 `futex → scheduler` — единственное направление, а обработчик прерывания не
-трогает futex-состояние.
+трогает futex-состояние. `process`-лок не вкладывается в futex/scheduler и не
+удерживается через `block_current`.
 
-**Почему `run_source` ждёт не задачу, а счётчик.** `wait_for_run_end` читает
-`RunState::threads`; главный поток может выйти первым (его код уже записан), а
-`RunState` нельзя снимать, пока жив хоть один `clone`-ребёнок: он всё ещё
+**Почему `run_source` ждёт не задачу, а счётчик.** `wait_for_process` читает
+`Process::threads`; главный поток может выйти первым (его код уже записан), а
+`Process` нельзя снимать, пока жив хоть один `clone`-ребёнок: он всё ещё
 исполняется в этом адресном пространстве и держит fd/heap. Освобождение
-маппингов, fd и futex-очереди делает только раннер после `threads == 0` и
-`reap`; сами потоки `RunState` не трогают.
+маппингов, fd и futex-очереди делает только раннер или `wait4` после
+`threads == 0` и `reap`; сами потоки `Process` не трогают.
 
 **Тесты.** `userland/abi.rs` в секции threads проверяет `gettid`/`set_tid_address`,
 матрицу ошибок `clone`, два потока с общим atomic-счётчиком, futex
@@ -731,13 +758,16 @@ wait/wake-rendezvous, `exit` не-главного потока и `exit_group` 
 ### 9.3 Сигналы (POSIX-подобные)
 
 Реализация — `src/user/signal.rs`; это **не** Linux-сигналы: структуры и порядок
-полей свои, и документированы здесь. Один прогон — один процесс: таблица
-обработчиков (1..=31) живёт в прогоне и сбрасывается в `run_source`
-(`signal::begin_run`) и после teardown (`signal::clear_run`); pending-биты,
-blocked-маски, alt-стек и указатель на активный кадр — у каждого потока
-(`ThreadSignal`, до `MAX_TASKS` записей). С идентификатором pending-сигнала
-хранятся `si_pid`/`si_uid`/`si_code` отправителя: доставка происходит позже
-`kill`, и `siginfo` должен помнить, кто и как его послал.
+полей свои, и документированы здесь. Таблица обработчиков (1..=31) принадлежит
+**процессу** (`ProcessSignals`, строка на слот `MAX_PROCESSES`): `begin_process`
+создаёт её, `fork_process` копирует обработчики/blocked/altstack, `exec_process`
+сбрасывает все действия в `SIG_DFL`, гасит pending/кадры и выключает alt-стек,
+`clear_process` освобождает после последнего потока. Pending-биты, blocked-маски,
+restart-флаг, alt-стек и указатель на активный кадр — у каждого потока
+(`ThreadSignal`, до `MAX_TASKS` записей). Pending не наследуется `fork` (ребёнок
+не должен получить сигнал дважды). С идентификатором pending-сигнала хранятся
+`si_pid`/`si_uid`/`si_code` отправителя: доставка происходит позже `kill`, и
+`siginfo` должен помнить, кто и как его послал.
 
 **Syscall'ы** `kill` (129), `tgkill` (131), `sigaltstack` (132),
 `rt_sigaction` (134), `rt_sigprocmask` (135), `rt_sigreturn` (139).
@@ -754,7 +784,9 @@ user-странице `U|X`. Остальные допустимые биты:
 | `SA_RESETHAND` | `0x80000000` | сбросить disposition в `SIG_DFL` при входе в обработчик |
 
 `SIG_DFL=0`, `SIG_IGN=1`; SIGKILL/SIGSTOP нельзя поймать
-(`rt_sigaction` — `-EINVAL`) или заблокировать. `rt_sigprocmask` принимает
+(`rt_sigaction` — `-EINVAL`) или заблокировать. `fork` копирует действия
+родителя, `execve` ставит их все в `SIG_DFL` (включая `SIG_IGN` — отличие от
+POSIX, где ignore сохраняется). `rt_sigprocmask` принимает
 `sigsetsize = 8`; сигнал `n` — бит `n-1`; биты SIGKILL/SIGSTOP отбрасываются;
 `oldset` пишется до изменения маски.
 
@@ -782,7 +814,7 @@ kernel fault.
 | 8 | `si_code` (i32): `SI_USER=0`, `SI_KERNEL=0x80`, `SI_TKILL=-6`, `SEGV_MAPERR=1`, `BUS_ADRALN=1`, `TRAP_BRKPT=1` |
 | 12 | padding |
 | 16..24 | `si_pid` (u32) + `si_uid` (u32) для `kill`/`tgkill`; `si_addr` (u64) для синхронного fault |
-| 24 | `si_status` (i32, 0): поле child-exit `SIGCHLD`; своего производителя у `fork`/`wait` пока нет, поэтому явный `kill(SIGCHLD)` — `SI_USER` с нулём |
+| 24 | `si_status` (i32, 0): поле child-exit `SIGCHLD`; `fork`/`exit`/`wait4` не генерируют SIGCHLD, поэтому явный `kill(SIGCHLD)` — `SI_USER` с нулём (документированный разрыв) |
 | 28..128 | padding |
 
 `kill` заполняет `SI_USER` и pid/uid отправителя (uid всегда 0 — модели
@@ -854,15 +886,15 @@ deliverable-сигнал имеет `SA_RESTART`, и `dispatch` в этом сл
 
 **Default actions и job control.** `SIG_DFL` для SIGTERM/SIGINT/SIGQUIT/
 SIGABRT/SIGSEGV/SIGILL/SIGFPE/SIGBUS/SIGKILL и остальных «фатальных» завершает
-**прогон** (`on_signal_death`: `kill_group` + `threads = 0`, как fault);
+**процесс** (`on_signal_death`: `kill_group` + `threads = 0`, как fault);
 SIGCHLD/SIGCONT/SIGURG/SIGWINCH игнорируются. SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU с
 `SIG_DFL` останавливают целевой поток: `default_action` вызывает
 `scheduler::stop_current`, который переводит running-задачу в
 `State::Stopped` (не в ready-очереди, стек и signal-состояние сохраняются).
 SIGCONT очищает pending stop-бит и делает `Stopped -> Ready`; ловимый
 SIGCONT с обработчиком доставляется как обычный сигнал. `kill(0/-1)` адресует
-все живые потоки прогона, включая остановленные, поэтому так можно остановить
-весь run. Tty и process-group модели нет: остановленный извне run некому
+все живые потоки процесса, включая остановленные, поэтому так можно остановить
+весь процесс. Tty и process-group модели нет: остановленный извне процесс некому
 возобновить, `SIGTSTP` от терминала не существует, а остановка всех потоков
 одного прогона `kill(0, SIGSTOP)` — документированный тупик. SIGKILL/SIGSTOP
 нельзя поймать или заблокировать; `SIG_IGN` просто сбрасывает pending.
@@ -876,7 +908,7 @@ faulting-инструкцию; без обработчика остаётся п
 прогон с диагностикой). `SIG_IGN` для синхронного сигнала не делает инструкцию
 успешной, поэтому тоже уходит в `on_fault`.
 
-**Lock order.** `RUN → signal table` (id прогона читается до лока), а
+**Lock order.** `process → signal table` (pid читается до лока), а
 `scheduler → signal table` не бывает: цели `kill` резолвятся под
 scheduler-локом до взятия signal-лока, `wake_task`/`continue_task` вызываются
 после его отпускания. Signal-лок никогда не удерживается через
@@ -905,6 +937,82 @@ SIGTSTP/SIGCONT на futex-ожидании. Маркеры — `abi: signals ok
 `stopped_tasks` после прогона.
 
 ---
+
+### 9.4 Процессы: `fork`, `execve`, `wait4` (native-proc)
+
+Процесс — запись в статической таблице `src/user/process.rs`
+(`MAX_PROCESSES = 6`) плюс собственный Sv39-root и ASID. `Process` хранит
+`pid/ppid`, `root/satp/asid`, `name`, `entry/sp/argc/argv`, `main_tid`,
+`threads`, `exit/signal`, `heap_end/heap_count`, `mmap_regions`, `stack_base`,
+`wait_tid` и `ready`. Списки image- и heap-кадров лежат **вне** `Process`
+(`IMAGES`/`HEAPS`): процесс весит сотни байт, а перенос 2 KiB `Loaded` через
+16 KiB kernel-стек уже вызывал переполнение в ранней версии fork. Состояния:
+`Free -> Live -> Zombie -> Free`; `threads` уменьшается на каждом `exit`, а
+последний поток (или `exit_group`/fault) ставит `Exit`/`threads = 0` и будит
+родителя.
+
+**Адресное пространство.** `paging::create_user_space` выделяет root-кадр,
+копирует в него каждый supervisor-лист kernel-root'а (RAM identity map, UART,
+PLIC, virtio-окна) и **не** копирует листья с `U=1`. Загрузчик мапит страницы
+процесса уже в этот root через `map_in`/`translate_in`. ASID берётся из
+монотонного 16-битного счётчика (0 — ядро), после оборота — полный
+`sfence.vma`. Несмотря на ASID, `scheduler::install_satp` всегда пишет `satp` и
+делает `sfence_vma_all` при смене root: метка TLB не должна пережить
+переиспользование кадра таблицы. `free_user_space` возвращает только кадры
+таблиц; листья освобождает процессный teardown, а kernel-листья — общие и не
+трогаются.
+
+**`fork`** копирует **все** mapped user-страницы (image, heap, mmap, 64 KiB
+user-стека) — это deep copy, не COW. `ForkSnapshot` снимается под process-локом,
+страницы копируются по `translate_in(parent.root)`, флаги листа (включая `X`)
+сохраняются. Строка fd копируется (`fork_fds`: файлы/pipe/`Arc` клонируются,
+pipe-ring получает +1 ссылку, сокет становится `FdEntry::Unsupported`);
+обработчики/blocked/altstack наследуются, pending и чужие потоки — нет. Ребёнок
+входит через `scheduler::spawn_user_frame`: `TrapFrame` родителя копируется,
+`a0 = 0`, `sepc = frame.sepc + 4`, `sstatus = user_entry_status()`. Родитель
+возвращается из `dispatch` с pid и своим `sepc + 4`. Ошибка на любом шаге
+(`build_fork_into`, `fork_fds`, spawn, `fork_process`) освобождает всё
+построенное и убивает уже созданный поток; PMM-ledger не меняется.
+
+**`execve`** читает путь/`argv`/`envp` из **старого** root'а, грузит ELF в новый
+root (`elf::load_in`), строит стек и SysV-кадр, затем: `activate_satp(new)` →
+`set_current_satp` → `kill_group(pid)` (только sibling-потоки, текущий остаётся)
+→ освобождение старого image/heap/mmap/стека и root'а → публикация новых полей
+→ `signal::exec_process` (все действия `SIG_DFL`, alt-стек disabled, pending и
+кадры погашены, blocked сохранён) → `futex::clear_run(pid)`. `pid`, `ppid`,
+fd-таблица и `main_tid` (тот же tid) сохраняются; `wait_tid = 0`; `threads = 1`.
+На успехе `TrapFrame` заменяется целиком: `sepc = entry`, `sp = built.sp`,
+`a0 = argc`, `a1 = argv`, `sstatus = user_entry_status()`; `dispatch` **не**
+делает `sepc + 4`. Все ошибки возвращаются до первой необратимой операции и
+оставляют старый образ; errno — `-ENOENT`/`-ENOEXEC`/`-EISDIR`/`-E2BIG`/
+`-EFAULT`/`-ENOMEM`.
+
+**`wait4`** ищет ребёнка по `ppid == current pid` и `pid > 0 | 0 | -1`
+(`pid < -1` — `-EINVAL`), `options` — только `WNOHANG` (1). Зомби
+(`threads == 0 && ready`) отдаёт pid, `0` — живой при `WNOHANG`, `-ECHILD` —
+детей нет. Блокирующий вызов ставит `wait_tid`, `block_current(None)`, и
+просыпается от `notify_parent` из `exit`/`exit_group`/`on_signal_death`/
+`on_fault`; `signal::interrupted()` даёт `-EINTR`. Статус: обычный выход
+`code << 8` (только младший байт), смерть от сигнала/fault — номер сигнала в
+младших 7 битах, без core-бита. `SIGCHLD` не генерируется, `si_status` не
+заполняется; родитель будится напрямую.
+
+**Сироты.** Init-процесса нет. После возврата foreground-процесса
+`run_source` вызывает `cleanup_orphans`: `ready_pids` → `kill_group` →
+`force_finish(Exit::Fault, "orphaned")` → `reap` → `release_fds`/
+`clear_process`/`futex::clear_run`/`release_process_memory`/`clear_slot`, пока
+таблица не опустеет. Поэтому `run` не возвращает приглашение, пока PMM-ledger
+и таблица процессов не пусты; убийство сироты — политика этого ядра, а не
+POSIX-усыновление.
+
+**Тесты.** `userland/abi.rs`, `process_section`/`exec_section`: `getppid` у
+foreground (0) и у ребёнка; `fork` + маркер `abi: fork ok`; `wait4` с blocking
+и `WNOHANG`, `ECHILD`/`EINVAL`; fork-ребёнок `execve`-ит `/mnt/exec-child` с
+`argv=["exec-child","exec-arg"]`, `PWD=/mnt`, маркеры `abi: exec ok` и
+`abi: exec wait ok`, статус 0; не-ELF файл даёт `-ENOEXEC`, процесс выживает.
+`SELFTEST user-abi-syscalls` требует, чтобы `forks`/`waits`/`getppids`/
+`execs` выросли, `live_processes() == 0`, `live_pipes() == 0`, а selftest с
+диском проходит 10/10; PMM-ledger в двух прогонах совпадает.
 
 ## 10. Консоль, экран и шелл
 
@@ -998,14 +1106,16 @@ SIGTSTP/SIGCONT на futex-ожидании. Маркеры — `abi: signals ok
 
 Состояние на момент написания; раздел перепроверяется перед коммитом.
 
-* **Нет адресного пространства на процесс.** Sv39 включён (раздел 6), карта одна:
-  identity для RAM плюс user-окно (образ и стек) с `U=1` в той же таблице;
-  `satp.ASID = 0`, `satp` не переключается. `map`/`unmap`/`translate`/`flags` —
-  `src/memory/paging.rs`; `unmap` возвращает пустые промежуточные таблицы в PMM.
-  Отдельного VMM, mprotect, разделяемых страниц и per-process `satp` нет.
-  Историческая справка: до этого лендинга `satp` не писался и адрес был физическим
-  «по совпадению»; теперь это следствие identity-карты, а не отсутствия трансляции.
-  Сигналы есть (§9.3), но они per-run/per-thread и не меняют это утверждение.
+* **Адресное пространство per-process есть, но без COW/demand paging.** У
+  каждого процесса свой Sv39-root и 16-битный ASID (`create_user_space`), ядро
+  копирует supervisor-карту, user-страницы приватны; `satp` переключается
+  `install_satp` перед `task_switch` (§9.4). Ограничения: `MAX_PROCESSES = 6`,
+  `fork` — глубокая копия всех страниц, `mmap`/`brk` выделяют кадры сразу,
+  `MAP_SHARED`/`MAP_FIXED`/file-backed `mmap` и разделяемая память отсутствуют,
+  ASID не используется для пропуска `sfence.vma`, один hart. `map`/`unmap`/
+  `translate`/`flags` — `src/memory/paging.rs`; `unmap` возвращает пустые
+  промежуточные таблицы в PMM. Историческая справка: до native-proc `satp` не
+  переключался и user-страницы жили в одном root'е.
 * **Планировщик есть, но политика одна**: round-robin по тику, без приоритетов,
   deadline wakeup-очереди и SMP; `Blocked`/`block_current`/`wake_task` есть только
   ради futex (9.2), блокирующего I/O и `sleep`-очереди поверх них нет; `sleep` в
@@ -1015,13 +1125,16 @@ SIGTSTP/SIGCONT на futex-ожидании. Маркеры — `abi: signals ok
 * **Нет TLS и apt.** Сеть есть (M7, раздел 13), но это `http`, а не `https`; TLS-стек
   и OpenPGP-проверка Debian-метаданных — следующий майлстоун, и `apt` до него не
   подключается (fail-closed важнее «поставить хоть что-нибудь»). User mode,
-  syscall'ы, ELF и native ABI есть (M6b, раздел 9.1); userland — пять
-  ассемблерных/Rust-фикстур, libc/динамического ELF нет; `mmap`/`fork`/`exec`
-  нет, а сигналы — узкое подмножество §9.3, не Linux-совместимый слой.
+  syscall'ы, ELF и native ABI есть (M6b, раздел 9.1); userland — шесть
+  ассемблерных/Rust-фикстур, libc/динамического ELF нет. `mmap`/`mprotect`/
+  `fork`/`execve`/`wait4` есть (§9.1, §9.4), но без COW, demand paging,
+  `MAP_SHARED`/`MAP_FIXED`, `SIGCHLD` и init-усыновления; сигналы — узкое
+  подмножество §9.3, не Linux-совместимый слой.
 * **Планировщик — только round-robin по таймеру**: нет приоритетов, sleep/wakeup-
-  очереди, блокирующего I/O, SMP; слотов 16 (14 user-потоков на прогон), стек
-  16 KiB, из них два системных. TLS/PI/requeue, `join`/`waitid` и `CLONE_SETTLS`
-  отсутствуют.
+  очереди, блокирующего I/O, SMP; слотов 16 (14 user-потоков на процесс), стек
+  16 KiB, из них два системных. `State::Stopped` и `stop_current`/
+  `continue_task` есть для job control. TLS/PI/requeue, `join`/`waitid` и
+  `CLONE_SETTLS` отсутствуют; процессов ≤ 6, `fork` — deep copy без COW.
 * **Нет журнала/WAL, procfs, прав/uid, нескольких дисков, кэша страниц, fsck** —
   границы M5 названы в `docs/roadmap.md`; формат совместим с `mkfs.ext2`/`e2fsck`,
   поэтому образ можно проверять хостовыми инструментами.
@@ -1056,16 +1169,22 @@ SIGTSTP/SIGCONT на futex-ожидании. Маркеры — `abi: signals ok
 
 ### 12.2 Что дальше
 
-M6b закрыт: user mode, syscall'ы, ELF и native-потоки подтверждены живыми
-прогонами (`run demo` → 42, `run fault` → killed, `run spin` → 7 с таймером в U,
-`abi: threads ok` в ABI-фикстуре), `SELFTEST user-* 10/10` с диском
-(`user-run-large-file`: 100 KiB образ с нулевым хвостом через `run_file`; без
-`/mnt` — 8/10 + 2 SKIP), ledger 62467 → 62467 в двух прогонах, smoke в четырёх
-режимах. Следующие шаги —
+M6b и native-proc закрыты: user mode, syscall'ы, ELF, native-потоки и
+fork/exec/wait подтверждены живыми прогонами (`run demo` → 42, `run fault` →
+killed, `run spin` → 7 с таймером в U; маркеры `abi: threads ok`,
+`abi: signals ok`, `abi: altstack ok`, `abi: siginfo ok`, `abi: jobcontrol ok`,
+`abi: fork ok`, `abi: wait ok`, `abi: exec ok`, `abi: exec wait ok`),
+`SELFTEST user-* 10/10` с диском (`user-run-large-file`: 100 KiB образ с нулевым
+хвостом через `run_file`; без `/mnt` — 8/10 + 2 SKIP), PMM-ledger до/после
+каждого блока совпадает в двух прогонах, smoke проходит serial/net/ramfb/
+disk-fresh/disk-existing. Следующие шаги —
 из `docs/roadmap.md`:
 
 * Linux-compat слой (перенос подхода x86: syscall-номера, `/proc`, Linux-ELF) —
   только после того, как появится userland, которому он нужен;
+* COW/`MAP_SHARED`/demand paging в per-process root'ах и `SIGCHLD` как
+  настоящий child-exit источник (сейчас `wait4` будит родителя напрямую);
+* init-процесс/усыновление сирот вместо политики «сирота умирает с foreground»;
 * журнал/WAL в ext2 и краш-устойчивость;
 * SMP (новый boot-протокол, per-hart стеки, настоящие локи);
 * своя сеть/apt — осознанно отложено.
@@ -1107,7 +1226,7 @@ active-open-соединение, handshake/seq/ack/FIN — достаточно
 
 Поверх этого клиента `src/user/syscall.rs` даёт минимальный BSD-ABI
 (`socket`/`connect`/`sendto`/`recvfrom`/`setsockopt`/`getsockopt`/`shutdown`).
-Соединение одно: `FdEntry::Socket` в per-run fd-таблице, второй `socket()` —
+Соединение одно: `FdEntry::Socket` в per-process fd-таблице, второй `socket()` —
 `-ENOSPC`; `connect` принимает IPv4-литерал в 16-байтном `sockaddr_in`, `recv`
 неблокирующий (`-EAGAIN`), `read`/`write` на сокете идут теми же путями. Пока
 user-программа работает, шелл не в idle-цикле, поэтому `connect`/`send`/

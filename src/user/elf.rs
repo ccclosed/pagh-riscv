@@ -4,12 +4,12 @@
 //! This is deliberately an *ELF reader for one job*, not a general-purpose
 //! loader:
 //!
-//! * **One address space.** Pages are installed in the kernel's existing Sv39
-//!   tree with `U=1`; there is no second `satp` or per-process page table. The
-//!   isolation this buys is exactly one bit: supervisor pages are mapped without
-//!   `U`, so U-mode cannot read, write or execute them. It does *not* give a
-//!   separate physical memory namespace, an ASID, or protection between two user
-//!   processes (only one runs at a time; see `src/user/mod.rs`).
+//! * **Per-process root.** `load` installs pages in the active root (the direct
+//!   selftest); `load_in(root, …)` installs them in a process's own Sv39 root.
+//!   Supervisor pages are copied without `U`, so U-mode cannot read, write or
+//!   execute them; two process roots share no user leaf, table frame or ASID.
+//!   The caller owns the root and frees it with the process (see
+//!   `src/user/mod.rs` and `src/memory/paging.rs`).
 //! * **Validate before mapping where possible.** Header, program-header table,
 //!   per-segment bounds, flags, alignment, the entry point and the page count are
 //!   all checked against the [`ImageSource`]'s length and the user window before
@@ -44,6 +44,8 @@
 //! which is the same mechanism that rejects overlap with a previous user mapping.
 
 use core::fmt;
+
+use alloc::vec::Vec;
 
 use crate::arch::riscv64::mmu::{Flags, PTE_A, PTE_D, PTE_R, PTE_U, PTE_V, PTE_W, PTE_X};
 use crate::memory::{paging, pmm, FRAME_SIZE};
@@ -289,29 +291,49 @@ struct PagePlan {
 
 /// A successfully loaded image: its entry point and the pages it owns.
 ///
-/// The caller is responsible for [`Loaded::release`] once the process is gone;
-/// dropping the value does not unmap anything (there is no `Drop` impl, because
-/// unmapping can allocate/free page tables and this kernel's teardown paths are
-/// explicit).
+/// The page list is a `Vec`, not an inline array: a 256-entry `[usize; 256]`
+/// made every `Loaded` value 2 KiB, and a fork that built one on the task's
+/// 16 KiB kernel stack (plus the loader's own buffers) overflowed the guard.
+/// The allocation is bounded by [`MAX_IMAGE_PAGES`] and is released with the
+/// image; `try_reserve` keeps a full heap a refusal, not an abort.
 pub struct Loaded {
+    /// Root table of the address space the pages live in. `release` walks this
+    /// root, not the currently active one: the image may outlive the satp value
+    /// it was loaded under (a foreground process torn down by the shell, or the
+    /// old image of an `execve`).
+    pub root: usize,
     /// User virtual address to start at.
     pub entry: usize,
-    pages: [usize; MAX_IMAGE_PAGES],
-    count: usize,
+    pages: Vec<usize>,
 }
 
 impl Loaded {
     const fn empty() -> Self {
         Loaded {
+            root: 0,
             entry: 0,
-            pages: [0; MAX_IMAGE_PAGES],
-            count: 0,
+            pages: Vec::new(),
         }
+    }
+
+    /// A descriptor for an image whose pages were copied into `root` by the
+    /// caller (the `fork` path). `pages` are the virtual addresses, in the same
+    /// order as the parent's image; no validation is repeated here.
+    pub fn from_pages(root: usize, entry: usize, pages: &[usize]) -> Option<Self> {
+        if pages.len() > MAX_IMAGE_PAGES {
+            return None;
+        }
+        let mut loaded = Loaded::empty();
+        loaded.root = root;
+        loaded.entry = entry;
+        loaded.pages.try_reserve_exact(pages.len()).ok()?;
+        loaded.pages.extend_from_slice(pages);
+        Some(loaded)
     }
 
     /// The user virtual addresses this image owns, in mapping order.
     pub fn pages(&self) -> &[usize] {
-        &self.pages[..self.count]
+        &self.pages
     }
 
     /// Unmap every page and return its physical frame to the PMM.
@@ -320,13 +342,11 @@ impl Loaded {
     /// (a page that disappeared) are ignored here because there is no better
     /// answer after a process has ended; the ledger check catches a real leak.
     pub fn release(&mut self) {
-        for index in 0..self.count {
-            if let Ok(frame) = paging::unmap(self.pages[index]) {
+        for page in self.pages.drain(..) {
+            if let Ok(frame) = paging::unmap_in(self.root, page) {
                 pmm::free_frame(frame);
             }
-            self.pages[index] = 0;
         }
-        self.count = 0;
     }
 }
 
@@ -366,6 +386,18 @@ fn u64_at(bytes: &[u8], offset: usize) -> Option<u64> {
 /// On `Err`, every page mapped by this call has already been unmapped and its
 /// frame returned: the PMM ledger is the same as before the call.
 pub fn load<S: ImageSource + ?Sized>(source: &S, bias: usize) -> Result<Loaded, ElfError> {
+    load_in(paging::active_root(), source, bias)
+}
+
+/// [`load`] into an explicit address-space root.
+///
+/// The process loader uses this so an image is mapped into its own root before
+/// that root is installed; the direct selftest uses [`load`] on the kernel root.
+pub fn load_in<S: ImageSource + ?Sized>(
+    root: usize,
+    source: &S,
+    bias: usize,
+) -> Result<Loaded, ElfError> {
     // ── ELF header ────────────────────────────────────────────────────────
     let source_len = source.len();
     if source_len < EHDR_SIZE as u64 {
@@ -434,8 +466,14 @@ pub fn load<S: ImageSource + ?Sized>(source: &S, bias: usize) -> Result<Loaded, 
     }; MAX_SEGMENTS];
     let mut segment_count = 0usize;
     let mut executable_contains_entry = false;
-    let mut plans = [PagePlan { vaddr: 0, flags: 0 }; MAX_IMAGE_PAGES];
-    let mut plan_count = 0usize;
+    // A 256-entry `PagePlan` array is 4 KiB of kernel stack, and `execve`
+    // calls this loader from a 16 KiB kernel stack that already holds the trap
+    // frame and the syscall/process frames; the first version overflowed the
+    // guard there. Keep the plan list on the heap, like `Loaded`.
+    let mut plans: Vec<PagePlan> = Vec::new();
+    if plans.try_reserve_exact(MAX_IMAGE_PAGES).is_err() {
+        return Err(ElfError::OutOfFrames);
+    }
 
     for index in 0..phnum {
         let base = index * PHDR_SIZE;
@@ -509,20 +547,16 @@ pub fn load<S: ImageSource + ?Sized>(source: &S, bias: usize) -> Result<Loaded, 
             if flags & PF_X != 0 {
                 merged |= PTE_X;
             }
-            match plans[..plan_count]
-                .iter_mut()
-                .find(|plan| plan.vaddr == page)
-            {
+            match plans.iter_mut().find(|plan| plan.vaddr == page) {
                 Some(plan) => plan.flags |= merged,
                 None => {
-                    if plan_count == MAX_IMAGE_PAGES {
+                    if plans.len() == MAX_IMAGE_PAGES {
                         return Err(ElfError::ImageTooLarge);
                     }
-                    plans[plan_count] = PagePlan {
+                    plans.push(PagePlan {
                         vaddr: page,
                         flags: merged,
-                    };
-                    plan_count += 1;
+                    });
                 }
             }
             page += FRAME_SIZE;
@@ -545,8 +579,12 @@ pub fn load<S: ImageSource + ?Sized>(source: &S, bias: usize) -> Result<Loaded, 
 
     // ── map (rollback on the first failure) ───────────────────────────────
     let mut loaded = Loaded::empty();
+    loaded.root = root;
     loaded.entry = entry;
-    for plan in &plans[..plan_count] {
+    if loaded.pages.try_reserve_exact(plans.len()).is_err() {
+        return Err(ElfError::OutOfFrames);
+    }
+    for plan in &plans {
         let Some(frame) = pmm::alloc_frame() else {
             loaded.release();
             return Err(ElfError::OutOfFrames);
@@ -557,11 +595,8 @@ pub fn load<S: ImageSource + ?Sized>(source: &S, bias: usize) -> Result<Loaded, 
         // whole frame is cleared, which is what gives the segment's `.bss` tail
         // its zeros.
         unsafe { core::ptr::write_bytes(frame as *mut u8, 0, FRAME_SIZE) };
-        match paging::map(plan.vaddr, frame, Flags::from_bits(plan.flags)) {
-            Ok(()) => {
-                loaded.pages[loaded.count] = plan.vaddr;
-                loaded.count += 1;
-            }
+        match paging::map_in(root, plan.vaddr, frame, Flags::from_bits(plan.flags)) {
+            Ok(()) => loaded.pages.push(plan.vaddr),
             Err(paging::MapError::AlreadyMapped(address)) => {
                 pmm::free_frame(frame);
                 loaded.release();
@@ -599,7 +634,7 @@ pub fn load<S: ImageSource + ?Sized>(source: &S, bias: usize) -> Result<Loaded, 
                 loaded.release();
                 return Err(error);
             }
-            let Some(frame) = paging::translate(page) else {
+            let Some(frame) = paging::translate_in(root, page) else {
                 loaded.release();
                 return Err(ElfError::Map(paging::MapError::NotMapped(page)));
             };

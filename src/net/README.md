@@ -74,7 +74,7 @@ out-of-order reassembly, нет congestion control — это HTTP/1.0-клие�
 маршрутизируются сюда), `setsockopt`/`getsockopt` (типовые опции принимаются и
 игнорируются) и `shutdown` (оба направления, fd остаётся). `recv`
 неблокирующий: `-EAGAIN` — «опять нет данных», 0 — peer закрылся. Соединение
-одно; `FdEntry::Socket { id, connected }` живёт в per-run таблице и закрывается
+одно; `FdEntry::Socket { id, connected }` живёт в per-process таблице и закрывается
 при teardown. Пока user-программа работает, шелл не в idle-цикле, поэтому
 `connect`/`send`/`shutdown`/`close` включают прерывания на время ожидания и сами
 вызывают `net::poll()` на каждом шаге — иначе тики бы стояли, а NIC остался бы

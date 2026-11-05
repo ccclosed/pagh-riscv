@@ -77,6 +77,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::arch::riscv64::csr;
+use crate::arch::riscv64::mmu;
 use crate::arch::riscv64::switch::{self, TaskContext};
 use crate::arch::riscv64::traps::TrapFrame;
 use crate::memory::{pmm, FRAME_SIZE};
@@ -306,6 +307,10 @@ struct Task {
     stack_base: usize,
     /// 16-byte-aligned top of the usable stack.
     stack_top: usize,
+    /// `satp` value the hart must be running with while this thread executes.
+    /// The kernel address space has ASID 0; a user thread carries its process's
+    /// root and ASID. `0` is "not initialised" and never installed.
+    satp: usize,
     /// Demo cohort this thread belongs to, compared against [`DEMO_EPOCH`].
     epoch: u64,
     /// Run this thread belongs to (`0` for kernel threads). `kill_group` uses
@@ -336,6 +341,7 @@ impl Task {
             entry: None,
             stack_base: 0,
             stack_top: 0,
+            satp: 0,
             epoch: 0,
             group: 0,
             wake_at: 0,
@@ -566,6 +572,7 @@ pub fn init() {
         (*shell).entry = None;
         (*shell).stack_base = 0;
         (*shell).stack_top = 0;
+        (*shell).satp = crate::memory::paging::kernel_satp();
         (*shell).epoch = 0;
         (*shell).group = 0;
         (*shell).wake_at = 0;
@@ -576,6 +583,7 @@ pub fn init() {
         (*idle).id = 1;
         (*idle).name.set("idle");
         (*idle).entry = Some(idle_main);
+        (*idle).satp = crate::memory::paging::kernel_satp();
         (*idle).epoch = 0;
         (*idle).group = 0;
         (*idle).wake_at = 0;
@@ -617,16 +625,15 @@ pub fn init() {
 /// the frame allocator has no run of [`STACK_ALLOC_FRAMES`] frames. The thread
 /// starts queued (`Ready`) and runs after the next tick/yield of the caller.
 pub fn spawn(entry: fn()) -> Option<u64> {
-    spawn_thread(entry, 0, 0)
+    let satp = crate::memory::paging::kernel_satp();
+    spawn_thread(entry, 0, 0, satp)
 }
 
-/// [`spawn`] tagging the thread as a member of a user run.
-///
-/// The tag is what [`kill_group`] retires on `exit_group` and what the runner
-/// uses (through `RunState::threads`, not the tag itself) to know a program is
-/// over. Kernel threads carry `0`.
-pub fn spawn_in_group(entry: fn(), group: u64) -> Option<u64> {
-    spawn_thread(entry, 0, group)
+/// [`spawn_in_group`] with an explicit address space, for a user task whose
+/// kernel-side body (`user_task`) runs before the first `sret` and must already
+/// see its process's user pages.
+pub fn spawn_in_group_satp(entry: fn(), group: u64, satp: usize) -> Option<u64> {
+    spawn_thread(entry, 0, group, satp)
 }
 
 /// Create a *user* thread that starts directly in U-mode.
@@ -649,28 +656,42 @@ pub fn spawn_user_thread(
     gp: usize,
     tp: usize,
     group: u64,
+    satp: usize,
 ) -> Option<u64> {
+    let mut frame = TrapFrame::zeroed();
+    frame.sp = stack;
+    frame.gp = gp;
+    frame.tp = tp;
+    frame.a0 = arg;
+    frame.sepc = entry;
+    frame.sstatus = csr::user_entry_status();
+    spawn_user_frame(&frame, group, satp)
+}
+
+/// Create a user thread whose complete U-mode register set is `frame`.
+///
+/// This is the `fork` entry point: the child resumes at exactly the parent's
+/// saved `sepc`/`sp`/registers (the caller has already set `a0 = 0` and advanced
+/// `sepc` past the `ecall`), through the same trap-return path as any other
+/// U-mode thread. `frame` is copied onto the new kernel stack before the thread
+/// is published, so the caller may keep using its own trap frame.
+pub fn spawn_user_frame(frame: &TrapFrame, group: u64, satp: usize) -> Option<u64> {
     let _mask = InterruptsOff::new();
     let (slot, base, stack_top) = reserve_stack()?;
 
     // The frame lives at the top of the new kernel stack, exactly where a
     // `trap_entry` from U-mode would build it (`sscratch = stack_top`, then
     // `sp -= sizeof(TrapFrame)`). The epilogue restores `sepc`, `sstatus`, the
-    // user `sp` and every GPR, then `sret`s.
+    // user `sp` and every GPR, then `sret`s. The source frame was built by the
+    // caller on its own stack; the copy is what makes the child independent.
     let frame_base = stack_top - core::mem::size_of::<TrapFrame>();
     // SAFETY: `frame_base` is inside this thread's freshly allocated, writable
     // kernel stack (`STACK_SIZE` is far larger than one frame), and nothing else
-    // owns it yet. Zeroing the whole frame is deliberate: a register not named
-    // below starts as 0, not as leftover kernel state that U-mode could read.
+    // owns it yet. `TrapFrame` is `Copy` data (all-usize fields), so the
+    // read/write pair is a valid duplicate with no drop obligations.
     unsafe {
-        core::ptr::write_bytes(frame_base as *mut u8, 0, core::mem::size_of::<TrapFrame>());
-        let frame = frame_base as *mut TrapFrame;
-        (*frame).sp = stack;
-        (*frame).gp = gp;
-        (*frame).tp = tp;
-        (*frame).a0 = arg;
-        (*frame).sepc = entry;
-        (*frame).sstatus = csr::user_entry_status();
+        let destination = frame_base as *mut TrapFrame;
+        core::ptr::write(destination, core::ptr::read(frame));
     }
     let context = TaskContext {
         ra: crate::arch::riscv64::traps::trap_return_address(),
@@ -678,12 +699,12 @@ pub fn spawn_user_thread(
         ..TaskContext::zeroed()
     };
     Some(commit_task(
-        slot, base, stack_top, None, context, 0, group, "thread-",
+        slot, base, stack_top, None, context, 0, group, satp, "thread-",
     ))
 }
 
 /// `spawn` with a demo cohort tag; the tag is only read by [`demo_main`].
-fn spawn_thread(entry: fn(), epoch: u64, group: u64) -> Option<u64> {
+fn spawn_thread(entry: fn(), epoch: u64, group: u64, satp: usize) -> Option<u64> {
     let _mask = InterruptsOff::new();
     let (slot, base, stack_top) = reserve_stack()?;
     let context = switch::initial_context(task_entry, stack_top);
@@ -695,6 +716,7 @@ fn spawn_thread(entry: fn(), epoch: u64, group: u64) -> Option<u64> {
         context,
         epoch,
         group,
+        satp,
         "task-",
     ))
 }
@@ -733,6 +755,7 @@ fn commit_task(
     context: TaskContext,
     epoch: u64,
     group: u64,
+    satp: usize,
     name_prefix: &str,
 ) -> u64 {
     let mut sched = SCHED.lock();
@@ -749,6 +772,7 @@ fn commit_task(
         (*t).entry = entry;
         (*t).stack_base = base;
         (*t).stack_top = stack_top;
+        (*t).satp = satp;
         (*t).epoch = epoch;
         (*t).group = group;
         (*t).wake_at = 0;
@@ -1225,7 +1249,7 @@ pub fn spawn_demo(count: usize) -> usize {
     let count = count.min(MAX_TASKS - FIRST_SPAWNABLE_SLOT);
     let mut started = 0usize;
     for _ in 0..count {
-        if spawn_thread(demo_main, epoch, 0).is_some() {
+        if spawn_thread(demo_main, epoch, 0, crate::memory::paging::kernel_satp()).is_some() {
             started += 1;
         }
     }
@@ -1275,6 +1299,39 @@ pub fn foreign_tasks() -> usize {
     live
 }
 
+/// Make the hart translate through `t`, if it is not already.
+///
+/// Called with the scheduler lock held and interrupts masked, immediately before
+/// the context switch. A `satp` write plus a full `sfence.vma` is the sound
+/// choice here: the ASID allocator is monotonic, but a root frame can be reused
+/// after its process is reaped, and a stale translation would alias two
+/// processes. Kernel mappings are global, so the normal case (two threads of one
+/// process, or the shell and idle) changes nothing.
+///
+/// # Safety
+/// `t` must point at a live task slot; the caller holds the scheduler lock.
+unsafe fn install_satp(t: *mut Task) {
+    // SAFETY: the caller's contract.
+    let satp = unsafe { (*t).satp };
+    if satp != 0 && satp != mmu::read_satp() {
+        mmu::activate_satp(satp);
+    }
+}
+
+/// Publish a new `satp` for the running thread (the `execve` path).
+///
+/// The syscall has already switched the hardware (`mmu::activate_satp`); this
+/// keeps the task table in step so the next switch back to this thread does not
+/// restore the address space its old image used.
+pub fn set_current_satp(satp: usize) {
+    let _mask = InterruptsOff::new();
+    let _sched = SCHED.lock();
+    let current = CURRENT_SLOT.load(Ordering::Relaxed);
+    let t = task(current);
+    // SAFETY: the current slot is live and the scheduler lock is held.
+    unsafe { (*t).satp = satp };
+}
+
 /// The scheduling decision plus the switch.
 ///
 /// Interrupts are masked for the whole function: the ready queue, the current
@@ -1308,7 +1365,15 @@ fn schedule(reason: Reason, timeout_ticks: Option<u64>) {
         // contexts live in the static table so the pointers are stable, and
         // interrupts are masked for the whole switch. When this thread is
         // scheduled again it continues right here.
-        unsafe { switch::switch(&mut (*from).context, &(*to).context) };
+        //
+        // The incoming thread's address space must be live before its first
+        // instruction runs; the outgoing one is left installed until then, and
+        // this same code installs it again when somebody switches back to it.
+        // Kernel memory is in every root, so the switch itself is safe in either.
+        unsafe {
+            install_satp(to);
+            switch::switch(&mut (*from).context, &(*to).context)
+        };
     }
     // `_mask` drops here — or when this thread is resumed after the switch — and
     // restores *this* context's interrupt state.
@@ -1554,6 +1619,19 @@ pub fn stats() -> Stats {
         ready_tasks: ready,
         hardware_clock: HARDWARE_CLOCK.load(Ordering::Relaxed),
     }
+}
+
+/// Group tag of the running thread (`0` for a kernel thread).
+///
+/// The process layer uses the tag as its process id: a user task is spawned with
+/// the pid, so every syscall can name its process without scanning the task
+/// table.
+pub fn current_group() -> u64 {
+    let _mask = InterruptsOff::new();
+    let current = CURRENT_SLOT.load(Ordering::Relaxed);
+    // SAFETY: `current` is a live slot and interrupts are masked so it cannot
+    // change while we read it.
+    unsafe { (*task(current)).group }
 }
 
 /// Id of the running thread.

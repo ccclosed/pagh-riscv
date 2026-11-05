@@ -170,6 +170,13 @@ const SYS_GETSOCKOPT: usize = 209;
 const SYS_SHUTDOWN: usize = 210;
 const SYS_EXIT: usize = 93;
 const SYS_EXIT_GROUP: usize = 94;
+const SYS_GETPPID: usize = 173;
+const SYS_EXECVE: usize = 221;
+const SYS_WAIT4: usize = 260;
+/// pagh-native: asm-generic has no `fork`; `clone(220)` with all-zero arguments
+/// is the alias the kernel also accepts.
+const SYS_FORK: usize = 1000;
+const WNOHANG: usize = 1;
 const SYS_SET_TID_ADDRESS: usize = 96;
 const SYS_FUTEX: usize = 98;
 const SYS_SCHED_YIELD: usize = 124;
@@ -255,6 +262,8 @@ const POLLHUP: i16 = 0x10;
 
 const ENOENT: isize = -2;
 const ESRCH: isize = -3;
+const ENOEXEC: isize = -8;
+const ECHILD: isize = -10;
 const EINTR: isize = -4;
 const EBADF: isize = -9;
 const EAGAIN: isize = -11;
@@ -403,6 +412,24 @@ fn write_all(bytes: &[u8]) -> bool {
 
 fn print(text: &str) {
     let _ = write_all(text.as_bytes());
+}
+
+fn fork_process() -> isize {
+    syscall1(SYS_FORK, 0)
+}
+
+fn wait_child(pid: isize, status: *mut i32, options: usize) -> isize {
+    syscall4(
+        SYS_WAIT4,
+        pid as usize,
+        status as usize,
+        options,
+        0,
+    )
+}
+
+fn execve(path: &[u8], argv: *const usize, envp: *const usize) -> isize {
+    syscall3(SYS_EXECVE, path.as_ptr() as usize, argv as usize, envp as usize)
 }
 
 fn print_usize(mut value: usize) {
@@ -2012,6 +2039,297 @@ fn signal_ext_section(stack: usize) {
     print("abi: jobcontrol ok\n");
 }
 
+// ─── process family: fork / wait4 / getppid / execve ──────────────────────
+
+/// A child forked by [`process_section`]: writes its marker, proves `getppid`
+/// names the caller and exits 42.
+fn fork_child_marks(parent_pid: isize) -> ! {
+    if syscall1(SYS_GETPPID, 0) != parent_pid {
+        let _ = syscall1(SYS_EXIT, 43);
+        loop {}
+    }
+    print("abi: fork ok\n");
+    let _ = syscall1(SYS_EXIT, 42);
+    loop {}
+}
+
+/// A child that sleeps before exiting, so the parent's first `WNOHANG` poll is
+/// guaranteed to find it alive and its blocking wait then runs concurrently.
+fn fork_sleeper() -> ! {
+    let pause = Timespec {
+        seconds: 0,
+        nanos: 50_000_000,
+    };
+    let _ = syscall2(SYS_NANOSLEEP, &pause as *const Timespec as usize, 0);
+    let _ = syscall1(SYS_EXIT, 7);
+    loop {}
+}
+
+/// `fork`/`wait4`/`getppid` and their error paths. Runs with or without `/mnt`.
+fn process_section() {
+    let parent_pid = syscall1(172, 0);
+    check(parent_pid > 0, 300, "process parent pid");
+    check(syscall1(SYS_GETPPID, 0) == 0, 301, "foreground getppid");
+
+    let child = fork_process();
+    if child == 0 {
+        fork_child_marks(parent_pid);
+    }
+    check(child > 0, 302, "fork child pid");
+    let mut status: i32 = 0;
+    check(
+        wait_child(child, &mut status, 0) == child,
+        303,
+        "wait4 reaps child",
+    );
+    check(status == 42 << 8, 304, "wait4 exit status");
+    print("abi: wait ok\n");
+
+    // WNOHANG on a live child is 0; the blocking call that follows reaps it.
+    let sleeper = fork_process();
+    if sleeper == 0 {
+        fork_sleeper();
+    }
+    check(sleeper > 0, 305, "fork sleeper pid");
+    let mut sleeper_status: i32 = 0;
+    check(
+        wait_child(sleeper, &mut sleeper_status, WNOHANG) == 0,
+        306,
+        "wait4 WNOHANG while running",
+    );
+    check(
+        wait_child(sleeper, &mut sleeper_status, 0) == sleeper,
+        307,
+        "wait4 blocking sleeper",
+    );
+    check(sleeper_status == 7 << 8, 308, "sleeper exit status");
+
+    // ── fd/pipe inheritance ──
+    // A pipe written before `fork` must be readable in the child; both ends are
+    // descriptor references, not copies of the ring. The child closes its two
+    // ends before exiting, so the parent's `wait4` also proves the ring is
+    // released after the last reference (the kernel's `live_pipes() == 0`).
+    let mut pipe_fds = [0i32; 2];
+    check(
+        syscall2(SYS_PIPE2, pipe_fds.as_mut_ptr() as usize, 0) == 0,
+        340,
+        "fork pipe2",
+    );
+    let pipe_read = pipe_fds[0] as usize;
+    let pipe_write = pipe_fds[1] as usize;
+    check(
+        syscall3(SYS_WRITE, pipe_write, b"P".as_ptr() as usize, 1) == 1,
+        341,
+        "fork pipe write",
+    );
+    let pipe_child = fork_process();
+    if pipe_child == 0 {
+        let mut byte = [0u8; 1];
+        let got = syscall3(SYS_READ, pipe_read, byte.as_mut_ptr() as usize, 1);
+        let ok = got == 1 && byte[0] == b'P';
+        let _ = syscall1(SYS_CLOSE, pipe_read);
+        let _ = syscall1(SYS_CLOSE, pipe_write);
+        let _ = syscall1(SYS_EXIT, if ok { 0 } else { 47 });
+        loop {}
+    }
+    check(pipe_child > 0, 342, "fork pipe child");
+    check(syscall1(SYS_CLOSE, pipe_write) == 0, 343, "parent close pipe write");
+    check(syscall1(SYS_CLOSE, pipe_read) == 0, 344, "parent close pipe read");
+    let mut pipe_status: i32 = 0;
+    check(
+        wait_child(pipe_child, &mut pipe_status, 0) == pipe_child,
+        345,
+        "fork pipe child reaped",
+    );
+    check(pipe_status == 0, 346, "fork pipe byte read");
+
+    // ── signal inheritance ──
+    // `fork` copies the handler table; the child proves it by delivering SIGUSR1
+    // to itself. If the handler had been reset, the default action would kill
+    // the child and `wait4` would report signal 10 instead of exit 0.
+    let inherited = SigAction {
+        handler: sigusr1_handler as *const () as usize,
+        flags: SA_RESTORER,
+        mask: 0,
+        restorer: abi_sigrestorer as *const () as usize,
+    };
+    check(
+        rt_sigaction(SIGUSR1, &inherited, core::ptr::null_mut()) == 0,
+        347,
+        "fork install SIGUSR1",
+    );
+    let sig_child = fork_process();
+    if sig_child == 0 {
+        let self_pid = syscall1(172, 0);
+        if kill(self_pid, SIGUSR1) != 0 {
+            let _ = syscall1(SYS_EXIT, 48);
+            loop {}
+        }
+        if SIGUSR1_HITS.load(Ordering::SeqCst) != 6 {
+            let _ = syscall1(SYS_EXIT, 49);
+            loop {}
+        }
+        let _ = syscall1(SYS_EXIT, 0);
+        loop {}
+    }
+    check(sig_child > 0, 348, "fork signal child");
+    let mut sig_status: i32 = 0;
+    check(
+        wait_child(sig_child, &mut sig_status, 0) == sig_child,
+        349,
+        "fork signal child reaped",
+    );
+    check(sig_status == 0, 350, "fork inherited SIGUSR1 handler");
+    let dfl_usr1 = SigAction {
+        handler: SIG_DFL,
+        flags: 0,
+        mask: 0,
+        restorer: 0,
+    };
+    check(
+        rt_sigaction(SIGUSR1, &dfl_usr1, core::ptr::null_mut()) == 0,
+        351,
+        "fork restore SIG_DFL",
+    );
+
+    // Errors: no such child, an already-reaped child, bad pid and bad options.
+    check(wait_child(999_999, &mut status, 0) == ECHILD, 309, "wait4 no child");
+    check(wait_child(child, &mut status, 0) == ECHILD, 310, "wait4 reaped child");
+    check(wait_child(-2, &mut status, 0) == EINVAL, 311, "wait4 bad pid");
+    check(wait_child(-1, &mut status, 2) == EINVAL, 312, "wait4 bad options");
+
+    // execve error paths: the process is unchanged after every one of them.
+    let null_argv = [0usize; 1];
+    let null_env = [0usize; 1];
+    check(
+        execve(b"/mnt/abi-no-such-file\0", null_argv.as_ptr(), null_env.as_ptr()) == ENOENT,
+        313,
+        "execve missing path",
+    );
+    check(
+        execve(b"/mnt/exec-child\0", 0xdead_0000usize as *const usize, null_env.as_ptr()) == EFAULT,
+        314,
+        "execve bad argv",
+    );
+    check(
+        syscall3(
+            SYS_EXECVE,
+            0xdead_0000usize,
+            null_argv.as_ptr() as usize,
+            null_env.as_ptr() as usize,
+        ) == EFAULT,
+        315,
+        "execve bad path",
+    );
+    check(
+        execve(b"/mnt/exec-child\0", null_argv.as_ptr(), 0xdead_0000usize as *const usize) == EFAULT,
+        316,
+        "execve bad envp",
+    );
+    check(syscall1(SYS_GETPPID, 0) == 0, 317, "getppid after exec errors");
+}
+
+/// A forked child execs `/mnt/exec-child`; the parent's `wait4` status 0 proves
+/// the image ran with the expected `argv[1]` and environment.
+fn exec_section() {
+    // A non-ELF file is refused with ENOEXEC, and the child process survives.
+    let bad = fork_process();
+    if bad == 0 {
+        let null_argv = [0usize; 1];
+        let null_env = [0usize; 1];
+        let result = execve(
+            b"/mnt/abi-syscalls.txt\0",
+            null_argv.as_ptr(),
+            null_env.as_ptr(),
+        );
+        let _ = syscall1(SYS_EXIT, if result == ENOEXEC { 0 } else { 91 });
+        loop {}
+    }
+    check(bad > 0, 320, "fork execenoexec child");
+    let mut status: i32 = 0;
+    check(wait_child(bad, &mut status, 0) == bad, 321, "exec ENOEXEC reaped");
+    check(status == 0, 322, "exec ENOEXEC returned");
+
+    let child = fork_process();
+    if child == 0 {
+        let argv = [
+            b"exec-child\0".as_ptr() as usize,
+            b"exec-arg\0".as_ptr() as usize,
+            0,
+        ];
+        let envp = [b"PWD=/mnt\0".as_ptr() as usize, 0];
+        let result = execve(
+            b"/mnt/exec-child\0",
+            argv.as_ptr(),
+            envp.as_ptr(),
+        );
+        // execve only returns on error.
+        let _ = syscall1(SYS_EXIT, 90 + (-result) as usize);
+        loop {}
+    }
+    check(child > 0, 323, "fork exec child");
+    let mut status: i32 = 0;
+    check(wait_child(child, &mut status, 0) == child, 324, "exec child reaped");
+    check(status == 0, 325, "exec child exit status");
+    print("abi: exec wait ok\n");
+
+    // ── exec resets the signal table ──
+    // SIG_IGN is the observable case: POSIX keeps it across `exec`, pagh
+    // deliberately resets every action to SIG_DFL. The child asks its new image
+    // to raise SIGUSR1; if the ignore survived it exits 0, otherwise `wait4`
+    // reports death by signal 10.
+    let ignored = SigAction {
+        handler: SIG_IGN,
+        flags: 0,
+        mask: 0,
+        restorer: 0,
+    };
+    check(
+        rt_sigaction(SIGUSR1, &ignored, core::ptr::null_mut()) == 0,
+        352,
+        "exec install SIG_IGN",
+    );
+    let signal_child = fork_process();
+    if signal_child == 0 {
+        let argv = [
+            b"exec-child\0".as_ptr() as usize,
+            b"exec-arg\0".as_ptr() as usize,
+            0,
+        ];
+        let envp = [
+            b"PWD=/mnt\0".as_ptr() as usize,
+            b"PAGH_EXEC_SIGNAL=1\0".as_ptr() as usize,
+            0,
+        ];
+        let result = execve(b"/mnt/exec-child\0", argv.as_ptr(), envp.as_ptr());
+        let _ = syscall1(SYS_EXIT, 90 + (-result) as usize);
+        loop {}
+    }
+    check(signal_child > 0, 353, "fork exec signal child");
+    let mut signal_status: i32 = 0;
+    check(
+        wait_child(signal_child, &mut signal_status, 0) == signal_child,
+        354,
+        "exec signal child reaped",
+    );
+    check(
+        signal_status & 0x7f == 10,
+        355,
+        "exec reset SIG_IGN to SIG_DFL",
+    );
+    let dfl = SigAction {
+        handler: SIG_DFL,
+        flags: 0,
+        mask: 0,
+        restorer: 0,
+    };
+    check(
+        rt_sigaction(SIGUSR1, &dfl, core::ptr::null_mut()) == 0,
+        356,
+        "exec restore SIG_DFL",
+    );
+}
+
 // ─── the fixture ───────────────────────────────────────────────────────────
 
 #[no_mangle]
@@ -3014,6 +3332,9 @@ pub extern "C" fn abi_main() -> i32 {
     signal_section(thread_stack);
     signal_ext_section(thread_stack);
 
+    // ── process family: fork/wait4/getppid, before the filesystem split ──
+    process_section();
+
     // ── the filesystem half: skip when the selftest could not provide /mnt ──
     let path = b"/mnt/abi-syscalls.txt\0";
     let fd = syscall4(SYS_OPENAT, 0, path.as_ptr() as usize, O_RDONLY, 0);
@@ -3666,6 +3987,9 @@ pub extern "C" fn abi_main() -> i32 {
     );
     check(syscall1(SYS_CLOSE, fd as usize) == 0, 139, "close /mnt again");
 
+    // The exec target lives on /mnt; run it in a forked child so the parent's
+    // final exit_group/at-exit checks still happen.
+    exec_section();
     print("abi: mutations ok\n");
     print("abi: ok\n");
     exit_group_case(thread_stack);

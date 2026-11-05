@@ -1,7 +1,7 @@
 //! POSIX-style signals for the native user ABI.
 //!
 //! Scope: the six syscalls the ABI exposes (`kill`, `tgkill`, `rt_sigaction`,
-//! `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`), per-run handlers,
+//! `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`), per-process handlers,
 //! per-thread blocked masks, pending sets and alternate stacks, a user-memory
 //! signal frame, synchronous delivery for the faults that have a POSIX name
 //! (`SIGSEGV`, `SIGILL`, `SIGBUS`, `SIGTRAP`), and the four job-control stops
@@ -9,11 +9,18 @@
 //!
 //! # What a signal is here
 //!
-//! One run is one process: handlers and the signal frame format are per run,
-//! while the pending mask, the blocked mask and the alternate signal stack are
-//! per thread (a `clone` child has its own). `kill` with a thread id in the run
-//! targets that thread; `kill(0)` and `kill(-1)` target every live thread of the
-//! run. Delivery is asynchronous from the sender's point of view: the target
+//! One process owns one handler table; the pending mask, the blocked mask and
+//! the alternate signal stack are per thread (a `clone` child has its own).
+//! `fork` copies the handlers, the caller's blocked mask and the alternate-stack
+//! settings, never the pending bits; `execve` restores every handler to
+//! `SIG_DFL`, disables the alternate stack and drops pending bits, while the
+//! blocked mask survives, as POSIX specifies. `kill` with the caller's process
+//! id targets its main thread (or the first live thread when the main thread is
+//! gone); any other positive id must name a live thread of the caller's process.
+//! `kill(0)`/`kill(-1)` target every live thread of the calling process.
+//! Cross-process `kill` is not implemented: there is no permission model and no
+//! process group in this kernel. Delivery is asynchronous from the sender's
+//! point of view: the target
 //! marks the signal pending, and the *target's* next kernel-to-user boundary
 //! installs the handler. That boundary is the end of every syscall and the end
 //! of every trap taken from U-mode, including the timer tick, so a running
@@ -161,6 +168,7 @@ use crate::arch::riscv64::traps::TrapFrame;
 use crate::memory::{paging, FRAME_SIZE};
 use crate::sync::Spinlock;
 use crate::task::scheduler;
+use crate::user::process::MAX_PROCESSES;
 
 /// Signal numbers the ABI can name. Index 0 is never a valid signal.
 pub(crate) const MAX_SIGNALS: usize = 32;
@@ -341,27 +349,47 @@ impl ThreadSignal {
     }
 }
 
-/// The per-run handlers and the per-thread pending/blocked/altstack state.
-struct SignalTable {
-    /// Run these handlers belong to; 0 when no program has installed any.
-    run: u64,
+/// One process's installed handlers.
+///
+/// The handler table belongs to the process, not to a thread: `fork` copies it,
+/// `execve` resets it, and a `clone` sibling shares it. The row is keyed by the
+/// process-table slot and carries the pid, so a reused slot can never inherit a
+/// stale generation.
+struct ProcessSignals {
+    used: bool,
+    pid: u64,
     actions: [Action; MAX_SIGNALS],
+}
+
+impl ProcessSignals {
+    const fn empty() -> Self {
+        ProcessSignals {
+            used: false,
+            pid: 0,
+            actions: [Action::default(); MAX_SIGNALS],
+        }
+    }
+}
+
+/// The per-process handler rows and the per-thread pending/blocked/altstack
+/// state.
+struct SignalTable {
+    processes: [ProcessSignals; MAX_PROCESSES],
     threads: [ThreadSignal; MAX_THREADS],
 }
 
 impl SignalTable {
     const fn empty() -> Self {
         SignalTable {
-            run: 0,
-            actions: [Action::default(); MAX_SIGNALS],
+            processes: [const { ProcessSignals::empty() }; MAX_PROCESSES],
             threads: [ThreadSignal::empty(); MAX_THREADS],
         }
     }
 
-    fn reset(&mut self, run: u64) {
-        self.run = run;
-        self.actions = [Action::default(); MAX_SIGNALS];
-        self.threads = [ThreadSignal::empty(); MAX_THREADS];
+    fn process_index(&self, pid: u64) -> Option<usize> {
+        self.processes
+            .iter()
+            .position(|entry| entry.used && entry.pid == pid)
     }
 
     fn thread_index(&self, tid: u64) -> Option<usize> {
@@ -382,11 +410,18 @@ impl SignalTable {
     }
 
     fn live_handlers(&self) -> usize {
-        self.actions
+        self.processes
             .iter()
-            .skip(1)
-            .filter(|action| action.handler != SIG_DFL)
-            .count()
+            .filter(|process| process.used)
+            .map(|process| {
+                process
+                    .actions
+                    .iter()
+                    .skip(1)
+                    .filter(|action| action.handler != SIG_DFL)
+                    .count()
+            })
+            .sum()
     }
 
     fn live_threads(&self) -> usize {
@@ -470,19 +505,121 @@ pub(crate) fn live_pending() -> usize {
     })
 }
 
-/// Reset the per-run handler table and every thread entry. Called by
-/// `run_source` before the first task can issue an `ecall`.
-pub(crate) fn begin_run(run: u64) {
-    csr::without_interrupts(|| SIGNALS.lock().reset(run));
-}
-
-/// Forget everything a finished run installed. Called by the runner after the
-/// last thread is gone and before the next run can start.
-pub(crate) fn clear_run(run: u64) {
+/// Install a fresh handler row for a new process. Called before the process's
+/// first task can issue an `ecall`.
+pub(crate) fn begin_process(slot: usize, pid: u64) {
     csr::without_interrupts(|| {
         let mut table = SIGNALS.lock();
-        if table.run == run {
-            table.reset(0);
+        if let Some(entry) = table.processes.get_mut(slot) {
+            *entry = ProcessSignals {
+                used: true,
+                pid,
+                actions: [Action::default(); MAX_SIGNALS],
+            };
+        }
+    });
+}
+
+/// Copy `parent`'s handlers, the caller's blocked mask and its alternate-stack
+/// settings into the child. Pending bits and an armed frame are deliberately
+/// not copied: the child has not run yet, and a signal queued for the parent
+/// must not be delivered twice.
+pub(crate) fn fork_process(
+    parent_pid: u64,
+    child_pid: u64,
+    parent_slot: usize,
+    child_slot: usize,
+    child_tid: u64,
+) -> bool {
+    csr::without_interrupts(|| {
+        let mut table = SIGNALS.lock();
+        let Some(parent) = table.processes.get(parent_slot) else {
+            return false;
+        };
+        if !parent.used || parent.pid != parent_pid {
+            return false;
+        }
+        let actions = parent.actions;
+        if let Some(entry) = table.processes.get_mut(child_slot) {
+            *entry = ProcessSignals {
+                used: true,
+                pid: child_pid,
+                actions,
+            };
+        } else {
+            return false;
+        }
+        // The child's main thread inherits the blocked mask and alternate-stack
+        // configuration of the thread that called fork; pending signals and the
+        // "already on the alternate stack" depth start empty.
+        let inherited = table
+            .threads
+            .iter()
+            .find(|entry| entry.used && entry.tid == scheduler::current_id())
+            .map(|entry| {
+                (
+                    entry.blocked,
+                    entry.alt_sp,
+                    entry.alt_size,
+                    entry.alt_disabled,
+                )
+            })
+            .unwrap_or((0, 0, 0, true));
+        let Some(index) = table.ensure_thread(child_pid, child_tid) else {
+            return false;
+        };
+        let entry = &mut table.threads[index];
+        entry.blocked = inherited.0;
+        entry.alt_sp = inherited.1;
+        entry.alt_size = inherited.2;
+        entry.alt_disabled = inherited.3;
+        entry.alt_active = 0;
+        entry.pending = 0;
+        entry.frame = 0;
+        entry.restart = false;
+        true
+    })
+}
+
+/// `execve`: every handler returns to `SIG_DFL`, the alternate stack is
+/// disabled, pending signals and armed frames are dropped, and the blocked mask
+/// is kept (POSIX keeps the mask across `exec`).
+pub(crate) fn exec_process(slot: usize, pid: u64) {
+    csr::without_interrupts(|| {
+        let mut table = SIGNALS.lock();
+        if let Some(entry) = table.processes.get_mut(slot) {
+            if entry.used && entry.pid == pid {
+                entry.actions = [Action::default(); MAX_SIGNALS];
+            }
+        }
+        for thread in table.threads.iter_mut() {
+            if thread.used && thread.run == pid {
+                thread.pending = 0;
+                thread.frame = 0;
+                thread.alt_sp = 0;
+                thread.alt_size = 0;
+                thread.alt_disabled = true;
+                thread.alt_active = 0;
+                thread.restart = false;
+            }
+        }
+    });
+}
+
+/// Forget everything a finished process installed. Called by the runner or a
+/// parent's `wait4` after the last thread is gone.
+pub(crate) fn clear_process(slot: usize, pid: u64) {
+    csr::without_interrupts(|| {
+        let mut table = SIGNALS.lock();
+        if let Some(entry) = table.processes.get_mut(slot) {
+            if entry.used && entry.pid == pid {
+                *entry = ProcessSignals::empty();
+            }
+        }
+        for thread in table.threads.iter_mut() {
+            if thread.used && thread.run == pid {
+                *thread = ThreadSignal::empty();
+            }
         }
     });
 }
@@ -608,6 +745,13 @@ const _: () = assert!(core::mem::size_of::<SignalFrame>() == SIGFRAME_SIZE);
 const _: () = assert!(core::mem::offset_of!(SignalFrame, siginfo) == 288);
 const _: () = assert!(core::mem::offset_of!(SignalFrame, ucontext) == 432);
 
+/// The handler `pid` installed for `signal`, if the process still has a row.
+fn action_of(table: &SignalTable, pid: u64, signal: usize) -> Option<Action> {
+    table
+        .process_index(pid)
+        .map(|index| table.processes[index].actions[signal])
+}
+
 /// Run `f` with the signal table locked and interrupts masked.
 ///
 /// Single-hart discipline: the lock protects against a trap handler, not another
@@ -715,13 +859,7 @@ pub(crate) fn rt_sigaction(signum: usize, act: usize, oldact: usize, sigsetsize:
 
     // Read the old action and publish it *before* installing the new one: if the
     // user pointer is bad, the call changes nothing.
-    let old = with_table(|table| {
-        if table.run != run {
-            None
-        } else {
-            Some(table.actions[signum])
-        }
-    });
+    let old = with_table(|table| action_of(table, run, signum));
     let Some(old) = old else {
         return EINVAL;
     };
@@ -733,10 +871,10 @@ pub(crate) fn rt_sigaction(signum: usize, act: usize, oldact: usize, sigsetsize:
     }
     if let Some(action) = new_action {
         let installed = with_table(|table| {
-            if table.run != run {
+            let Some(index) = table.process_index(run) else {
                 return false;
-            }
-            table.actions[signum] = action;
+            };
+            table.processes[index].actions[signum] = action;
             true
         });
         if !installed {
@@ -797,7 +935,7 @@ pub(crate) fn sigaltstack(stack: usize, oldstack: usize) -> isize {
     // Snapshot the current stack for `oldstack` (and for the `SS_ONSTACK`
     // report) before installing anything.
     let current = with_table(|table| {
-        if table.run != run {
+        if table.process_index(run).is_none() {
             return None;
         }
         let index = table.ensure_thread(run, tid)?;
@@ -832,7 +970,7 @@ pub(crate) fn sigaltstack(stack: usize, oldstack: usize) -> isize {
 
     if let Some((sp, size, disabled)) = requested {
         let stored = with_table(|table| {
-            if table.run != run {
+            if table.process_index(run).is_none() {
                 return false;
             }
             let Some(index) = table.ensure_thread(run, tid) else {
@@ -881,7 +1019,7 @@ pub(crate) fn rt_sigprocmask(how: usize, set: usize, oldset: usize, sigsetsize: 
     };
 
     let current = with_table(|table| {
-        if table.run != run {
+        if table.process_index(run).is_none() {
             return None;
         }
         let index = table.ensure_thread(run, tid)?;
@@ -906,7 +1044,7 @@ pub(crate) fn rt_sigprocmask(how: usize, set: usize, oldset: usize, sigsetsize: 
             _ => set,
         };
         let stored = with_table(|table| {
-            if table.run != run {
+            if table.process_index(run).is_none() {
                 return false;
             }
             let Some(index) = table.ensure_thread(run, tid) else {
@@ -941,12 +1079,30 @@ fn validate_signal(sig: isize) -> Result<Option<usize>, isize> {
 /// Turn a pid argument into the target thread ids of `run`.
 fn resolve_targets(run: u64, pid: isize, out: &mut [u64]) -> Result<usize, isize> {
     if pid > 0 {
-        match scheduler::thread_group(pid as u64) {
-            Some(group) if group == run => {
-                out[0] = pid as u64;
+        // `getpid` names the process, not its main thread: resolve that id to
+        // the main thread when it is still live, else to any live thread of the
+        // group. A thread id keeps the older thread-targeted rule. Cross-process
+        // ids are `-ESRCH` (there is no permission model here).
+        let requested = pid as u64;
+        let target = if requested == crate::user::process_id() {
+            let main = crate::user::process::peek(requested, |proc| proc.main_tid)
+                .filter(|tid| scheduler::thread_group(*tid) == Some(run));
+            match main {
+                Some(tid) => Some(tid),
+                None => {
+                    let ids = scheduler::group_threads(run, out);
+                    (ids > 0).then_some(out[0])
+                }
+            }
+        } else {
+            (scheduler::thread_group(requested) == Some(run)).then_some(requested)
+        };
+        match target {
+            Some(tid) => {
+                out[0] = tid;
                 Ok(1)
             }
-            _ => Err(ESRCH),
+            None => Err(ESRCH),
         }
     } else if pid == 0 || pid == -1 {
         let count = scheduler::group_threads(run, out);
@@ -956,8 +1112,9 @@ fn resolve_targets(run: u64, pid: isize, out: &mut [u64]) -> Result<usize, isize
             Ok(count)
         }
     } else {
-        // Any other negative pid would address another process group; there is
-        // exactly one run, so the honest answer is "no such process".
+        // Any other negative pid would address another process group; this
+        // kernel has no process groups, so the honest answer is "no such
+        // process".
         Err(ESRCH)
     }
 }
@@ -968,7 +1125,7 @@ fn resolve_targets(run: u64, pid: isize, out: &mut [u64]) -> Result<usize, isize
 fn mark_pending(run: u64, tid: u64, signal: usize, source: Source) -> Result<bool, isize> {
     let bit = 1u64 << (signal - 1);
     with_table(|table| {
-        if table.run != run {
+        if table.process_index(run).is_none() {
             return Err(ESRCH);
         }
         let Some(index) = table.ensure_thread(run, tid) else {
@@ -987,7 +1144,7 @@ fn mark_pending(run: u64, tid: u64, signal: usize, source: Source) -> Result<boo
 /// a stop that raced with the continue must not stop it again immediately.
 fn clear_stop_pending(run: u64, tid: u64) -> bool {
     with_table(|table| {
-        if table.run != run {
+        if table.process_index(run).is_none() {
             return false;
         }
         match table.thread_index(tid) {
@@ -1115,7 +1272,7 @@ pub(crate) fn interrupted() -> bool {
         };
         let tid = scheduler::current_id();
         let deliverable = with_table(|table| {
-            if table.run != run {
+            if table.process_index(run).is_none() {
                 return None;
             }
             let index = table.thread_index(tid)?;
@@ -1126,7 +1283,7 @@ pub(crate) fn interrupted() -> bool {
                 return None;
             }
             let signal = deliverable.trailing_zeros() as usize + 1;
-            if table.actions[signal].flags & SA_RESTART != 0 {
+            if action_of(table, run, signal)?.flags & SA_RESTART != 0 {
                 table.threads[index].restart = true;
             }
             Some(())
@@ -1167,10 +1324,10 @@ pub(crate) fn take_restart() -> bool {
 ///
 /// `si_pid`/`si_uid` describe the sender for `kill`/`tgkill`; `si_addr` is the
 /// faulting virtual address for a synchronous fault. `si_status` is meaningful
-/// only for a child-exit `SIGCHLD`, which this process model cannot produce yet:
-/// an explicitly sent SIGCHLD is `SI_USER` and leaves it 0. The `fork`/`wait`
-/// workstream overwrites bytes 24..28 with the real status when it starts
-/// generating child signals.
+/// only for a child-exit `SIGCHLD`, and this kernel does not generate that
+/// signal: `fork`/`exit`/`wait4` do not post `SIGCHLD` yet, and an explicitly
+/// sent SIGCHLD is `SI_USER` with `si_status = 0`. That is a documented gap, not
+/// a claim of waitable child notification.
 fn make_siginfo(signal: usize, source: Source) -> [u8; SIGINFO_SIZE] {
     let mut info = [0u8; SIGINFO_SIZE];
     info[0..4].copy_from_slice(&(signal as i32).to_le_bytes());
@@ -1245,7 +1402,7 @@ fn make_ucontext(frame: &TrapFrame, mask: u64, link: u64) -> UContext {
 fn arm(frame: &mut TrapFrame, run: u64, signal: usize, action: Action, source: Source) {
     let tid = scheduler::current_id();
     let state = with_table(|table| {
-        if table.run != run {
+        if table.process_index(run).is_none() {
             return None;
         }
         let index = table.ensure_thread(run, tid)?;
@@ -1347,7 +1504,7 @@ fn arm(frame: &mut TrapFrame, run: u64, signal: usize, action: Action, source: S
     }
 
     let armed = with_table(|table| {
-        if table.run != run {
+        if table.process_index(run).is_none() {
             return false;
         }
         let Some(index) = table.ensure_thread(run, tid) else {
@@ -1360,7 +1517,9 @@ fn arm(frame: &mut TrapFrame, run: u64, signal: usize, action: Action, source: S
             entry.alt_active = entry.alt_active.saturating_add(1);
         }
         if action.flags & SA_RESETHAND != 0 {
-            table.actions[signal] = Action::default();
+            if let Some(process) = table.process_index(run) {
+                table.processes[process].actions[signal] = Action::default();
+            }
         }
         true
     });
@@ -1408,13 +1567,7 @@ fn default_action(frame: &TrapFrame, signal: usize) {
 
 /// One delivery attempt for the current thread.
 fn deliver_one(frame: &mut TrapFrame, run: u64, signal: usize, source: Source) -> bool {
-    let action = with_table(|table| {
-        if table.run != run {
-            None
-        } else {
-            Some(table.actions[signal])
-        }
-    });
+    let action = with_table(|table| action_of(table, run, signal));
     let Some(action) = action else {
         return false;
     };
@@ -1445,7 +1598,7 @@ pub(crate) fn deliver_pending(frame: &mut TrapFrame) {
     };
     let tid = scheduler::current_id();
     let item = with_table(|table| {
-        if table.run != run {
+        if table.process_index(run).is_none() {
             return None;
         }
         let index = table.ensure_thread(run, tid)?;
@@ -1503,13 +1656,7 @@ pub(crate) fn deliver_fault(
     let Some(run) = crate::user::current_run_id() else {
         return false;
     };
-    let action = with_table(|table| {
-        if table.run != run {
-            None
-        } else {
-            Some(table.actions[signal])
-        }
-    });
+    let action = with_table(|table| action_of(table, run, signal));
     let Some(action) = action else {
         return false;
     };
@@ -1557,7 +1704,7 @@ pub(crate) fn sigreturn(frame: &mut TrapFrame) -> Result<(), isize> {
     }
 
     let active = with_table(|table| {
-        if table.run != run {
+        if table.process_index(run).is_none() {
             return None;
         }
         let index = table.thread_index(tid)?;
@@ -1592,7 +1739,7 @@ pub(crate) fn sigreturn(frame: &mut TrapFrame) -> Result<(), isize> {
     let restored = signal.saved;
 
     let restored_ok = with_table(|table| {
-        if table.run != run {
+        if table.process_index(run).is_none() {
             return false;
         }
         let Some(index) = table.thread_index(tid) else {

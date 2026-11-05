@@ -34,7 +34,9 @@ use crate::arch::riscv64::traps::CAUSE_LOAD_PAGE_FAULT;
 use crate::memory::pmm;
 use crate::user::elf::{self, ElfError, MAX_IMAGE_BYTES};
 use crate::user::syscall;
-use crate::user::{self, Exit, UserError, ABI_ELF, ARGV_ELF, FAULT_ELF, HELLO_ELF, SPIN_ELF};
+use crate::user::{
+    self, Exit, UserError, ABI_ELF, ARGV_ELF, EXEC_CHILD_ELF, FAULT_ELF, HELLO_ELF, SPIN_ELF,
+};
 use crate::vfs::{self, VfsError, VfsNode};
 
 /// The fixture's `e_entry`: `user.ld` places `_start` at the bottom of the first
@@ -62,6 +64,15 @@ const PHDR_MEMSZ: usize = PHDR0 + 40;
 /// Free frames in the PMM: the number every case has to leave unchanged.
 fn frames() -> usize {
     pmm::stats().0
+}
+
+/// True when a captured console transcript contains `needle` as a contiguous
+/// byte run. The transcript is bounded; a `truncated` capture is still searched,
+/// and the caller's marker check fails if the bytes were not there.
+fn captured_contains(captured: &user::Captured, needle: &[u8]) -> bool {
+    captured.bytes[..captured.len]
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 /// Little-endian stores that never panic on an out-of-range offset: a fixture
@@ -337,6 +348,7 @@ fn user_abi_argv(_buf: &mut Vec<u8>) -> Outcome {
 const ABI_FILE: &str = "abi-syscalls.txt";
 const ABI_CREATED: &str = "abi-created.txt";
 const ABI_LINK: &str = "abi-link";
+const EXEC_CHILD: &str = "exec-child";
 const ABI_FILE_BYTES: &[u8] = b"pagh-abi\n";
 
 /// Every name the ABI fixture's mutation half may create. The fixture removes
@@ -362,7 +374,7 @@ fn cleanup_abi_files(dir: &Arc<dyn VfsNode>) {
             }
         }
     }
-    for name in [ABI_FILE, ABI_CREATED, ABI_LINK] {
+    for name in [ABI_FILE, ABI_CREATED, ABI_LINK, EXEC_CHILD] {
         match dir.remove(name) {
             Ok(()) | Err(VfsError::NotFound) => {}
             Err(error) => crate::kprintln!(
@@ -401,6 +413,14 @@ fn create_abi_files(dir: &Arc<dyn VfsNode>) -> Result<(), &'static str> {
         .create_symlink(ABI_LINK, ABI_FILE.as_bytes())
         .map_err(|_| "cannot create /mnt/abi-link")?;
     drop(link);
+    let exec = dir
+        .create_file(EXEC_CHILD)
+        .map_err(|_| "cannot create /mnt/exec-child")?;
+    match exec.write(0, EXEC_CHILD_ELF) {
+        Ok(written) if written == EXEC_CHILD_ELF.len() => {}
+        _ => return Err("cannot write /mnt/exec-child"),
+    }
+    drop(exec);
     Ok(())
 }
 
@@ -445,11 +465,13 @@ fn user_abi_syscalls(_buf: &mut Vec<u8>) -> Outcome {
         }
     }
 
+    user::capture_start();
     let result = if ok {
         Some(user::run_image_with_args(ABI_ELF, &["abi.elf"], &["PWD=/"]))
     } else {
         None // setup failed; do not run against missing inputs
     };
+    let captured = user::capture_stop();
     let stats = syscall::stats();
 
     // The fixture removes every mutation artifact itself (rename, link, symlink,
@@ -486,6 +508,26 @@ fn user_abi_syscalls(_buf: &mut Vec<u8>) -> Outcome {
         }
     }
 
+    // The three process markers are console evidence, not just exit codes: the
+    // fork child writes the first, the parent the second, and the forked child
+    // that exec'd `/mnt/exec-child` writes the third (with the argv/envp it
+    // actually received). `exec` is disk-only because its target lives on /mnt.
+    let mut markers_ok = captured_contains(&captured, b"abi: fork ok\n")
+        && captured_contains(&captured, b"abi: wait ok\n");
+    if dir.is_some() {
+        markers_ok &= captured_contains(
+            &captured,
+            b"abi: exec ok argc=2 argv=exec-arg env=PWD=/mnt\n",
+        );
+    }
+    if !markers_ok {
+        crate::kprintln!(
+            "[selftest] user: process markers missing from {:?}",
+            core::str::from_utf8(&captured.bytes[..captured.len]).unwrap_or("<non-UTF-8>")
+        );
+        ok = false;
+    }
+
     // Counters: the fixture must have gone through the new entry points. The
     // filesystem-independent set is required on every boot; the file half only
     // when /mnt existed.
@@ -507,6 +549,10 @@ fn user_abi_syscalls(_buf: &mut Vec<u8>) -> Outcome {
         || stats.clones <= stats_before.clones
         || stats.futex_waits <= stats_before.futex_waits
         || stats.futex_wakes <= stats_before.futex_wakes
+        || stats.forks <= stats_before.forks
+        || stats.waits <= stats_before.waits
+        || stats.getppids <= stats_before.getppids
+        || (dir.is_some() && stats.execs <= stats_before.execs)
     {
         crate::kprintln!(
             "[selftest] user: ABI counters did not move as expected (before {:?}, after {:?})",
@@ -540,6 +586,13 @@ fn user_abi_syscalls(_buf: &mut Vec<u8>) -> Outcome {
     // Pipe rings are static memory, not PMM frames, so the ledger cannot see a
     // leaked one. The fixture closes every end; a non-zero count would mean a
     // reference was lost and the ring would stay allocated for the whole boot.
+    if crate::user::process::live_processes() != 0 {
+        crate::kprintln!(
+            "[selftest] user: the ABI run left {} process slot(s)",
+            crate::user::process::live_processes()
+        );
+        ok = false;
+    }
     if crate::user::syscall::live_pipes() != 0 {
         crate::kprintln!(
             "[selftest] user: the ABI run left {} pipe(s) allocated",

@@ -103,12 +103,13 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
   (+ `src/drivers/README.md`), `fs/{ext2,format_policy,selftest}.rs`
   (+ `src/fs/README.md`), `vfs/mod.rs` (+ `src/vfs/README.md`),
   `task/{mod,scheduler,selftest}.rs` (+ `src/task/README.md`),
-  `user/{mod,signal,elf,syscall,selftest,futex}.rs` (+ `src/user/README.md`),
+  `user/{mod,process,signal,elf,syscall,selftest,futex}.rs` (+ `src/user/README.md`),
   `net/{mod,wire,dhcp,dns,tcp,selftest}.rs` (+ `src/net/README.md`),
   `pkg/{mod,sha256}.rs` (+ `src/pkg/README.md`), `console.rs`, `shell.rs`,
   `sync.rs`.
-- `userland/` — five static RV64 fixture programs (`hello`, `fault`, `spin`,
-  `argv`, `abi`), their linker script and `build.sh` (+ `userland/README.md`).
+- `userland/` — six static RV64 fixture programs (`hello`, `fault`, `spin`,
+  `argv`, `abi`, `exec-child`), their linker script and `build.sh`
+  (+ `userland/README.md`).
   The ELFs are committed and embedded with `include_bytes!`; a rebuild must be
   committed with the sources in the same commit.
 - `docs/` — architecture, roadmap, screenshots (`shell.png`, `fs.png`, `user.png`,
@@ -265,24 +266,28 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
     machine still booted, which is how it hid). A child's frame reaches `sret`
     through `trap_return`, the same epilogue a preempted U-mode thread uses; do
     not add a second entry layout.
-22. **U-mode faults kill the run, never the hart.** Any synchronous exception
-    with saved `SPP == 0` (`ecall` excepted) goes to `user::on_fault`, which
-    prints one `[user] <name> killed: …` line, records `Exit::Fault`, retires the
-    run's other threads with `scheduler::kill_group` and calls `scheduler::exit`;
-    the runner releases pages and frames afterwards. A fault is process-fatal on
-    purpose: a thread that died holding a userspace lock would leave the others
-    waiting forever. S-mode exceptions keep the print-and-park contract. A user
-    program's bad pointer must be `-EFAULT` via PTE validation (`U=1` and `R=1`
-    for every page, `SUM` only around the copy), not an exception.
-23. **`RUN` is not held across blocking work, and outlives every thread.** The
-    runner claims the one user program (`Busy` otherwise) and releases `RUN` only
-    after `RunState::threads == 0` and the pages are gone; the wait loop
-    (`wait_for_run_end`, `yield_now`) and the trap paths only read/update short
-    sections. A `clone` child may outlive the main thread, so "the task is
-    Exited" is not "the run is over": releasing the address space, fd table or
-    heap while a child still runs is use-after-free. One address space, one ASID,
-    one program at a time: there is no per-process `satp` and no isolation
-    between two user programs.
+22. **U-mode faults kill the process, never the hart.** Any synchronous
+    exception with saved `SPP == 0` (`ecall` excepted) goes to `user::on_fault`,
+    which prints one `[user] <name> killed: …` line, records `Exit::Fault`,
+    retires the process's other threads with `scheduler::kill_group` and calls
+    `scheduler::exit`; the runner or the parent's `wait4` releases pages and
+    frames afterwards. A fault is process-fatal on purpose: a thread that died
+    holding a userspace lock would leave the others waiting forever. S-mode
+    exceptions keep the print-and-park contract. A user program's bad pointer
+    must be `-EFAULT` via PTE validation (`U=1` and `R=1` for every page, `SUM`
+    only around the copy), not an exception.
+23. **The process outlives every thread, and owns its address space.** A
+    `Process` (`src/user/process.rs`) is created by `run_source`/`fork`, holds
+    `root`/`satp`/`asid`, the fd row, heap/mmap tracking, `threads`, `exit` and
+    `wait_tid`, and is released only after `threads == 0` and `reap`. A thread's
+    exit only decrements `Process::threads` (and records the main thread's code);
+    it never tears down fd/heap/mmap. `exit_group`/`on_fault` retire survivors
+    with `scheduler::kill_group` and zero the counter; the runner or `wait4` then
+    does the one teardown. `Task::satp` points at the process root and
+    `scheduler::install_satp` switches it before `task_switch` with a full
+    `sfence.vma`; ASID is a TLB tag, not permission to skip the flush. A field a
+    thread touches while another runs belongs in `Process`, not in `Task`; a
+    per-thread field (blocked/pending/altstack) stays in `ThreadSignal`.
 24. **virtio-net's header is a contract, not a guess.** The driver negotiates
     `VIRTIO_F_VERSION_1` + `VIRTIO_NET_F_MRG_RXBUF`, so every buffer starts with
     a **12-byte** `virtio_net_hdr` (the 10-byte base plus `num_buffers`). A
@@ -337,8 +342,10 @@ disk it creates, renames, hard-links, symlinks, truncates, unlinks and
 mkdir/rmdir's entries under `/mnt`, and the kernel verifies they are gone), the
 signal sections (markers `abi: altstack ok`, `abi: siginfo ok`,
 `abi: jobcontrol ok`; the kernel requires the altstack/stop/continue/restart
-counters to move and no live handler, pending bit or `Stopped` task to survive)
-and the socket section (bad args/EBADF always; `connect` to `10.0.2.2:8000` plus
+counters to move and no live handler, pending bit or `Stopped` task to survive),
+the process family (`fork`/`execve`/`wait4`/`getppid`; markers `abi: fork ok`,
+`abi: wait ok`, `abi: exec ok`, `abi: exec wait ok`; `live_processes() == 0`
+and the fork/exec counters must move) and the socket section (bad args/EBADF always; `connect` to `10.0.2.2:8000` plus
 send/recv/shutdown/EOF only when a host server is listening, otherwise a
 `SKIP`, never a failure). `run demo` must print
 `run: demo exited with code 42`, `run fault` must be killed with cause 13 while
@@ -380,7 +387,7 @@ fuzzing. That is a gap, not a policy — the rule stands:
 
 ## Versioning
 
-Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.15.0`,
+Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.16.0`,
 which `Cargo.lock` mirrors. **The two move together in one commit**: CI builds with
 `--locked`, and cargo refuses to rewrite the lock (`cannot update the lock file …
 because --locked was passed`), so a `Cargo.toml`-only bump fails the build job in
@@ -416,7 +423,12 @@ seconds. Verify locally with `cargo build --locked` after any version change.
   blocked/pending masks, SA_RESTORER and a delivered user signal frame;
   `0.15.0` completes the signal surface: sigaltstack/SA_ONSTACK, full siginfo,
   SA_SIGINFO/ucontext, SA_NODEFER/RESETHAND/RESTART and journal-style
-  job control (SIGSTOP/CONT, stopped scheduler state). The same rule applies
+  job control (SIGSTOP/CONT, stopped scheduler state); `0.16.0` integrates
+  native processes: fork(1000)/execve(221)/wait4(260)/getppid(173), a per-process
+  Sv39 root and 16-bit ASID with `satp` switching, deep-copy fork, fd/pipe
+  inheritance (sockets become `-ENOTSUP` in the child), signal handling across
+  fork/exec, wait status and the orphan policy, without changing the 0.15 signal
+  frame or job-control semantics. The same rule applies
   to both: the tag equals the manifest and the `Cargo.lock` entry, and the
   release is not optional.
 
@@ -427,7 +439,7 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
 
 | Gap | Consequence for your change |
 |---|---|
-| Sv39 is on with an **identity** map, so a physical address is still a pointer | any address handed to a device (`fw_cfg`, ramfb) relies on that identity; a non-identity or per-process map breaks it silently |
+| Sv39 is on with an **identity** map, so a physical address is still a pointer | the kernel root and every process root copy that identity map; any address handed to a device (`fw_cfg`, ramfb) relies on it. `create_user_space` copies only supervisor leaves, so a kernel mapping added after a process root was created is absent there — do not add kernel maps under a live process without a plan |
 | The tick is 100 Hz and preemption happens only on it (no priorities/deadline scheduler) | scheduling policy is a scheduler change; `timer::set_tick_handler` is the seam, not a policy |
 | No TLS/apt: the network stack speaks plain HTTP | `pkg` verifies size + SHA-256 from the index only (integrity, not signatures) and says so; apt stays deliberately unwired until the vendored-TLS + OpenPGP milestone lands. Never call the digest a signature or `pkg` an apt replacement |
 | TCP is one active-open client (HTTP/1.0), not a general stack, and userland gets one `AF_INET`/`SOCK_STREAM` socket on top of it | no `listen`/`accept`/`bind`, UDP/IPv6 sockets, DNS syscall, multiple connections, out-of-order reassembly, congestion control or TLS |
@@ -436,18 +448,19 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
 | The pointer/keyboard have **no IRQ**: both are polled from the shell's idle loop | a long-running command (or a blocking wait that does not poll) freezes the cursor and drops typed bytes; do not put input polling in a place that never returns to the idle loop |
 | The keyboard translates **US layout only** and ignores arrows/Home/End/dead keys | a program needing another layout or key semantics needs a keymap layer, not a driver tweak |
 | Clicks/selection are not consumed: `BTN_LEFT` is read and stored, nothing acts on it | mouse-driven editing/selection is a UI milestone, not a driver change |
-| One address space, one ASID: user pages carry `U=1` in the kernel's single Sv39 tree | two user programs are not isolated from each other; no per-process `satp`; `brk` is one fixed 1 MiB window, `fork`/`exec`/`wait` are another workstream; 16 fds, console reads are non-blocking (`-EAGAIN`), `getdents64` is a snapshot taken at `openat`, `openat`/`mkdirat` ignore `mode` and `fchmodat` is a per-run override never written to the inode or enforced; `run <path>` streams from the VFS and accepts images up to 1 MiB (`MAX_IMAGE_BYTES`), one image at a time |
+| Per-process Sv39 root/ASID, but no COW/demand paging: `MAX_PROCESSES = 6`, `fork` deep-copies every page, `mmap`/`brk` allocate eagerly, ASID is only a TLB tag (switch still flushes) | releasing a process root while any thread lives, or reusing an ASID without the flush, aliases two processes; a seventh live process is `-EAGAIN`, not silent serialisation. `brk` is one fixed 1 MiB window, `MAP_SHARED`/`MAP_FIXED`/file-backed `mmap` are absent. 16 fds per process, console reads are non-blocking (`-EAGAIN`), `getdents64` is a snapshot taken at `openat`, `openat`/`mkdirat` ignore `mode` and `fchmodat` is a per-process override never written to the inode or enforced; `run <path>` streams from the VFS and accepts images up to 1 MiB (`MAX_IMAGE_BYTES`), one foreground image at a time |
 | The filesystem has **no journal** (M5 deliberately skipped the x86 WAL) | a power cut between two writes can leave an operation half-applied; do not claim crash consistency |
 | One block device slot, no partitions/hot-plug | a second disk is a design change, not a registration |
 | Formatting is the only destructive operation and is gated by `format_policy` | never format "to recover": a failed mount is not permission to erase |
-| No S-mode page-fault recovery | a kernel bad access halts (`[EXC] … halting`); a *user* fault ends that task instead (`user::on_fault`) |
+| No S-mode page-fault recovery | a kernel bad access halts (`[EXC] … halting`); a *user* fault ends that process instead (`user::on_fault`) |
 | Screenshot pixels are not gated in CI yet (`--check-font` returns a non-zero code) | wiring it into the smoke job is an open task, not a reason to trust a shot by eye |
 | No host tests; state coverage is `selftest` only | you own the verification: extend the smoke driver or add a `SELFTEST` routine (the M6b suite is `src/user/selftest.rs`) |
-| Threads are a native MVP: `clone` with explicit entry, no TLS/`CLONE_SETTLS`, no join/waitid, no priorities or PI futexes, max 14 live threads per run | libc's `clone` wrapper cannot be mapped one-to-one; document the native signature and keep the futex table static (32 waiters / 16 addresses) rather than growing it silently |
-| Signals are a documented subset: no `sigqueue`/`sival_ptr`/queued signals, no SIGFPE producer, no tty/process groups, `SA_RESTART` only for `futex`/`nanosleep` (full timeout again), `SIGCHLD` has no child-exit source (si_status 0), and `kill(0, SIGSTOP)` can park a whole run | the frame/`siginfo_t`/`ucontext_t` layouts are the ABI (see invariant 41) and must move with `docs/architecture.md` + `userland/abi.rs`; do not claim Linux signal semantics, and add queueing/tty/process-group state as a real design change rather than a flag |
-| 19 compiler warnings remain (unused diagnostic helpers, `trap_entry as usize`, …) | do not add more; warning-cleanup PRs are welcome |
+| Threads are a native MVP: `clone` with explicit entry, no TLS/`CLONE_SETTLS`, no join/waitid, no priorities or PI futexes, max 14 live threads per process | libc's `clone` wrapper cannot be mapped one-to-one; document the native signature and keep the futex table static (32 waiters / 16 addresses) rather than growing it silently |
+| Processes are an MVP: `fork` deep-copies, sockets are not inherited (child gets `-ENOTSUP`), file offsets are copied rather than shared, `SIGCHLD` has no child-exit source, no init/reparenting (the foreground runner kills orphans), `MAX_PROCESSES = 6` | do not describe this as POSIX process semantics; wait status is `code<<8` or signal in low 7 bits; a new process resource belongs in `Process` (or a side table) and must be released by `run_source`, `wait4` and `cleanup_orphans` |
+| Signals are a documented subset: no `sigqueue`/`sival_ptr`/queued signals, no SIGFPE producer, no tty/process groups, `SA_RESTART` only for `futex`/`nanosleep` (full timeout again), `SIGCHLD` has no child-exit source (si_status 0), no cross-process `kill`, and `kill(0, SIGSTOP)` can park a whole process | the frame/`siginfo_t`/`ucontext_t` layouts are the ABI (see invariant 41) and must move with `docs/architecture.md` + `userland/abi.rs`; do not claim Linux signal semantics, and add queueing/tty/process-group state as a real design change rather than a flag |
+| 20 compiler warnings remain (unused diagnostic helpers, `trap_entry as usize`, …) | do not add more; warning-cleanup PRs are welcome |
 | No `LICENSE` file although `Cargo.toml` says MIT | do not add a license your work does not own |
-| `src/memory/paging.rs` owns the only page table; `src/arch/riscv64/mmu.rs` is encoding only | do not map over the kernel image or drop the identity map while a device holds a physical address |
+| `src/memory/paging.rs` owns the kernel root and creates process roots; `src/arch/riscv64/mmu.rs` is encoding only | do not map over the kernel image or drop the identity map while a device holds a physical address; `free_user_space` frees table frames only, the process teardown frees the leaves first |
 28. **The software cursor is frame content.** It is erased before text is drawn and
     repainted after the frame flush; only its 12x19 rectangle is pushed
     (`flush_rect`). Drawing under the arrow outside that path leaves a stale
@@ -469,21 +482,26 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
     pointer is `-EFAULT` and the fault counter, never an S-mode page fault — a
     store to a read-only user page would otherwise print and halt the hart. Any
     new syscall with a buffer argument must use these helpers.
-31. **The fd table is per run, not per kernel.** `src/user/syscall.rs` has one
-    static table of 16 entries, reset by `run_source` before spawning and
-    released after the task is gone; 0/1/2 are the console, 3.. are
-    `Arc<dyn VfsNode>` + offset + flags, and at most one is
-    `FdEntry::Socket { id, connected }` (the stack owns one TCP connection;
-    a second `socket()` is `-ENOSPC`). Never hold its lock across a VFS, block
-    or network call (the block driver polls and may `wfi`; `tcp::close` sends a
-    segment): copy the `Arc`/offset/handle out, do the I/O, publish afterwards.
-    A node or connection must not survive a faulted program into the next run;
-    `release_fds` closes a socket the program left open.
+31. **The fd table is per process, not per kernel.** `src/user/syscall.rs` has
+    `FdTables` with one 16-entry row per process slot, reset by `run_source`
+    before spawning and released after the last thread is gone; 0/1/2 are the
+    console, 3.. are `Arc<dyn VfsNode>` + offset + flags, and at most one is
+    `FdEntry::Socket { id, connected }` (the stack owns one TCP connection; a
+    second `socket()` is `-ENOSPC`). `fork` copies the row: file/pipe entries
+    clone (a pipe ring gains one reference), a socket becomes
+    `FdEntry::Unsupported` because the kernel owns exactly one connection;
+    file offsets are copied, not shared. `execve` keeps the row. Never hold its
+    lock across a VFS, block or network call (the block driver polls and may
+    `wfi`; `tcp::close` sends a segment): copy the `Arc`/offset/handle out, do
+    the I/O, publish afterwards. `release_fds` collects pipe references and the
+    socket flag under the lock, releases the pipes and closes the socket
+    outside it, and a node or connection must not outlive the process.
 32. **The user heap is exactly `0x2000_0000..0x2010_0000` (1 MiB).** `brk` maps
-    zeroed PMM frames on demand through `paging::map(Flags::user_rw())`, records
-    them in `RunState::heap_frames`, and rolls a partial growth back on
-    `-ENOMEM`. The runner's `release_heap` unmaps and frees them after `reap`
-    and before `run_source` returns; the selftest's PMM ledger is the check. A
+    zeroed PMM frames on demand through `paging::map_in(proc.root, …, Flags::user_rw())`,
+    records them in `process::HEAPS` (not inline in `Process`, which must stay
+    small enough to move through a 16 KiB kernel stack), and rolls a partial
+    growth back on `-ENOMEM`. The runner/`wait4`/`execve` release them after
+    `reap`/before the root is freed; the selftest's PMM ledger is the check. A
     new mapping in this window, or an image placed there, is `-ENOMEM`, not an
     overlap.
 33. **`read(0)` never blocks.** It tries `uart::try_get_byte()` then
@@ -515,8 +533,9 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
     create-then-install path, `openat(O_CREAT)`, removes the new entry when the
     descriptor cannot be installed and rolls the descriptor back when `O_TRUNC`
     fails. Permissions are the documented gap: `mkdirat`/`openat` ignore `mode`,
-    and `fchmodat` only fills the per-run `ModeTable` that `fstat` reads — not
-    the ext2 inode, not an access check, gone with the run (`-ENOTSUP` on a
+    and `fchmodat` only fills the per-process `ModeTable` that `fstat` reads —
+    not the ext2 inode, not an access check, gone with the process (and not
+    inherited by `fork`; `-ENOTSUP` on a
     synthetic node, `-ENOSPC` past 16 overrides). A non-empty `rmdir` is
     `-ENOTEMPTY` (ext2 reports it as `AlreadyExists` internally; translate it),
     and a cross-mount `linkat`/`renameat2` is `-ENOTSUP`. Do not add path
@@ -525,11 +544,11 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
 
 36. **The socket ABI is one connection, and every wait must pump the NIC.**
     `socket` accepts only `AF_INET`/`SOCK_STREAM`/protocol 0; a second socket
-    while one fd is open is `-ENOSPC`. `FdEntry::Socket` lives in the per-run
+    while one fd is open is `-ENOSPC`. `FdEntry::Socket` lives in the per-process
     table and `read`/`write`/`close` route to `tcp::recv_nonblocking`/
     `tcp::send`/`tcp::close`; `shutdown` closes the connection but keeps the
     descriptor (`read` then returns 0, `write` is `-EPIPE`). A user program runs
-    while the shell sits in `wait_for_run_end`, so **nothing else polls the NIC**:
+    while the shell sits in `wait_for_process`, so **nothing else polls the NIC**:
     `connect` and `send` run with interrupts enabled for the wait (the same
     deliberate exception `nanosleep` makes, with no lock held) so ticks and
     preemption still work, and the TCP wait loop calls `net::poll()` every
@@ -540,14 +559,14 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
     and no TLS. The live evidence is `tools/test_sockets.py` /
     `docs/live-sockets.txt`; the CI-safe evidence is the always-running bad-arg
     half of `userland/abi.elf` plus its `SKIP` when `10.0.2.2:8000` is closed.
-37. **The run, not the thread, owns the address space.** `RunState` is created by
-    `run_source`, holds the shared address space, fd table, heap/mmap tracking and
-    the futex run id, and is released only after the last thread is `Exited` and
-    reaped. A thread's exit only decrements `RunState::threads` (and records the
+37. **The process, not the thread, owns the address space.** `Process` is created
+    by `run_source`/`fork`, holds `root/satp/asid`, fd row, heap/mmap tracking and
+    the futex pid, and is released only after the last thread is `Exited` and
+    reaped. A thread's exit only decrements `Process::threads` (and records the
     main thread's code); it never tears down fd/heap/mmap. `exit_group` and
-    `on_fault` retire survivors with `scheduler::kill_group` and zero the counter;
-    the runner then does the one teardown. A new field that a thread may touch
-    while another runs belongs in `RUN`, not in `Task`.
+    `on_fault` retire survivors with `scheduler::kill_group` and zero the
+    counter; the runner or `wait4` then does the one teardown. A new field that a
+    thread may touch while another runs belongs in `Process`, not in `Task`.
 38. **Every thread owns a kernel stack; the user stack is not yours.** A `clone`
     child gets the scheduler's 16 KiB + 4 KiB guard PMM stack like any task, and
     starts through the one trap-return path: a zeroed `TrapFrame` at the top of
@@ -565,12 +584,13 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
     value check is done by the syscall layer before registration; a syscall trap
     runs with `SIE = 0`, which is what makes check + insert + block atomic on one
     hart. Limits are static and documented: 32 waiters, 16 addresses.
-40. **`exit` is a thread exit; `exit_group` is a run exit.** `exit` decrements
-    `threads`, keeps the main thread's code and discards a non-main code; the
-    last thread stores the result. `exit_group` retires every thread and uses the
-    main thread's code if it already exited, otherwise the caller's. A fault is
-    an `Exit::Fault` for the whole run. Do not make `exit` call
-    `kill_group`, and do not let a thread return to U-mode after either call.
+40. **`exit` is a thread exit; `exit_group` is a process exit.** `exit`
+    decrements `Process::threads`, keeps the main thread's code and discards a
+    non-main code; the last thread stores the result and wakes the parent's
+    `wait4`. `exit_group` retires every thread and uses the main thread's code if
+    it already exited, otherwise the caller's. A fault is an `Exit::Fault` for
+    the whole process. Do not make `exit` call `kill_group`, and do not let a
+    thread return to U-mode after either call.
 
 41. **Signals deliver one fixed user frame; alt stacks and stops are scheduler
     state.** The frame is 736 bytes below `sp` (or below the alternate-stack
@@ -593,4 +613,25 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
     clearing pending stop bits, and `kill_group`/liveness scans include it.
     `SA_RESTART` is honoured only for `futex`/`nanosleep` by leaving `sepc` on
     the `ecall` and `a0` untouched; do not extend it to other syscalls without
-    an explicit restart contract.
+    an explicit restart contract. The action table is per **process**:
+    `fork_process` copies handlers, blocked mask and altstack settings (not
+    pending bits); `exec_process` sets every handler to `SIG_DFL` — including
+    `SIG_IGN`, a documented divergence — disables the alternate stack and drops
+    pending/frames while keeping the blocked mask.
+42. **A process is one root, one ASID and one fd row; its children are its own.**
+    `Process.root/satp/asid` are the address-space identity, `Task::satp` must
+    match the process of the running thread, and `install_satp` is the only
+    writer before a switch (`set_current_satp` updates it after `execve`).
+    `fork` deep-copies image/heap/mmap/stack into a fresh root, copies the fd
+    row (pipes +1 reference, sockets `-EINVAL`/`-ENOTSUP`), copies handlers but
+    not pending, and returns 0 in the child with `sepc+4`; the parent gets the
+    pid. `execve` builds the new root/ELF/stack **before** switching `satp`,
+    retires sibling threads, frees the old image/heap/mmap/stack/root, keeps
+    pid/ppid/fd/blocked and resets `wait_tid`, then rewrites the trap frame
+    (`a0=argc`, `a1=argv`, no `sepc` bump). `wait4` reaps only a
+    `threads == 0 && ready` child of the caller, status `code<<8` or signal in
+    the low 7 bits; `SIGCHLD` is not generated. The foreground runner kills and
+    reaps every survivor (`cleanup_orphans`) before `run_source` returns, so a
+    released process root is never still installed and a zombie never outlives
+    the command. Do not free `Process.root` while any of its threads is live or
+    while the hart is running on it.

@@ -1,32 +1,44 @@
-//! User mode (M6b): load a static RV64 ELF, run it in U-mode as a scheduler
-//! task, serve its `ecall`s and survive its faults.
+//! User mode: a process model, ELF loading, U-mode execution, syscalls and
+//! faults.
 //!
-//! # The shape of a run
+//! # What a process is
 //!
-//! [`run_image`] (embedded fixtures) and [`run_file`] (`run <path>`) are the
-//! whole user-visible operation, called from the shell:
+//! One [`Process`](process::Process) owns one Sv39 address space (a private root
+//! table with a nonzero ASID), its image pages, a 64 KiB user stack, the `brk`
+//! heap window, the `mmap` extents, one thread group, one descriptor table and
+//! its signal state. `run_source` creates the first process; `fork` copies the
+//! current one; `execve` replaces its image; `wait4` reaps a child. The shell
+//! still starts one foreground program with `run` and waits for it, but a
+//! forked child is a separate process that runs concurrently and can be waited
+//! for.
 //!
-//! 1. [`elf::load`] validates the image and maps its `PT_LOAD` pages with `U=1`
-//!    in the kernel's one Sv39 tree (see that module for the layout). The image
-//!    is read through [`elf::ImageSource`], so a file is streamed: the loader
-//!    asks for the header, the program-header table and one page of each
-//!    segment at a time and never allocates a whole-image buffer.
-//! 2. The 64 KiB user stack (`USER_STACK_BASE..USER_TOP`) is mapped from a
-//!    contiguous PMM run.
-//! 3. A normal scheduler task is spawned for the main thread; its kernel-thread
-//!    body calls [`enter_user`], which builds the return-to-U-mode state and
-//!    executes `sret` (`sstatus.SPP = 0`, `SPIE = 1`, `sepc = entry`,
-//!    `sp = stack_top`). A `clone` child starts instead at the exported trap-return
-//!    epilogue with a hand-built `TrapFrame`, the same layout a trap restores.
-//! 4. The shell task waits in [`wait_for_run_end`], yielding the CPU until the
-//!    last thread of the run is gone (`RunState::threads == 0`). While it waits,
-//!    timer preemption and `sched_yield` work exactly as for any other task —
-//!    U-mode is just a thread's register state, and a blocked thread is not
-//!    runnable.
-//! 5. The runner reaps every thread's kernel stack and releases the image, user
-//!    stack, fd table, heap/mmap regions and futex queue. The PMM ledger is back
-//!    where it started; the `selftest` user suite measures that, not the
-//!    function's promise.
+//! # The address space
+//!
+//! The kernel keeps its own root (ASID 0). [`paging::create_user_space`] makes a
+//! process root by copying every *supervisor* mapping the kernel has — the RAM
+//! identity map and the device windows — and no user page; the loader then maps
+//! only this process's image, heap, `mmap` and stack pages into it. Two processes
+//! therefore share no user frame, no table frame and no ASID, and U-mode in one
+//! cannot reach the other's memory even though both roots contain the same
+//! kernel map (that map has `U=0`). The scheduler installs a task's `satp`
+//! before switching to it; `sscratch` and the trap-frame layout are unchanged,
+//! so a trap from U-mode lands on the task's own kernel stack in the same root.
+//!
+//! A fork is a **deep copy** of the mapped user pages (image, heap, `mmap` and
+//! stack), not copy-on-write. COW is out of scope for this MVP: both processes
+//! own every frame they can touch from the first instruction, which is slower
+//! and uses more memory than a COW fork, but it needs no write-fault path and
+//! keeps the PMM ledger exact.
+//!
+//! # Run lifecycle
+//!
+//! [`run_image`]/[`run_file`] build a process, spawn the main thread, wait until
+//! its `threads` count reaches zero and return its exit status. A process that
+//! outlives the foreground — an orphan — is killed and reaped by the shell's
+//! runner before `run` returns. There is no init process to adopt it, and
+//! leaving it alive would let a stale user page table outlive the command that
+//! created it; the ABI documents "orphans die with the foreground run" rather
+//! than pretending to be POSIX.
 //!
 //! # Kernel stack, user stack, and `sscratch`
 //!
@@ -38,26 +50,19 @@
 //! makes the same swap a no-op for kernel traps. [`enter_user`] installs the
 //! kernel pointer, and the trap epilogue re-arms it on every return to U-mode.
 //!
-//! # What this isolation is, and is not
-//!
-//! One address space, one ASID: user pages carry `U=1`, kernel pages do not, so
-//! U-mode cannot read, write or execute the kernel. There is no separate `satp`,
-//! no per-process translation namespace and no protection between two user
-//! programs — processes run one at a time from [`run_image`], which refuses a
-//! second concurrent run. That is the honest description of the milestone; a
-//! per-process page table is a later change, not a flag.
-//!
 //! # Faults
 //!
-//! An exception whose saved `sstatus.SPP` is 0 ends the *run*, never the machine
-//! ([`on_fault`]). It prints one diagnostic line, retires the other threads with
-//! `scheduler::kill_group` and ends the caller; the runner then does the cleanup
-//! below. A fault is process-fatal because a thread that died holding a
-//! userspace lock would otherwise leave its siblings waiting forever. S-mode
-//! exceptions keep the older print-and-park contract in `arch::riscv64::traps`.
+//! An exception whose saved `sstatus.SPP` is 0 ends the *process*, never the
+//! machine ([`on_fault`]). It prints one diagnostic line, retires the other
+//! threads with `scheduler::kill_group` and ends the caller; the runner or the
+//! waiting parent then does the cleanup. A fault is process-fatal because a
+//! thread that died holding a userspace lock would otherwise leave its siblings
+//! waiting forever. S-mode exceptions keep the print-and-park contract in
+//! `arch::riscv64::traps`.
 
 pub mod elf;
 pub mod futex;
+pub mod process;
 pub mod selftest;
 pub mod signal;
 pub mod syscall;
@@ -66,14 +71,18 @@ use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use crate::arch::riscv64::mmu::{Flags, PTE_R, PTE_U};
+use crate::arch::riscv64::traps::TrapFrame;
 use crate::memory::paging;
 use crate::memory::pmm;
 use crate::memory::FRAME_SIZE;
 use crate::sync::Spinlock;
 use crate::task::scheduler;
 use crate::vfs::{self, VfsError, VfsNode};
+
+use process::Process;
 
 /// Embedded hello fixture: `write(1, "hello from user mode\n")`, `sched_yield`,
 /// `exit(42)`. Built by `userland/build.sh` and committed, so a clean checkout
@@ -93,14 +102,16 @@ pub const SPIN_ELF: &[u8] = include_bytes!("../../userland/spin.elf");
 /// layout against the ABI, prints one line and exits 0. See `userland/argv.rs`.
 pub const ARGV_ELF: &[u8] = include_bytes!("../../userland/argv.elf");
 
-/// Embedded native-ABI fixture: exercises `read`/`write`/`openat`/`close`/
-/// `lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/
-/// `readlinkat`, the path mutations and the BSD-socket subset. It exits 0 when
-/// everything passed, 77 when only the filesystem half was skipped (no `/mnt`),
-/// and a distinct non-zero code otherwise. The socket probe to `10.0.2.2:8000`
-/// is a printed SKIP when no host server is listening; the bad-argument half
-/// always runs.
+/// Embedded native-ABI fixture: exercises the syscall table, the file and
+/// directory mutations, sockets, threads, signals and the process family. It
+/// exits 0 when everything passed, 77 when only the filesystem half was skipped
+/// (no `/mnt`), and a distinct non-zero code otherwise.
 pub const ABI_ELF: &[u8] = include_bytes!("../../userland/abi.elf");
+
+/// Embedded `execve` target. The selftest writes it to `/mnt/exec-child`; the ABI
+/// fixture execs that path with one argument and one environment variable and
+/// the program exits 0 only when both arrived correctly.
+pub const EXEC_CHILD_ELF: &[u8] = include_bytes!("../../userland/exec-child.elf");
 
 pub use elf::{ElfError, ImageSource, SourceError, USER_STACK_BASE, USER_STACK_PAGES, USER_TOP};
 
@@ -151,28 +162,27 @@ pub const USER_MMAP_TOP: usize = 0x3f00_0000;
 /// Pages in the `mmap` window.
 pub const USER_MMAP_PAGES: usize = (USER_MMAP_TOP - USER_MMAP_BASE) / FRAME_SIZE;
 
-/// Most `mmap` regions one run may track.
+/// Most `mmap` regions one process may track.
 ///
 /// A region is a contiguous extent returned by one `mmap`; a partial `munmap`
 /// can split one into two. Eight extents cover ordinary allocator-shaped use
-/// (one arena plus a handful of small mappings) while keeping `RunState` small
-/// enough for the shell thread's 16 KiB stack — the 32-entry version overflowed
-/// it and hung the large-file selftest. Running out is `-ENOMEM` *before* any
-/// page is touched, never a half-applied `munmap`.
-const MAX_MMAP_REGIONS: usize = 8;
+/// (one arena plus a handful of small mappings) while keeping `Process` small
+/// enough for the trap stack. Running out is `-ENOMEM` *before* any page is
+/// touched, never a half-applied `munmap`.
+pub(crate) const MAX_MMAP_REGIONS: usize = 8;
 
-/// One contiguous extent of anonymous private mappings owned by the run.
+/// One contiguous extent of anonymous private mappings owned by the process.
 ///
 /// Teardown needs only the extent: every page is translated and freed one by
 /// one, so no per-page frame array (the heap's shape) is required.
 #[derive(Clone, Copy)]
-struct MmapRegion {
+pub(crate) struct MmapRegion {
     start: usize,
     pages: usize,
 }
 
 impl MmapRegion {
-    const fn empty() -> Self {
+    pub(crate) const fn empty() -> Self {
         MmapRegion { start: 0, pages: 0 }
     }
 
@@ -222,19 +232,21 @@ impl fmt::Display for Exit {
 ///
 /// A loader refusal is not a run: nothing was mapped by the time it is returned,
 /// and the shell prints it as a command error. The scheduler variants are the
-/// two resource failures the launch path has (task slot, stack frames).
+/// resource failures the launch path has (task slot, stack frames).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserError {
-    /// A program is already running (the shell is a single runner by design).
-    Busy,
     /// The ELF was refused; `elf::load` has already rolled back its pages.
     Elf(ElfError),
     /// The 64 KiB user stack had no contiguous run in the PMM.
     StackFrames,
     /// A user-stack page could not be mapped; the stack run was rolled back.
     StackMap(paging::MapError),
+    /// The process root table could not be built (frame pool empty).
+    AddressSpace,
     /// The scheduler had no task slot or no frames for the kernel stack.
     TaskSlot,
+    /// The process table has no free slot.
+    ProcessSlot,
     /// The path could not be resolved through the VFS.
     Vfs(VfsError),
     /// The path names a directory, not an image file.
@@ -255,13 +267,14 @@ pub enum UserError {
 impl fmt::Display for UserError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            UserError::Busy => f.write_str("a user program is already running"),
             UserError::Elf(error) => write!(f, "{error}"),
             UserError::StackFrames => f.write_str("no contiguous frames for the user stack"),
             UserError::StackMap(error) => write!(f, "mapping the user stack failed: {error}"),
+            UserError::AddressSpace => f.write_str("no frames for a process address space"),
             UserError::TaskSlot => {
                 f.write_str("the scheduler has no free slot or kernel stack for the task")
             }
+            UserError::ProcessSlot => f.write_str("no free process-table slot"),
             UserError::Vfs(error) => f.write_str(error.as_str()),
             UserError::IsADirectory => f.write_str("is a directory"),
             UserError::ImageSize(size) => write!(
@@ -283,23 +296,23 @@ impl fmt::Display for UserError {
     }
 }
 
-/// A fixed-capacity program name: stored in [`RunState`] because the fault
+/// A fixed-capacity program name: stored in [`Process`] because the fault
 /// handler runs in trap context and cannot borrow the shell's `String`.
 #[derive(Clone, Copy)]
-struct RunName {
+pub(crate) struct RunName {
     bytes: [u8; NAME_CAPACITY],
     len: u8,
 }
 
 impl RunName {
-    const fn empty() -> Self {
+    pub(crate) const fn empty() -> Self {
         RunName {
             bytes: [0; NAME_CAPACITY],
             len: 0,
         }
     }
 
-    fn new(name: &str) -> Self {
+    pub(crate) fn new(name: &str) -> Self {
         let mut out = RunName::empty();
         let take = name.len().min(NAME_CAPACITY);
         out.bytes[..take].copy_from_slice(&name.as_bytes()[..take]);
@@ -307,62 +320,15 @@ impl RunName {
         out
     }
 
-    fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         core::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or("?")
     }
 }
 
-/// The one user program currently running, if any.
-///
-/// `run_image` claims this before mapping anything and releases it after the
-/// task's frames are back in the PMM, so `Busy` is a real invariant rather than
-/// advisory. The trap and syscall paths only ever *read and update* the entry:
-/// the runner owns the mappings itself and does the cleanup after the task is
-/// gone, which keeps page-table teardown out of trap context.
-struct RunState {
-    /// Monotonic run id: the key that scopes futex waiters to one program. It is
-    /// never reused, so a stale queue entry from a killed run can never wake a
-    /// thread of the next one.
-    id: u64,
-    name: RunName,
-    entry: usize,
-    /// Initial user `sp`: 16-byte aligned, points at `argc`.
-    sp: usize,
-    /// `argc` and the user address of `argv[0]`, passed in `a0`/`a1`.
-    argc: usize,
-    argv: usize,
-    exit: Option<Exit>,
-    /// Scheduler id of the thread that started the program (`gettid` of the
-    /// main thread; `getpid` reports it for the whole run).
-    main_tid: u64,
-    /// Exit code the main thread passed to `exit`, recorded even when other
-    /// threads outlive it. The run returns this code, not the last thread's.
-    main_code: Option<u32>,
-    /// Threads of this run that have not exited yet, main included. The runner
-    /// waits for this to reach 0; `exit_group` and a fault set it to 0 after
-    /// retiring the survivors. Only this counter, not a task-state scan, defines
-    /// "the run is over".
-    threads: usize,
-    /// Page-aligned current `brk` (starts at [`USER_HEAP_BASE`]).
-    heap_end: usize,
-    /// Physical frames backing `USER_HEAP_BASE..heap_end`, in mapping order.
-    /// Kept here so the runner can unmap/free them after the task is gone; the
-    /// syscall layer is the only writer.
-    heap_frames: [usize; USER_HEAP_PAGES],
-    heap_count: usize,
-    /// Contiguous extents created by `mmap`, sorted and non-overlapping. The
-    /// runner frees every page still listed here after the task is gone; the
-    /// syscall layer is the only writer while the program runs.
-    mmap_regions: [MmapRegion; MAX_MMAP_REGIONS],
-    mmap_count: usize,
-}
-
-static RUN: Spinlock<Option<RunState>> = Spinlock::new(None);
-
-/// Next [`RunState::id`]. Monotonic for the whole boot; a new run never reuses
-/// the key of a previous one, which is what makes stale futex waiters harmless
-/// even if a teardown path ever missed one.
-static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
+/// Next process id. Monotonic for the whole boot; it is also the futex/signal
+/// scope key and the scheduler group tag, so a stale entry from a killed process
+/// can never match a future one.
+static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 
 // ─── console capture for the ABI selftest ─────────────────────────────────
 //
@@ -373,7 +339,7 @@ static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
 // boot pays one relaxed atomic load per user write.
 
 /// Bytes the capture keeps; the argv line is well under 100.
-const CAPTURE_CAPACITY: usize = 256;
+const CAPTURE_CAPACITY: usize = 4096;
 
 struct CaptureBuffer {
     len: usize,
@@ -475,12 +441,6 @@ impl ImageSource for FileSource {
 /// up to [`elf::MAX_IMAGE_BYTES`] (1 MiB) is accepted even though the kernel
 /// heap hands out 64 KiB chunks. `path` is absolute; the shell resolves its
 /// current directory before calling this.
-///
-/// This is the compatibility entry point: `argv[0]` is `path` and there are no
-/// further arguments or environment strings. The shell uses
-/// [`run_file_with_argv0`] so a relative `run demo.elf` keeps `argv[0]` exactly
-/// as typed (the ABI contract), while [`run_file_with_args`] is the
-/// path-plus-arguments form.
 pub fn run_file(path: &str) -> Result<Exit, UserError> {
     run_file_with_argv0(path, path, &[], &[])
 }
@@ -495,10 +455,7 @@ pub fn run_file_with_args(path: &str, args: &[&str], env: &[&str]) -> Result<Exi
 /// [`run_file`] with a separate `argv[0]`.
 ///
 /// `open_path` is what the VFS resolves (the shell's cwd-joined path); `argv0`
-/// is what the program sees in `argv[0]` (the path as the user typed it). The
-/// split exists because the ABI says `argv[0]` is the typed path, and resolving
-/// `demo.elf` against the cwd must not leak `/mnt/demo.elf` into the program's
-/// view of its own name.
+/// is what the program sees in `argv[0]` (the path as the user typed it).
 pub fn run_file_with_argv0(
     open_path: &str,
     argv0: &str,
@@ -522,19 +479,13 @@ pub fn run_file_with_argv0(
 
 /// Load `bytes` and run it in U-mode until `exit` or a fault, then return how it
 /// ended. The image and stack mappings are gone before this returns.
-///
-/// `name` is the label in the fault diagnostic and the shell's result line; it is
-/// copied into a fixed buffer because the trap handler needs it while the caller
-/// is suspended. The fixture gets `argc = 1`, `argv = [name]` and the minimal
-/// environment `PWD=/` (fixtures have no cwd of their own).
 pub fn run_image(bytes: &[u8], name: &str) -> Result<Exit, UserError> {
     run_source(bytes, name, &[], &["PWD=/"])
 }
 
 /// [`run_image`] with explicit arguments (used by the ABI selftest to prove the
 /// multi-argument stack without a filesystem). `args[0]` is `argv[0]`; the
-/// environment is the caller's, because a fixture that checks `envp` needs to
-/// know what to expect.
+/// environment is the caller's.
 pub fn run_image_with_args(bytes: &[u8], args: &[&str], env: &[&str]) -> Result<Exit, UserError> {
     let Some((argv0, rest)) = args.split_first() else {
         return Err(UserError::ArgumentsTooLong);
@@ -542,190 +493,139 @@ pub fn run_image_with_args(bytes: &[u8], args: &[&str], env: &[&str]) -> Result<
     run_source(bytes, argv0, rest, env)
 }
 
-/// The shared run path: claim `RUN`, load from `source`, map the stack, build
-/// the SysV-style initial frame, spawn, wait, and unwind every allocation on
-/// both success and failure.
+/// The shared launch path for the shell and the embedded fixtures.
 ///
-/// `RUN` is claimed before the first mapping and released only after the image
-/// pages, the initial stack and (when the program used `brk`) the user heap are
-/// gone, which is what makes [`UserError::Busy`] a real one-run-at-a-time
-/// guarantee rather than advice.
+/// Builds a fresh address space and process, loads the image into *that* root,
+/// maps the stack, builds the SysV entry frame, spawns the main thread and waits
+/// for the process to finish. On every failure the pages, tables, fd row and
+/// process slot are unwound; on success the process is reaped before it returns.
+/// A forked child that outlives the foreground is killed and reaped by
+/// [`cleanup_orphans`] before the result is returned.
 fn run_source<S: ImageSource + ?Sized>(
     source: &S,
     argv0: &str,
     args: &[&str],
     env: &[&str],
 ) -> Result<Exit, UserError> {
-    let argc = 1 + args.len();
-    if argc + env.len() > MAX_ENTRY_STRINGS {
+    let mut argv_strings: Vec<&str> = Vec::new();
+    if argv_strings.try_reserve(1 + args.len()).is_err() {
         return Err(UserError::ArgumentsTooLong);
     }
-    let mut string_bytes = 0usize;
-    for text in core::iter::once(argv0)
-        .chain(args.iter().copied())
-        .chain(env.iter().copied())
-    {
-        // An embedded NUL would make the in-memory vector of strings disagree
-        // with the pointer table; refuse instead of silently truncating.
-        if text.as_bytes().contains(&0) {
-            return Err(UserError::ArgumentsTooLong);
-        }
-        string_bytes = string_bytes
-            .checked_add(text.len() + 1)
-            .ok_or(UserError::ArgumentsTooLong)?;
-    }
-    if string_bytes > MAX_ENTRY_BYTES {
-        return Err(UserError::ArgumentsTooLong);
-    }
+    argv_strings.push(argv0);
+    argv_strings.extend_from_slice(args);
+    build_entry_stack_plan(&argv_strings, env)?;
 
-    let run_id = NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed);
-    {
-        let mut slot = RUN.lock();
-        if slot.is_some() {
-            return Err(UserError::Busy);
-        }
-        *slot = Some(RunState {
-            id: run_id,
-            name: RunName::new(argv0),
-            entry: 0,
-            sp: USER_TOP,
-            argc,
-            argv: USER_TOP,
-            exit: None,
-            main_tid: 0,
-            main_code: None,
-            threads: 1,
-            heap_end: USER_HEAP_BASE,
-            heap_frames: [0; USER_HEAP_PAGES],
-            heap_count: 0,
-            mmap_regions: [MmapRegion::empty(); MAX_MMAP_REGIONS],
-            mmap_count: 0,
-        });
-    }
-    // Handlers and pending/blocked masks belong to this run. Resetting here,
-    // before the main task can issue an `ecall`, is what makes a stale entry from
-    // a killed run invisible to this one (the signal analogue of the futex
-    // queue's run key).
-    signal::begin_run(run_id);
-
-    let mut loaded = match elf::load(source, 0) {
+    let space = paging::create_user_space().map_err(|_| UserError::AddressSpace)?;
+    let mut loaded = match elf::load_in(space.root, source, 0) {
         Ok(loaded) => loaded,
         Err(ElfError::Source(error)) => {
-            *RUN.lock() = None;
+            paging::free_user_space(space.root);
             return Err(UserError::Source(error));
         }
         Err(error) => {
-            *RUN.lock() = None;
+            paging::free_user_space(space.root);
             return Err(UserError::Elf(error));
         }
     };
 
-    // The stack is one contiguous PMM run mapped page by page at the fixed user
-    // range. A failure anywhere below unwinds the whole run: every page mapped
-    // so far is unmapped and the frames go back as one allocation.
     let Some(stack_base) = pmm::alloc_frames_contiguous(USER_STACK_PAGES) else {
         loaded.release();
-        *RUN.lock() = None;
+        paging::free_user_space(space.root);
         return Err(UserError::StackFrames);
     };
     for page in 0..USER_STACK_PAGES {
         let va = USER_STACK_BASE + page * FRAME_SIZE;
         let pa = stack_base + page * FRAME_SIZE;
-        if let Err(error) = paging::map(va, pa, Flags::user_rw()) {
-            for mapped in 0..page {
-                let _ = paging::unmap(USER_STACK_BASE + mapped * FRAME_SIZE);
-            }
-            pmm::free_frames_contiguous(stack_base, USER_STACK_PAGES);
+        if let Err(error) = paging::map_in(space.root, va, pa, Flags::user_rw()) {
+            release_stack_in(space.root, stack_base);
             loaded.release();
-            *RUN.lock() = None;
+            paging::free_user_space(space.root);
             return Err(UserError::StackMap(error));
         }
         // SAFETY: `pa` is a PMM frame (RAM, therefore identity-mapped supervisor
         // RW by `paging::init`) that this call just mapped as the user stack;
         // writing through the physical address, the same way the ELF loader
-        // copies segment bytes, cannot fault and keeps `SUM` off. Zeroing is
-        // deliberate: the frames may have been a kernel task stack before, and
-        // a U-mode program must not be able to read what was there.
+        // copies segment bytes, cannot fault and keeps `SUM` off. Zeroing stops
+        // a U-mode program from reading a previous tenant of the frame.
         unsafe { core::ptr::write_bytes(pa as *mut u8, 0, FRAME_SIZE) };
     }
 
-    let frame = match build_entry_stack(argv0, args, env) {
+    let built = match build_entry_stack_in(space.root, &argv_strings, env) {
         Ok(frame) => frame,
         Err(error) => {
-            release_stack(stack_base);
+            release_stack_in(space.root, stack_base);
             loaded.release();
-            *RUN.lock() = None;
+            paging::free_user_space(space.root);
             return Err(error);
         }
     };
 
-    {
-        let mut slot = RUN.lock();
-        if let Some(run) = slot.as_mut() {
-            run.entry = loaded.entry;
-            run.sp = frame.sp;
-            run.argc = frame.argc;
-            run.argv = frame.argv;
-        }
-    }
+    let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+    let mut proc = Process::new(pid, 0, space.root, space.satp, space.asid);
+    proc.name = RunName::new(argv0);
+    proc.entry = loaded.entry;
+    proc.sp = built.sp;
+    proc.argc = built.argc;
+    proc.argv = built.argv;
+    proc.stack_base = stack_base;
 
-    // The descriptor table is per run: three console descriptors, no files.
-    // Reset after the frame is built and before the task can issue an `ecall`.
-    syscall::reset_fds();
-    // The main thread's id must be in `RunState` before the thread can run:
-    // `exit` of the main thread records its code there. `spawn_in_group` does
-    // not switch, but a timer tick between the spawn and the store would let
-    // the new thread run, so the pair is one interrupts-off region.
+    let slot = match process::publish(proc) {
+        Ok(slot) => slot,
+        Err(mut proc) => {
+            release_process_memory(&mut proc, None);
+            loaded.release();
+            return Err(UserError::ProcessSlot);
+        }
+    };
+    process::set_image(slot, loaded);
+    syscall::reset_fds(slot);
+    signal::begin_process(slot, pid);
+
     let spawned = crate::arch::riscv64::csr::without_interrupts(|| {
-        let id = scheduler::spawn_in_group(user_task, run_id);
+        let id = scheduler::spawn_in_group_satp(user_task, pid, space.satp);
         if let Some(id) = id {
-            if let Some(run) = RUN.lock().as_mut() {
-                run.main_tid = id;
-            }
+            process::update(pid, |proc| {
+                proc.main_tid = id;
+                proc.ready = true;
+            });
         }
         id
     });
     let Some(_) = spawned else {
-        syscall::release_fds();
-        release_stack(stack_base);
-        loaded.release();
-        *RUN.lock() = None;
+        syscall::release_fds(slot);
+        signal::clear_process(slot, pid);
+        let _ = process::with_slot_mut(slot, |proc| release_process_memory(proc, Some(slot)));
+        process::clear_slot(slot);
         return Err(UserError::TaskSlot);
     };
 
-    wait_for_run_end();
+    wait_for_process(pid);
     // Every thread is `Exited`; each kernel stack is reaped on the next
     // scheduler entry. Reap explicitly so the caller's ledger does not depend on
     // when the next unrelated tick happens.
     let _ = scheduler::reap();
 
-    // The program is gone, so its descriptors are too: a socket left open must
-    // not keep the kernel's one connection alive into the next run. This also
-    // drops the `Arc<dyn VfsNode>` handles a program may have left behind.
-    syscall::release_fds();
+    let exit = process::peek(pid, |proc| proc.exit)
+        .flatten()
+        .unwrap_or(Exit::Fault {
+            reason: "task ended without an exit status",
+            cause: 0,
+            sepc: 0,
+        });
+    // The process is gone, so its descriptors are too: a socket left open must
+    // not keep the kernel's one connection alive into the next run, and the
+    // `Arc<dyn VfsNode>` handles must not outlive the program. The address space
+    // is released in place (a `Process` is several KiB and moving it through the
+    // 16 KiB kernel stack overflowed it in an earlier version).
+    syscall::release_fds(slot);
+    signal::clear_process(slot, pid);
+    futex::clear_run(pid);
+    let _ = process::with_slot_mut(slot, |proc| release_process_memory(proc, Some(slot)));
+    process::clear_slot(slot);
 
-    // The trap frame is gone with the task, so the user pages can go too. Heap
-    // frames are owned by `RunState`, not by `Loaded`, so they are released
-    // here explicitly — before `RunState` itself is dropped.
-    release_stack(stack_base);
-    loaded.release();
-    let mut run = RUN.lock().take();
-    if let Some(run) = run.as_mut() {
-        // `exit_group` and faults retire threads without them returning through
-        // `futex_wait`'s removal path; dropping the run's queue entries here is
-        // what keeps the next program from inheriting them. The signal table is
-        // scoped the same way: handlers, pending bits and blocked masks die with
-        // the run, never with the next one.
-        futex::clear_run(run.id);
-        signal::clear_run(run.id);
-        release_mmap(run);
-        release_heap(run);
-    }
-    let exit = run.and_then(|run| run.exit).unwrap_or(Exit::Fault {
-        reason: "task ended without an exit status",
-        cause: 0,
-        sepc: 0,
-    });
+    // No init process: a child that outlived the foreground is not adopted, it
+    // is killed and reaped here, before the shell sees its prompt again.
+    cleanup_orphans();
     Ok(exit)
 }
 
@@ -738,6 +638,28 @@ struct EntryStack {
     argv: usize,
 }
 
+/// Validate `argv`/`env` sizes before a single page is touched.
+fn build_entry_stack_plan(argv: &[&str], env: &[&str]) -> Result<(), UserError> {
+    if argv.len() + env.len() > MAX_ENTRY_STRINGS {
+        return Err(UserError::ArgumentsTooLong);
+    }
+    let mut string_bytes = 0usize;
+    for text in argv.iter().copied().chain(env.iter().copied()) {
+        // An embedded NUL would make the in-memory vector of strings disagree
+        // with the pointer table; refuse instead of silently truncating.
+        if text.as_bytes().contains(&0) {
+            return Err(UserError::ArgumentsTooLong);
+        }
+        string_bytes = string_bytes
+            .checked_add(text.len() + 1)
+            .ok_or(UserError::ArgumentsTooLong)?;
+    }
+    if string_bytes > MAX_ENTRY_BYTES {
+        return Err(UserError::ArgumentsTooLong);
+    }
+    Ok(())
+}
+
 /// Build the SysV-style initial stack frame the ABI promises:
 ///
 /// ```text
@@ -746,27 +668,19 @@ struct EntryStack {
 ///
 /// The strings grow down from [`USER_TOP`]; the frame size is known from the
 /// string lengths, so `sp` is computed up front and each string's pointer is
-/// written into the table as the string itself is copied. That is deliberate:
-/// an intermediate `[usize; N]` of addresses cost 512 bytes of the shell's
-/// 128 KiB boot stack, and the stack is already the deepest part of a
-/// file-backed `run` (the loader's page buffer lives there too). The table start
-/// is aligned down to 16 bytes, which is the entry `sp` alignment RISC-V
-/// requires.
+/// written into the table as the string itself is copied. The table start is
+/// aligned down to 16 bytes, which is the entry `sp` alignment RISC-V requires.
 ///
-/// Every write goes through `paging::translate` to the physical frame (the
-/// loader's pattern): `SUM` stays clear, because this is S-mode writing through
-/// the identity map, not the kernel borrowing a user pointer.
-fn build_entry_stack(argv0: &str, args: &[&str], env: &[&str]) -> Result<EntryStack, UserError> {
-    let argc = 1 + args.len();
+/// Every write goes through [`paging::translate_in`] to the physical frame of
+/// `root` (the loader's pattern): `SUM` stays clear, because this is S-mode
+/// writing through the identity map, not the kernel borrowing a user pointer.
+fn build_entry_stack_in(root: usize, argv: &[&str], env: &[&str]) -> Result<EntryStack, UserError> {
+    build_entry_stack_plan(argv, env)?;
+    let argc = argv.len();
     let envc = env.len();
     let mut string_bytes = 0usize;
-    for text in core::iter::once(argv0)
-        .chain(args.iter().copied())
-        .chain(env.iter().copied())
-    {
-        string_bytes = string_bytes
-            .checked_add(text.len() + 1)
-            .ok_or(UserError::ArgumentsTooLong)?;
+    for text in argv.iter().copied().chain(env.iter().copied()) {
+        string_bytes += text.len() + 1;
     }
     // `[argc]` + `argv` + `NULL` + `envp` + `NULL`.
     let words = 1 + argc + 1 + envc + 1;
@@ -782,34 +696,31 @@ fn build_entry_stack(argv0: &str, args: &[&str], env: &[&str]) -> Result<EntrySt
         return Err(UserError::ArgumentsTooLong);
     }
 
-    write_user_u64(sp, argc as u64)?;
+    write_user_u64_in(root, sp, argc as u64)?;
     let mut cursor = USER_TOP;
     let mut argv_slot = sp + 8;
     let env_base = sp + 8 + (argc + 1) * 8;
     let mut env_slot = env_base;
     let mut index = 0usize;
-    for text in core::iter::once(argv0)
-        .chain(args.iter().copied())
-        .chain(env.iter().copied())
-    {
+    for text in argv.iter().copied().chain(env.iter().copied()) {
         let start = cursor
             .checked_sub(text.len() + 1)
             .filter(|start| *start >= USER_STACK_BASE)
             .ok_or(UserError::ArgumentsTooLong)?;
         cursor = start;
-        write_user_bytes(cursor, text.as_bytes())?;
-        write_user_bytes(cursor + text.len(), &[0])?;
+        write_user_bytes_in(root, cursor, text.as_bytes())?;
+        write_user_bytes_in(root, cursor + text.len(), &[0])?;
         if index < argc {
-            write_user_u64(argv_slot, cursor as u64)?;
+            write_user_u64_in(root, argv_slot, cursor as u64)?;
             argv_slot += 8;
         } else {
-            write_user_u64(env_slot, cursor as u64)?;
+            write_user_u64_in(root, env_slot, cursor as u64)?;
             env_slot += 8;
         }
         index += 1;
     }
-    write_user_u64(sp + 8 + argc * 8, 0)?;
-    write_user_u64(env_slot, 0)?;
+    write_user_u64_in(root, sp + 8 + argc * 8, 0)?;
+    write_user_u64_in(root, env_slot, 0)?;
     Ok(EntryStack {
         sp,
         argc,
@@ -817,28 +728,26 @@ fn build_entry_stack(argv0: &str, args: &[&str], env: &[&str]) -> Result<EntrySt
     })
 }
 
-/// Copy `bytes` to the user virtual address `va`, translating page by page and
-/// writing through the physical frame.
+/// Copy `bytes` to the user virtual address `va` in `root`, translating page by
+/// page and writing through the physical frame.
 ///
-/// No `SUM`: the destination is a user page this kernel mapped in the same
-/// Sv39 tree, and the physical frame is identity-mapped supervisor-RW, so an
-/// S-mode store through `pa` is legitimate and cannot take a U-permission
-/// fault. Returning an error instead of faulting is the house rule for every
-/// mapping the runner writes itself.
-fn write_user_bytes(va: usize, bytes: &[u8]) -> Result<(), UserError> {
+/// No `SUM`: the destination is a user page this kernel mapped in `root`, and
+/// the physical frame is identity-mapped supervisor-RW, so an S-mode store
+/// through `pa` is legitimate and cannot take a U-permission fault.
+fn write_user_bytes_in(root: usize, va: usize, bytes: &[u8]) -> Result<(), UserError> {
     let mut offset = 0usize;
     while offset < bytes.len() {
         let address = va.checked_add(offset).ok_or(UserError::StackFrame)?;
         let page = address & !(FRAME_SIZE - 1);
-        let Some(physical) = paging::translate(page) else {
+        let Some(physical) = paging::translate_in(root, page) else {
             return Err(UserError::StackFrame);
         };
         let in_page = address & (FRAME_SIZE - 1);
         let take = (bytes.len() - offset).min(FRAME_SIZE - in_page);
-        // SAFETY: `page` is a mapped user-stack page; `translate` returned its
-        // frame, `in_page + take <= FRAME_SIZE`, and the frame is identity-mapped
-        // supervisor-RW. `bytes` is a live kernel slice disjoint from it; the
-        // store is how the initial stack becomes visible to U-mode.
+        // SAFETY: `page` is a mapped user-stack page in `root`; `translate`
+        // returned its frame, `in_page + take <= FRAME_SIZE`, and the frame is
+        // identity-mapped supervisor-RW. `bytes` is a live kernel slice disjoint
+        // from it; the store is how the initial stack becomes visible to U-mode.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 bytes.as_ptr().add(offset),
@@ -851,10 +760,12 @@ fn write_user_bytes(va: usize, bytes: &[u8]) -> Result<(), UserError> {
     Ok(())
 }
 
-/// Little-endian 64-bit store into the user stack (see [`write_user_bytes`]).
-fn write_user_u64(va: usize, value: u64) -> Result<(), UserError> {
-    write_user_bytes(va, &value.to_le_bytes())
+/// Little-endian 64-bit store into a user stack (see [`write_user_bytes_in`]).
+fn write_user_u64_in(root: usize, va: usize, value: u64) -> Result<(), UserError> {
+    write_user_bytes_in(root, va, &value.to_le_bytes())
 }
+
+// ─── address-space bookkeeping ────────────────────────────────────────────
 
 /// `brk(addr)` for the running program.
 ///
@@ -864,91 +775,79 @@ fn write_user_u64(va: usize, value: u64) -> Result<(), UserError> {
 /// program cannot shrink the heap past the start), `addr` past
 /// [`USER_HEAP_TOP`] is `Err(())` → `-ENOMEM`, and a partial growth is rolled
 /// back so a failed call changes neither the mapping nor the ledger.
-///
-/// The return value is the new break, rounded up to a page. `libpagh`'s bump
-/// allocator uses the returned value as its new limit, so the extra space
-/// between the requested and rounded break is normal and usable.
-///
-/// Frames are recorded in [`RunState::heap_frames`] here; the runner's
-/// [`release_heap`] is what unmaps/frees anything still mapped when the task
-/// ends, including after a fault.
 pub(crate) fn brk(address: usize) -> Result<usize, ()> {
-    let mut slot = RUN.lock();
-    let Some(run) = slot.as_mut() else {
-        // No run means no address space to grow: a stale `ecall` from a task
-        // that is already being torn down. Refuse rather than touch `RUN`.
+    let Some(pid) = process::current_pid() else {
         return Err(());
     };
-    if address == 0 {
-        return Ok(run.heap_end);
-    }
-    let target = address
-        .checked_add(FRAME_SIZE - 1)
-        .map(|value| value & !(FRAME_SIZE - 1))
-        .ok_or(())?
-        .max(USER_HEAP_BASE);
-    if target > USER_HEAP_TOP {
+    let Some(slot) = process::current_slot() else {
         return Err(());
-    }
-
-    if target > run.heap_end {
-        let start = run.heap_end;
-        while run.heap_end < target {
-            let Some(frame) = pmm::alloc_frame() else {
-                release_heap_to(run, start);
-                return Err(());
-            };
-            if paging::map(run.heap_end, frame, Flags::user_rw()).is_err() {
-                pmm::free_frame(frame);
-                release_heap_to(run, start);
-                return Err(());
-            }
-            // SAFETY: `frame` is a fresh PMM frame (RAM, identity-mapped
-            // supervisor RW) that was just mapped into the user heap; writing
-            // through the physical address cannot fault and keeps `SUM` off.
-            // Zeroing stops a U-mode program from reading whatever used the
-            // frame before it, the same rule the initial stack follows.
-            unsafe { core::ptr::write_bytes(frame as *mut u8, 0, FRAME_SIZE) };
-            run.heap_frames[run.heap_count] = frame;
-            run.heap_count += 1;
-            run.heap_end += FRAME_SIZE;
+    };
+    process::update(pid, |run| {
+        if address == 0 {
+            return Ok(run.heap_end);
         }
-    } else if target < run.heap_end {
-        release_heap_to(run, target);
-    }
-    Ok(run.heap_end)
+        let target = address
+            .checked_add(FRAME_SIZE - 1)
+            .map(|value| value & !(FRAME_SIZE - 1))
+            .ok_or(())?
+            .max(USER_HEAP_BASE);
+        if target > USER_HEAP_TOP {
+            return Err(());
+        }
+
+        if target > run.heap_end {
+            let start = run.heap_end;
+            while run.heap_end < target {
+                let Some(frame) = pmm::alloc_frame() else {
+                    release_heap_to(run, slot, start);
+                    return Err(());
+                };
+                if paging::map_in(run.root, run.heap_end, frame, Flags::user_rw()).is_err() {
+                    pmm::free_frame(frame);
+                    release_heap_to(run, slot, start);
+                    return Err(());
+                }
+                // SAFETY: `frame` is a fresh PMM frame (RAM, identity-mapped
+                // supervisor RW) that was just mapped into the user heap;
+                // writing through the physical address cannot fault and keeps
+                // `SUM` off. Zeroing stops a U-mode program from reading whatever
+                // used the frame before it.
+                unsafe { core::ptr::write_bytes(frame as *mut u8, 0, FRAME_SIZE) };
+                process::set_heap_frame(slot, run.heap_count, frame);
+                run.heap_count += 1;
+                run.heap_end += FRAME_SIZE;
+            }
+        } else if target < run.heap_end {
+            release_heap_to(run, slot, target);
+        }
+        Ok(run.heap_end)
+    })
+    .unwrap_or(Err(()))
 }
 
 /// Unmap and free heap pages above `target`, updating the recorded break.
-fn release_heap_to(run: &mut RunState, target: usize) {
+fn release_heap_to(run: &mut Process, slot: usize, target: usize) {
     while run.heap_end > target {
         run.heap_end -= FRAME_SIZE;
         run.heap_count -= 1;
-        let frame = run.heap_frames[run.heap_count];
-        run.heap_frames[run.heap_count] = 0;
-        let _ = paging::unmap(run.heap_end);
-        pmm::free_frame(frame);
+        let frame = process::heap_frame(slot, run.heap_count);
+        process::set_heap_frame(slot, run.heap_count, 0);
+        let _ = paging::unmap_in(run.root, run.heap_end);
+        if frame != 0 {
+            pmm::free_frame(frame);
+        }
     }
 }
 
 /// Unmap and free every page the program mapped with `brk`.
-///
-/// Called by the runner after the task is gone and before `RunState` is dropped;
-/// a second call (heap already shrunk to the base) has nothing to do.
-fn release_heap(run: &mut RunState) {
-    release_heap_to(run, USER_HEAP_BASE);
+fn release_heap(run: &mut Process, slot: usize) {
+    release_heap_to(run, slot, USER_HEAP_BASE);
+    process::clear_heap(slot);
 }
-
-// ─── mmap / munmap / mprotect ──────────────────────────────────────────────
 
 /// True when `[start, start + pages * 4 KiB)` is inside the `mmap` window and
 /// neither the region table nor the live page tables claim any page of it.
-///
-/// The page-table check is what keeps a hint from landing on an image segment
-/// that happens to be inside the window: the loader's pages are not in
-/// `mmap_regions`, but they are mapped, and mapping over them would leave the
-/// running program executing someone else's memory.
-fn mmap_range_free(run: &RunState, start: usize, pages: usize) -> bool {
+fn mmap_range_free(run: &Process, start: usize, pages: usize) -> bool {
     let Some(length) = pages.checked_mul(FRAME_SIZE) else {
         return false;
     };
@@ -966,7 +865,7 @@ fn mmap_range_free(run: &RunState, start: usize, pages: usize) -> bool {
     }
     let mut page = start;
     while page < end {
-        if paging::flags(page).is_some() {
+        if paging::flags_in(run.root, page).is_some() {
             return false;
         }
         page += FRAME_SIZE;
@@ -975,16 +874,14 @@ fn mmap_range_free(run: &RunState, start: usize, pages: usize) -> bool {
 }
 
 /// Record one new region; adjacent extents are coalesced.
-///
-/// The caller has already reserved capacity, so a full table is impossible here.
-fn insert_mmap_region(run: &mut RunState, start: usize, pages: usize) {
+fn insert_mmap_region(run: &mut Process, start: usize, pages: usize) {
     run.mmap_regions[run.mmap_count] = MmapRegion { start, pages };
     run.mmap_count += 1;
     coalesce_mmap_regions(run);
 }
 
 /// Sort the region list and merge every touching pair.
-fn coalesce_mmap_regions(run: &mut RunState) {
+fn coalesce_mmap_regions(run: &mut Process) {
     run.mmap_regions[..run.mmap_count].sort_unstable_by_key(|region| region.start);
     let mut write = 0usize;
     for read in 0..run.mmap_count {
@@ -1000,7 +897,7 @@ fn coalesce_mmap_regions(run: &mut RunState) {
 }
 
 /// True when every page of `[start, end)` belongs to a tracked `mmap` region.
-fn mmap_range_covered(run: &RunState, start: usize, end: usize) -> bool {
+fn mmap_range_covered(run: &Process, start: usize, end: usize) -> bool {
     let mut page = start;
     while page < end {
         let Some(region) = run.mmap_regions[..run.mmap_count]
@@ -1014,14 +911,10 @@ fn mmap_range_covered(run: &RunState, start: usize, end: usize) -> bool {
     true
 }
 
-/// Unmap and free `[start, start + pages * 4 KiB)`.
-///
-/// Used by the rollback paths and by teardown. A page that is not mapped is
-/// skipped: the caller has already checked ownership, and refusing here would
-/// leave the frames above it leaked.
-fn release_mapping(start: usize, pages: usize) {
+/// Unmap and free `[start, start + pages * 4 KiB)` in `root`.
+fn release_mapping(root: usize, start: usize, pages: usize) {
     for page in 0..pages {
-        if let Ok(frame) = paging::unmap(start + page * FRAME_SIZE) {
+        if let Ok(frame) = paging::unmap_in(root, start + page * FRAME_SIZE) {
             pmm::free_frame(frame);
         }
     }
@@ -1033,78 +926,68 @@ fn release_mapping(start: usize, pages: usize) {
 /// `addr` is a hint (0 = none); it is honoured only when page-aligned, inside
 /// the window and completely free. Otherwise the first free run from
 /// [`USER_MMAP_BASE`] wins. Frames are allocated eagerly and zeroed, because this
-/// kernel has no demand-paging fault path: a lazily absent user page would kill
-/// the task on first touch instead of populating it.
-///
-/// On any failure the pages already mapped by this call are unmapped and freed,
-/// so the PMM ledger and the region table are exactly as they were.
+/// kernel has no demand-paging fault path.
 pub(crate) fn mmap(addr: usize, pages: usize, bits: u64) -> Result<usize, MmapError> {
     if pages == 0 || pages > USER_MMAP_PAGES {
         return Err(MmapError::Invalid);
     }
     let length = pages * FRAME_SIZE;
     let flags = Flags::from_bits(bits);
-    let mut slot = RUN.lock();
-    let Some(run) = slot.as_mut() else {
+    let Some(pid) = process::current_pid() else {
         return Err(MmapError::Invalid);
     };
-    if run.mmap_count == MAX_MMAP_REGIONS {
-        return Err(MmapError::NoMemory);
-    }
+    process::update(pid, |run| {
+        if run.mmap_count == MAX_MMAP_REGIONS {
+            return Err(MmapError::NoMemory);
+        }
 
-    let hinted =
-        (addr != 0 && addr % FRAME_SIZE == 0 && mmap_range_free(run, addr, pages)).then_some(addr);
-    let base = match hinted {
-        Some(base) => base,
-        None => {
-            let mut cursor = USER_MMAP_BASE;
-            loop {
-                let Some(end) = cursor.checked_add(length) else {
-                    return Err(MmapError::NoMemory);
-                };
-                if end > USER_MMAP_TOP {
-                    return Err(MmapError::NoMemory);
+        let hinted = (addr != 0 && addr % FRAME_SIZE == 0 && mmap_range_free(run, addr, pages))
+            .then_some(addr);
+        let base = match hinted {
+            Some(base) => base,
+            None => {
+                let mut cursor = USER_MMAP_BASE;
+                loop {
+                    let Some(end) = cursor.checked_add(length) else {
+                        return Err(MmapError::NoMemory);
+                    };
+                    if end > USER_MMAP_TOP {
+                        return Err(MmapError::NoMemory);
+                    }
+                    if mmap_range_free(run, cursor, pages) {
+                        break cursor;
+                    }
+                    cursor += FRAME_SIZE;
                 }
-                if mmap_range_free(run, cursor, pages) {
-                    break cursor;
-                }
-                cursor += FRAME_SIZE;
             }
-        }
-    };
-
-    let mut mapped = 0usize;
-    while mapped < pages {
-        let Some(frame) = pmm::alloc_frame() else {
-            release_mapping(base, mapped);
-            return Err(MmapError::NoMemory);
         };
-        let va = base + mapped * FRAME_SIZE;
-        if paging::map(va, frame, flags).is_err() {
-            pmm::free_frame(frame);
-            release_mapping(base, mapped);
-            return Err(MmapError::NoMemory);
+
+        let mut mapped = 0usize;
+        while mapped < pages {
+            let Some(frame) = pmm::alloc_frame() else {
+                release_mapping(run.root, base, mapped);
+                return Err(MmapError::NoMemory);
+            };
+            let va = base + mapped * FRAME_SIZE;
+            if paging::map_in(run.root, va, frame, flags).is_err() {
+                pmm::free_frame(frame);
+                release_mapping(run.root, base, mapped);
+                return Err(MmapError::NoMemory);
+            }
+            // SAFETY: `frame` is a fresh PMM frame (RAM, identity-mapped
+            // supervisor RW) that was just mapped into the mmap window. Writing
+            // through the physical address cannot fault and keeps `SUM` off;
+            // zeroing means a user program never sees a previous tenant.
+            unsafe { core::ptr::write_bytes(frame as *mut u8, 0, FRAME_SIZE) };
+            mapped += 1;
         }
-        // SAFETY: `frame` is a fresh PMM frame (RAM, identity-mapped supervisor
-        // RW) that was just mapped into the mmap window. Writing through the
-        // physical address cannot fault and keeps `SUM` off; zeroing means a
-        // user program never sees the heap or page-table contents that used the
-        // frame before it.
-        unsafe { core::ptr::write_bytes(frame as *mut u8, 0, FRAME_SIZE) };
-        mapped += 1;
-    }
-    insert_mmap_region(run, base, pages);
-    Ok(base)
+        insert_mmap_region(run, base, pages);
+        Ok(base)
+    })
+    .unwrap_or(Err(MmapError::Invalid))
 }
 
 /// `munmap`: unmap whole pages and forget the range.
-///
-/// `addr` must be page-aligned and `pages` non-zero (the caller rounded the
-/// byte length up). Every page of the range must currently belong to a tracked
-/// `mmap` mapping; a page of the image, the stack or an unmapped hole is
-/// `Invalid`, so a program cannot free memory it does not own. The tracker is
-/// rebuilt before anything is unmapped, which is what makes a full region table
-/// a clean `-ENOMEM` rather than a half-freed mapping.
 pub(crate) fn munmap(addr: usize, pages: usize) -> Result<(), MmapError> {
     if pages == 0 || addr % FRAME_SIZE != 0 {
         return Err(MmapError::Invalid);
@@ -1116,66 +999,60 @@ pub(crate) fn munmap(addr: usize, pages: usize) -> Result<(), MmapError> {
     if addr < USER_MMAP_BASE || end > USER_MMAP_TOP {
         return Err(MmapError::Invalid);
     }
-    let mut slot = RUN.lock();
-    let Some(run) = slot.as_mut() else {
+    let Some(pid) = process::current_pid() else {
         return Err(MmapError::Invalid);
     };
-    if !mmap_range_covered(run, addr, end) {
-        return Err(MmapError::Invalid);
-    }
+    process::update(pid, |run| {
+        if !mmap_range_covered(run, addr, end) {
+            return Err(MmapError::Invalid);
+        }
 
-    let mut next = [MmapRegion::empty(); MAX_MMAP_REGIONS];
-    let mut next_count = 0usize;
-    for index in 0..run.mmap_count {
-        let region = run.mmap_regions[index];
-        let region_end = region.end();
-        if region_end <= addr || region.start >= end {
-            if next_count == MAX_MMAP_REGIONS {
-                return Err(MmapError::NoMemory);
+        let mut next = [MmapRegion::empty(); MAX_MMAP_REGIONS];
+        let mut next_count = 0usize;
+        for index in 0..run.mmap_count {
+            let region = run.mmap_regions[index];
+            let region_end = region.end();
+            if region_end <= addr || region.start >= end {
+                if next_count == MAX_MMAP_REGIONS {
+                    return Err(MmapError::NoMemory);
+                }
+                next[next_count] = region;
+                next_count += 1;
+                continue;
             }
-            next[next_count] = region;
-            next_count += 1;
-            continue;
-        }
-        if region.start < addr {
-            if next_count == MAX_MMAP_REGIONS {
-                return Err(MmapError::NoMemory);
+            if region.start < addr {
+                if next_count == MAX_MMAP_REGIONS {
+                    return Err(MmapError::NoMemory);
+                }
+                next[next_count] = MmapRegion {
+                    start: region.start,
+                    pages: (addr - region.start) / FRAME_SIZE,
+                };
+                next_count += 1;
             }
-            next[next_count] = MmapRegion {
-                start: region.start,
-                pages: (addr - region.start) / FRAME_SIZE,
-            };
-            next_count += 1;
-        }
-        if region_end > end {
-            if next_count == MAX_MMAP_REGIONS {
-                return Err(MmapError::NoMemory);
+            if region_end > end {
+                if next_count == MAX_MMAP_REGIONS {
+                    return Err(MmapError::NoMemory);
+                }
+                next[next_count] = MmapRegion {
+                    start: end,
+                    pages: (region_end - end) / FRAME_SIZE,
+                };
+                next_count += 1;
             }
-            next[next_count] = MmapRegion {
-                start: end,
-                pages: (region_end - end) / FRAME_SIZE,
-            };
-            next_count += 1;
         }
-    }
 
-    // The page tables are consistent with the tracker by construction (this
-    // layer is the only writer), so an `unmap` failure here would mean a broken
-    // table, not a user error; ignoring it keeps the tracker and the frames in
-    // agreement instead of leaking everything above the first surprise.
-    release_mapping(addr, pages);
-    run.mmap_regions = next;
-    run.mmap_count = next_count;
-    coalesce_mmap_regions(run);
-    Ok(())
+        release_mapping(run.root, addr, pages);
+        run.mmap_regions = next;
+        run.mmap_count = next_count;
+        coalesce_mmap_regions(run);
+        Ok(())
+    })
+    .unwrap_or(Err(MmapError::Invalid))
 }
 
 /// `mprotect`: rewrite the permission bits of every mapped user page in the
 /// range, keeping the frames in place.
-///
-/// The range must lie in the user window and every page must be a live user leaf
-/// (`U=1`, `R=1`) before the first entry is touched, so a bad argument changes
-/// nothing. The caller has already validated `bits` (W^X is enforced there).
 pub(crate) fn mprotect(addr: usize, pages: usize, bits: u64) -> Result<(), MmapError> {
     if pages == 0 || addr % FRAME_SIZE != 0 {
         return Err(MmapError::Invalid);
@@ -1189,10 +1066,14 @@ pub(crate) fn mprotect(addr: usize, pages: usize, bits: u64) -> Result<(), MmapE
     if addr < elf::USER_BASE || end > USER_TOP {
         return Err(MmapError::Invalid);
     }
+    let Some(pid) = process::current_pid() else {
+        return Err(MmapError::Invalid);
+    };
+    let root = process::peek(pid, |run| run.root).ok_or(MmapError::Invalid)?;
 
     let mut page = addr;
     while page < end {
-        let Some(flags) = paging::flags(page) else {
+        let Some(flags) = paging::flags_in(root, page) else {
             return Err(MmapError::Invalid);
         };
         if flags.bits() & (PTE_U | PTE_R) != PTE_U | PTE_R {
@@ -1207,70 +1088,111 @@ pub(crate) fn mprotect(addr: usize, pages: usize, bits: u64) -> Result<(), MmapE
         paging::protect(page, flags).map_err(|_| MmapError::Invalid)?;
         page += FRAME_SIZE;
     }
+    crate::arch::riscv64::mmu::fence_i();
     Ok(())
 }
 
 /// Unmap and free every page the program mapped with `mmap`.
-///
-/// Called by the runner after the task is gone, next to [`release_heap`]. The
-/// page tables are walked by `paging::unmap`, so the frames come back even if a
-/// program unmapped part of a region without the tracker noticing (it cannot:
-/// `munmap` is the only path, and it updates both).
-fn release_mmap(run: &mut RunState) {
+fn release_mmap(run: &mut Process) {
     for index in 0..run.mmap_count {
         let region = run.mmap_regions[index];
-        release_mapping(region.start, region.pages);
+        release_mapping(run.root, region.start, region.pages);
         run.mmap_regions[index] = MmapRegion::empty();
     }
     run.mmap_count = 0;
 }
 
-/// Unmap the user stack pages and return the contiguous run to the PMM.
-fn release_stack(base: usize) {
+/// Unmap the user stack pages of `root` and return the contiguous run to the PMM.
+fn release_stack_in(root: usize, base: usize) {
     for page in 0..USER_STACK_PAGES {
-        let _ = paging::unmap(USER_STACK_BASE + page * FRAME_SIZE);
+        let _ = paging::unmap_in(root, USER_STACK_BASE + page * FRAME_SIZE);
     }
     pmm::free_frames_contiguous(base, USER_STACK_PAGES);
 }
 
-/// Block the calling (shell) task until the run's last thread has exited.
+/// Release everything a process owns in its address space.
 ///
-/// The predicate is [`RunState::threads`], decremented by [`exit_thread`] and
-/// zeroed by [`exit_group`]/[`on_fault`] after they retire the survivors — not
-/// "the main task is Exited". A program is over only when every thread is gone;
-/// the runner must not release the shared address space while a `clone` child
-/// still runs on it.
-///
-/// `yield_now` is the whole wait primitive. A program that loops forever keeps
-/// the shell here, which is what running a program means; a thread blocked on a
-/// futex is not runnable, and the shell simply keeps yielding until the last
-/// thread leaves. The shell is still in the ready queue, so the scheduler always
-/// has something to run and the futex wait can safely switch to idle when it is
-/// the only other task.
-fn wait_for_run_end() {
+/// Called after the last thread is gone and after the process has been taken out
+/// of the table. The order matters: image/heap/mmap/stack leaves are unmapped
+/// and their frames freed first, then the table structure is returned. Any
+/// kernel mapping the root was cloned with is a *reference* to a kernel frame
+/// and is deliberately not freed.
+fn release_process_memory(proc: &mut Process, slot: Option<usize>) {
+    if let Some(slot) = slot {
+        if let Some(mut loaded) = process::take_image(slot) {
+            loaded.release();
+        }
+        release_heap(proc, slot);
+    }
+    release_mmap(proc);
+    if proc.stack_base != 0 {
+        release_stack_in(proc.root, proc.stack_base);
+        proc.stack_base = 0;
+    }
+    if proc.root != 0 {
+        paging::free_user_space(proc.root);
+        proc.root = 0;
+    }
+}
+
+/// Block the calling (shell) task until `pid` has no live thread.
+fn wait_for_process(pid: u64) {
     loop {
-        let done = match RUN.lock().as_ref() {
-            Some(run) => run.threads == 0,
-            // The runner is the only taker of `RUN`, and it does not take it
-            // while waiting. `None` therefore means the run never started; do
-            // not spin on a state that cannot change.
-            None => true,
-        };
-        if done {
+        if process::is_finished(pid) {
+            return;
+        }
+        if process::slot_of(pid).is_none() {
             return;
         }
         scheduler::yield_now();
     }
 }
 
+/// Kill and reap every process still in the table.
+///
+/// The orphan policy: this kernel has no init, so a child that outlives the
+/// foreground (or a grandchild whose parent was reaped by `wait4`) is not
+/// adopted — it dies with the `run` that created it. The shell calls this after
+/// the foreground process has been reaped, so the PMM ledger and the process
+/// table are empty before the prompt returns.
+fn cleanup_orphans() {
+    let mut pids = [0u64; process::MAX_PROCESSES];
+    loop {
+        let count = process::ready_pids(&mut pids);
+        if count == 0 {
+            return;
+        }
+        for pid in pids[..count].iter().copied() {
+            let _ = scheduler::kill_group(pid);
+            process::force_finish(
+                pid,
+                Exit::Fault {
+                    reason: "killed: orphaned by the foreground run",
+                    cause: 0,
+                    sepc: 0,
+                },
+                None,
+            );
+        }
+        let _ = scheduler::reap();
+        for pid in pids[..count].iter().copied() {
+            let Some(slot) = process::slot_of(pid) else {
+                continue;
+            };
+            syscall::release_fds(slot);
+            signal::clear_process(slot, pid);
+            futex::clear_run(pid);
+            let _ = process::with_slot_mut(slot, |proc| release_process_memory(proc, Some(slot)));
+            process::clear_slot(slot);
+        }
+    }
+}
+
 /// The kernel-thread body of a user task: read the launch request, then never
 /// come back from U-mode.
 fn user_task() {
-    let request = {
-        let slot = RUN.lock();
-        slot.as_ref()
-            .map(|run| (run.entry, run.sp, run.argc, run.argv))
-    };
+    let request = process::current_pid()
+        .and_then(|pid| process::peek(pid, |run| (run.entry, run.sp, run.argc, run.argv)));
     match request {
         Some((entry, sp, argc, argv)) => {
             // SAFETY: `entry` was validated by the ELF loader to lie inside an
@@ -1288,44 +1210,19 @@ fn user_task() {
 
 /// Leave S-mode for `entry` at user `sp`, with `a0 = argc` and `a1 = argv`.
 ///
-/// For the run's main thread this is the first `sret` into user code; a `clone`
-/// child instead starts through the exported trap-return epilogue with a
-/// hand-built [`TrapFrame`](crate::arch::riscv64::traps::TrapFrame), which is
-/// the same frame layout and the same `sret`. Both paths run on the task's own
-/// kernel stack and put that stack pointer in `sscratch` first, so the first
-/// trap from U-mode has somewhere safe to land (see the module docs). Interrupts
-/// are masked across the `sscratch`/`sstatus` setup and the `sret` itself: a
-/// timer tick in that window would otherwise look like a trap *from* U-mode and
-/// would clear the re-armed `sscratch` before it is used.
-///
-/// The ABI ([`docs/abi.md`] in `pagh-api`) is: `a0 = argc`, `a1 = argv`,
-/// `sp = initial_sp` pointing at the SysV frame. `a2` is not part of the
-/// contract; `envp` is recovered by `libpagh`'s `_start` from `sp`
-/// (`argv + argc + 1`), which is why it is not passed in a register.
-///
 /// # Safety
 ///
 /// `entry`, `sp`, `argc` and `argv` must describe a loaded user image and the
-/// initial stack frame [`build_entry_stack`] wrote (the only caller is
-/// [`user_task`], fed by [`run_source`]), and this function must be called from
-/// the task that owns the current kernel stack. It never returns.
+/// initial stack frame [`build_entry_stack_in`] wrote, and this function must be
+/// called from the task that owns the current kernel stack. It never returns.
 unsafe fn enter_user(entry: usize, sp: usize, argc: usize, argv: usize) -> ! {
+    let status = crate::arch::riscv64::csr::user_entry_status();
     // SAFETY: `sret` deliberately transfers control to U-mode at `entry`. Every
     // register operand is a value validated by the loader/frame builder;
     // interrupts are disabled before the CSRs that describe the return are set,
     // and `sret` re-enables them from `SPIE` only after the switch. The function
     // is `-> !` and `options(noreturn)` keeps the compiler from emitting a
     // return path that could execute with `sp` pointing at the user stack.
-    // The return state is built here rather than with `csrci`/`csrsi`: SPP is
-    // bit 8, SPIE is bit 5, and those immediates do not fit the 5-bit CSR
-    // immediate field. A full read-modify-write of the value the `sret` will
-    // consume is both simpler and self-documenting.
-    //
-    // `a0`/`a1` are declared as fixed-register inputs, so the compiler loads
-    // `argc`/`argv` before the sequence starts and never allocates `entry`,
-    // `sp` or `status` to them. `mv sp` comes after `csrw sscratch, sp`, which
-    // is the kernel stack pointer the first trap will switch to.
-    let status = crate::arch::riscv64::csr::user_entry_status();
     unsafe {
         core::arch::asm!(
             "csrci sstatus, 2",   // SIE = 0: no trap between arming and `sret`
@@ -1349,123 +1246,110 @@ pub(crate) fn thread_id() -> u64 {
     scheduler::current_id()
 }
 
-/// The id of the run the current thread belongs to, if a program is running.
-///
-/// The syscall layer uses it as the futex key and as the group tag for `clone`;
-/// a stale `ecall` after teardown has no run and gets `None`.
+/// The id of the process the current thread belongs to, if any.
 pub(crate) fn current_run_id() -> Option<u64> {
-    RUN.lock().as_ref().map(|run| run.id)
+    process::current_pid()
 }
 
-/// Count one more live thread of the current run before `clone` spawns it.
-/// Returns false when no run exists.
-///
-/// The syscall trap runs with interrupts masked, so the child cannot run (and
-/// exit) between this charge and the spawn that publishes it; a failed spawn
-/// calls [`uncharge_thread`], keeping `threads` exactly equal to the number of
-/// scheduler tasks tagged with the run.
+/// Count one more live thread of the current process before `clone` spawns it.
 pub(crate) fn charge_thread() -> bool {
-    let mut slot = RUN.lock();
-    match slot.as_mut() {
-        Some(run) => {
-            run.threads += 1;
-            true
-        }
-        None => false,
-    }
+    let Some(pid) = process::current_pid() else {
+        return false;
+    };
+    process::update(pid, |run| run.threads += 1).is_some()
 }
 
 /// Roll back [`charge_thread`] when the spawn it guarded failed.
 pub(crate) fn uncharge_thread() {
-    if let Some(run) = RUN.lock().as_mut() {
-        run.threads = run.threads.saturating_sub(1);
+    if let Some(pid) = process::current_pid() {
+        process::update(pid, |run| run.threads = run.threads.saturating_sub(1));
     }
 }
 
-/// `getpid`: the main thread's id for the whole run.
-///
-/// Threads of one program must see one process id; `gettid` is the per-thread
-/// answer. Falls back to the caller's id if a stale call arrives with no run.
+/// `getpid`: the process id (`0` on a stale call with no process).
 pub(crate) fn process_id() -> u64 {
-    // Drop the RUN guard before asking the scheduler: the two locks are never
-    // nested here, and the fallback only matters for a stale call with no run.
-    let pid = RUN.lock().as_ref().map(|run| run.main_tid);
-    pid.unwrap_or_else(scheduler::current_id)
+    process::current_pid().unwrap_or_else(scheduler::current_id)
+}
+
+/// `getppid`: the parent process id, `0` for a program the shell started.
+pub(crate) fn parent_id() -> u64 {
+    process::current_pid()
+        .and_then(|pid| process::peek(pid, |run| run.ppid))
+        .unwrap_or(0)
 }
 
 /// End the calling thread with `code` (syscall 93). Never returns to U-mode.
-///
-/// This is a *thread* exit: the run continues while other threads remain. The
-/// main thread's code is recorded even if it exits first, because the run's
-/// result is the main thread's code by contract (a non-main thread's code is
-/// discarded). The last thread to leave finishes the run: it stores the exit
-/// status the runner will return after reaping.
 pub(crate) fn exit_thread(code: u32) -> ! {
     let id = scheduler::current_id();
-    {
-        let mut slot = RUN.lock();
-        if let Some(run) = slot.as_mut() {
+    let pid = process::current_pid();
+    let mut wake = 0u64;
+    if let Some(pid) = pid {
+        let mut parent = 0u64;
+        process::update(pid, |run| {
             if run.main_tid == id {
                 run.main_code = Some(code);
             }
             run.threads = run.threads.saturating_sub(1);
             if run.threads == 0 {
                 run.exit = Some(Exit::Code(run.main_code.unwrap_or(code)));
+                parent = run.ppid;
             }
+        });
+        if parent != 0 {
+            wake = process::peek(parent, |run| run.wait_tid).unwrap_or(0);
         }
+    }
+    if wake != 0 {
+        scheduler::wake_task(wake);
     }
     scheduler::exit()
 }
 
-/// End every thread of the run with `code` (syscall 94). Never returns.
-///
-/// The code is the main thread's if it already exited; otherwise it is the
-/// caller's. Survivors — runnable or blocked in a futex — are retired by
-/// [`scheduler::kill_group`] and never run again; their kernel stacks are
-/// reaped by the runner after the wait, and their fds/pages are the run's, so
-/// they are released once, by the runner, not here.
+/// End every thread of the calling process with `code` (syscall 94). Never
+/// returns.
 pub(crate) fn exit_group(code: u32) -> ! {
-    let (run_id, final_code) = {
-        let mut slot = RUN.lock();
-        match slot.as_mut() {
-            Some(run) => (run.id, run.main_code.unwrap_or(code)),
-            None => (0, code),
-        }
+    let Some(pid) = process::current_pid() else {
+        scheduler::exit()
     };
-    if run_id != 0 {
-        let _ = scheduler::kill_group(run_id);
-    }
-    if let Some(run) = RUN.lock().as_mut() {
+    let (final_code, parent) =
+        process::peek(pid, |run| (run.main_code.unwrap_or(code), run.ppid)).unwrap_or((code, 0));
+    let _ = scheduler::kill_group(pid);
+    process::update(pid, |run| {
         run.threads = 0;
         run.exit = Some(Exit::Code(final_code));
-    }
+    });
+    notify_parent(parent);
     scheduler::exit()
 }
 
-/// A run's default action for a signal: print one line and end every thread.
-///
-/// The run is the process here, so a fatal default action is process-fatal even
-/// when the signal was addressed to one thread id. Survivors (including threads
-/// blocked in `futex`) are retired with [`scheduler::kill_group`], the runner
-/// then does the one teardown of the address space/fd table/heap, and the shell
-/// sees [`Exit::Fault`] with the signal's name as the reason. This deliberately
-/// mirrors [`on_fault`] rather than `exit_thread`: a half-dead process whose
-/// other threads keep running is not a state this kernel's shared state can
-/// describe.
+/// Wake the parent thread blocked in `wait4`, if any.
+fn notify_parent(parent: u64) {
+    if parent == 0 {
+        return;
+    }
+    let wait_tid = process::peek(parent, |run| run.wait_tid).unwrap_or(0);
+    if wait_tid != 0 {
+        scheduler::wake_task(wait_tid);
+    }
+}
+
+/// A process's default action for a signal: print one line and end every thread.
 pub(crate) fn on_signal_death(signal: usize, sepc: usize, reason: &'static str) -> ! {
     let mut name = RunName::new("user");
-    let mut run_id = 0u64;
-    {
-        let mut slot = RUN.lock();
-        if let Some(run) = slot.as_mut() {
+    let mut pid = 0u64;
+    let mut parent = 0u64;
+    if let Some(current) = process::current_pid() {
+        pid = current;
+        process::update(current, |run| {
             name = run.name;
-            run_id = run.id;
+            parent = run.ppid;
             run.exit = Some(Exit::Fault {
                 reason,
                 cause: 0,
                 sepc,
             });
-        }
+            run.signal = Some(signal);
+        });
     }
     crate::kprintln!(
         "[user] {} killed: {} (signal={}, sepc={:#x})",
@@ -1474,42 +1358,33 @@ pub(crate) fn on_signal_death(signal: usize, sepc: usize, reason: &'static str) 
         signal,
         sepc
     );
-    if run_id != 0 {
-        let _ = scheduler::kill_group(run_id);
+    if pid != 0 {
+        let _ = scheduler::kill_group(pid);
+        process::update(pid, |run| run.threads = 0);
     }
-    if let Some(run) = RUN.lock().as_mut() {
-        run.threads = 0;
-    }
+    notify_parent(parent);
     scheduler::exit()
 }
 
-/// A U-mode exception: print one diagnostic line, record it as the run's result
-/// and end *every* thread of the run. Never returns to U-mode.
-///
-/// A fault is process-fatal, as it is in POSIX: leaving the other threads alive
-/// could let a program whose invariant was violated — often while holding a
-/// userspace lock — continue and deadlock the run. Survivors are retired with
-/// [`scheduler::kill_group`], the same mechanism as `exit_group`, and the
-/// runner returns [`Exit::Fault`].
-///
-/// The mapping cleanup is the runner's job (it knows the stack allocation and
-/// the `Loaded` value); this path only has to leave the scheduler, which is what
-/// lets the shell get its prompt back on the next schedule.
+/// A U-mode exception: print one diagnostic line, record it as the process's
+/// result and end *every* thread of that process. Never returns to U-mode.
 pub fn on_fault(scause: usize, sepc: usize, stval: usize) -> ! {
     let reason = crate::arch::riscv64::traps::cause_name(scause);
     let mut name = RunName::new("user");
-    let mut run_id = 0u64;
-    {
-        let mut slot = RUN.lock();
-        if let Some(run) = slot.as_mut() {
+    let mut pid = 0u64;
+    let mut parent = 0u64;
+    if let Some(current) = process::current_pid() {
+        pid = current;
+        process::update(current, |run| {
             name = run.name;
-            run_id = run.id;
+            parent = run.ppid;
             run.exit = Some(Exit::Fault {
                 reason,
                 cause: scause,
                 sepc,
             });
-        }
+            run.signal = fault_signal(scause);
+        });
     }
     crate::kprintln!(
         "[user] {} killed: {} (cause={}, stval={:#x}, sepc={:#x})",
@@ -1519,11 +1394,626 @@ pub fn on_fault(scause: usize, sepc: usize, stval: usize) -> ! {
         stval,
         sepc
     );
-    if run_id != 0 {
-        let _ = scheduler::kill_group(run_id);
+    if pid != 0 {
+        let _ = scheduler::kill_group(pid);
+        process::update(pid, |run| run.threads = 0);
     }
-    if let Some(run) = RUN.lock().as_mut() {
-        run.threads = 0;
-    }
+    notify_parent(parent);
     scheduler::exit()
+}
+
+/// The POSIX signal number a synchronous fault maps to, if any.
+fn fault_signal(cause: usize) -> Option<usize> {
+    match cause {
+        crate::arch::riscv64::traps::CAUSE_ILLEGAL_INSTRUCTION => Some(4), // SIGILL
+        crate::arch::riscv64::traps::CAUSE_BREAKPOINT => Some(5),          // SIGTRAP
+        crate::arch::riscv64::traps::CAUSE_INSTRUCTION_PAGE_FAULT
+        | crate::arch::riscv64::traps::CAUSE_LOAD_PAGE_FAULT
+        | crate::arch::riscv64::traps::CAUSE_STORE_PAGE_FAULT => Some(11), // SIGSEGV
+        _ => None,
+    }
+}
+
+// ─── process-family syscalls ───────────────────────────────────────────────
+
+/// `fork`: duplicate the calling process.
+///
+/// The child gets its own Sv39 root and ASID, deep copies of every mapped user
+/// page (image, heap, `mmap`, stack), a copy of the descriptor table (pipes keep
+/// the shared ring with one more reference; a socket becomes an `Unsupported`
+/// descriptor because the kernel owns exactly one TCP connection) and a copy of
+/// the signal handlers plus the caller's blocked mask. Pending signals are not
+/// inherited.
+///
+/// Both processes return from the same `ecall`: the parent with the child pid,
+/// the child with `a0 = 0` and every other register — `sepc`, `sp`, `gp`, `tp`
+/// and the callee-saved set — identical. The child's `sepc` already points past
+/// the `ecall` because the parent's dispatcher is about to advance its own.
+pub(crate) fn fork(frame: &TrapFrame) -> isize {
+    const EAGAIN: isize = -11;
+    const EINVAL: isize = -22;
+
+    let Some(parent_pid) = process::current_pid() else {
+        return EINVAL;
+    };
+    let Some(parent_slot) = process::current_slot() else {
+        return EINVAL;
+    };
+    let Some(snapshot) = process::peek(parent_pid, |run| ForkSnapshot::capture(run, parent_slot))
+    else {
+        return EINVAL;
+    };
+    let child_pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+
+    // Reserve the slot before copying anything: the child object lives in the
+    // static table, so a 1 MiB heap page list and a 1 MiB image page list never
+    // travel through this syscall's 16 KiB kernel stack.
+    let Some(child_slot) = process::reserve(child_pid, parent_pid) else {
+        return EAGAIN;
+    };
+    if let Err(error) = build_fork_into(child_slot, &snapshot) {
+        fork_cleanup(child_slot, child_pid);
+        return error;
+    }
+    if !syscall::fork_fds(parent_slot, child_slot) {
+        fork_cleanup(child_slot, child_pid);
+        return EAGAIN;
+    }
+    let mut child_frame = *frame;
+    child_frame.a0 = 0;
+    child_frame.sepc = frame.sepc.wrapping_add(4);
+    child_frame.sstatus = crate::arch::riscv64::csr::user_entry_status();
+    let satp = process::peek(child_pid, |proc| proc.satp).unwrap_or(0);
+    let Some(child_tid) = scheduler::spawn_user_frame(&child_frame, child_pid, satp) else {
+        fork_cleanup(child_slot, child_pid);
+        return EAGAIN;
+    };
+    if !signal::fork_process(parent_pid, child_pid, parent_slot, child_slot, child_tid) {
+        let _ = scheduler::kill_group(child_pid);
+        fork_cleanup(child_slot, child_pid);
+        let _ = scheduler::reap();
+        return EAGAIN;
+    }
+    process::update(child_pid, |proc| {
+        proc.main_tid = child_tid;
+        proc.ready = true;
+    });
+    child_pid as isize
+}
+
+/// Release every resource a failed fork may have installed, in place.
+fn fork_cleanup(slot: usize, pid: u64) {
+    syscall::release_fds(slot);
+    signal::clear_process(slot, pid);
+    futex::clear_run(pid);
+    let _ = process::with_slot_mut(slot, |proc| release_process_memory(proc, Some(slot)));
+    process::clear_slot(slot);
+}
+
+/// Everything `fork` needs from the parent, copied while the table is locked so
+/// no page copy runs under it.
+struct ForkSnapshot {
+    /// Parent slot, which owns the image and heap page rows.
+    parent_slot: usize,
+    root: usize,
+    entry: usize,
+    sp: usize,
+    argc: usize,
+    argv: usize,
+    name: RunName,
+    image_count: usize,
+    heap_end: usize,
+    heap_count: usize,
+    mmap_regions: [MmapRegion; MAX_MMAP_REGIONS],
+    mmap_count: usize,
+}
+
+impl ForkSnapshot {
+    fn capture(run: &Process, slot: usize) -> Self {
+        let image_count = process::with_image(slot, |loaded| loaded.pages().len()).unwrap_or(0);
+        ForkSnapshot {
+            parent_slot: slot,
+            root: run.root,
+            entry: run.entry,
+            sp: run.sp,
+            argc: run.argc,
+            argv: run.argv,
+            name: run.name,
+            image_count,
+            heap_end: run.heap_end,
+            heap_count: run.heap_count,
+            mmap_regions: run.mmap_regions,
+            mmap_count: run.mmap_count,
+        }
+    }
+}
+
+/// Fill a reserved child slot and copy every mapped user page into its root.
+///
+/// The child object is mutated through the table, never returned by value; on
+/// error the caller runs [`fork_cleanup`].
+fn build_fork_into(child_slot: usize, snapshot: &ForkSnapshot) -> Result<(), isize> {
+    const ENOMEM: isize = -12;
+    let space = paging::create_user_space().map_err(|_| ENOMEM)?;
+    let mut pages = [0usize; elf::MAX_IMAGE_PAGES];
+    for (index, page) in pages[..snapshot.image_count].iter_mut().enumerate() {
+        let Some(va) = process::image_page(snapshot.parent_slot, index) else {
+            paging::free_user_space(space.root);
+            return Err(ENOMEM);
+        };
+        *page = va;
+    }
+    let Some(loaded) =
+        elf::Loaded::from_pages(space.root, snapshot.entry, &pages[..snapshot.image_count])
+    else {
+        paging::free_user_space(space.root);
+        return Err(ENOMEM);
+    };
+    process::with_slot_mut(child_slot, |child| {
+        child.root = space.root;
+        child.satp = space.satp;
+        child.asid = space.asid;
+        child.entry = snapshot.entry;
+        child.sp = snapshot.sp;
+        child.argc = snapshot.argc;
+        child.argv = snapshot.argv;
+        child.name = snapshot.name;
+        child.heap_end = snapshot.heap_end;
+        child.heap_count = snapshot.heap_count;
+        child.mmap_regions = snapshot.mmap_regions;
+        child.mmap_count = snapshot.mmap_count;
+        child.stack_base = 0;
+        child.threads = 1;
+    });
+    process::set_image(child_slot, loaded);
+
+    for index in 0..snapshot.image_count {
+        let Some(va) = process::image_page(snapshot.parent_slot, index) else {
+            return Err(ENOMEM);
+        };
+        if copy_user_page(snapshot.root, space.root, va).is_err() {
+            return Err(ENOMEM);
+        }
+    }
+
+    let Some(stack_base) = pmm::alloc_frames_contiguous(USER_STACK_PAGES) else {
+        return Err(ENOMEM);
+    };
+    if let Some(child) = process::with_slot_mut(child_slot, |child| child.stack_base = stack_base) {
+        let _ = child;
+    } else {
+        pmm::free_frames_contiguous(stack_base, USER_STACK_PAGES);
+        return Err(ENOMEM);
+    }
+    for page in 0..USER_STACK_PAGES {
+        let va = USER_STACK_BASE + page * FRAME_SIZE;
+        let frame = stack_base + page * FRAME_SIZE;
+        if copy_page_into(snapshot.root, space.root, va, frame).is_err() {
+            return Err(ENOMEM);
+        }
+    }
+
+    for index in 0..snapshot.heap_count {
+        let va = USER_HEAP_BASE + index * FRAME_SIZE;
+        let Some(frame) = pmm::alloc_frame() else {
+            return Err(ENOMEM);
+        };
+        if copy_page_into(snapshot.root, space.root, va, frame).is_err() {
+            pmm::free_frame(frame);
+            return Err(ENOMEM);
+        }
+        process::set_heap_frame(child_slot, index, frame);
+    }
+
+    for index in 0..snapshot.mmap_count {
+        let region = snapshot.mmap_regions[index];
+        let mut page = region.start;
+        while page < region.end() {
+            if copy_user_page(snapshot.root, space.root, page).is_err() {
+                return Err(ENOMEM);
+            }
+            page += FRAME_SIZE;
+        }
+    }
+    Ok(())
+}
+
+/// Copy one user page from `src_root` to a fresh frame in `dst_root`.
+fn copy_user_page(src_root: usize, dst_root: usize, va: usize) -> Result<(), ()> {
+    let Some(frame) = pmm::alloc_frame() else {
+        return Err(());
+    };
+    if copy_page_into(src_root, dst_root, va, frame).is_err() {
+        pmm::free_frame(frame);
+        return Err(());
+    }
+    Ok(())
+}
+
+/// Copy the contents of the parent page at `va` into `frame` and map `frame` at
+/// the same virtual address in `dst_root`, preserving the parent's permissions.
+fn copy_page_into(src_root: usize, dst_root: usize, va: usize, frame: usize) -> Result<(), ()> {
+    let Some(source) = paging::translate_in(src_root, va & !(FRAME_SIZE - 1)) else {
+        return Err(());
+    };
+    let Some(flags) = paging::flags_in(src_root, va & !(FRAME_SIZE - 1)) else {
+        return Err(());
+    };
+    if flags.bits() & PTE_U == 0 {
+        return Err(());
+    }
+    // SAFETY: `source` is the physical frame backing a mapped user page of the
+    // parent (identity-mapped supervisor RW) and `frame` is a fresh PMM frame
+    // owned by this copy. Both are FRAME_SIZE bytes and disjoint.
+    unsafe { core::ptr::copy_nonoverlapping(source as *const u8, frame as *mut u8, FRAME_SIZE) };
+    if paging::map_in(dst_root, va & !(FRAME_SIZE - 1), frame, flags).is_err() {
+        return Err(());
+    }
+    Ok(())
+}
+
+/// `execve(path, argv, envp)`.
+///
+/// Loads a static ELF from the VFS into a *fresh* address space, builds the
+/// SysV entry stack from the caller's `argv`/`envp` arrays, then atomically
+/// replaces the process image: the old user pages, heap, `mmap` extents and
+/// stack are freed, the pid/parent/descriptor table survive, caught signal
+/// handlers go back to `SIG_DFL`, pending signals are dropped and the blocked
+/// mask is kept. Sibling threads are retired (a process has one image).
+///
+/// The success path rewrites `frame` and returns `Ok(())`; `dispatch` then must
+/// **not** bump `sepc` or write `a0`. Every error returns an errno and changes
+/// nothing.
+pub(crate) fn execve(
+    frame: &mut TrapFrame,
+    path_ptr: usize,
+    argv_ptr: usize,
+    envp_ptr: usize,
+) -> Result<(), isize> {
+    const E2BIG: isize = -7;
+    const ENOENT: isize = -2;
+    const ENOEXEC: isize = -8;
+    const EFAULT: isize = -14;
+    const EISDIR: isize = -21;
+    const EINVAL: isize = -22;
+    const ENOMEM: isize = -12;
+    const EIO: isize = -5;
+
+    // Resolve the caller's slot before anything is allocated: every failure
+    // below then has a place to release what it built, and a process that has
+    // already been taken out of the table cannot leak a new address space.
+    let Some(slot) = process::current_slot() else {
+        return Err(EINVAL);
+    };
+    let Some(pid) = process::current_pid() else {
+        return Err(EINVAL);
+    };
+
+    let mut path_buf = [0u8; 256];
+    let path = read_user_cstring(path_ptr, &mut path_buf)?;
+    if !path.starts_with('/') {
+        return Err(ENOENT);
+    }
+    let argv = read_string_array(argv_ptr, MAX_ENTRY_BYTES)?;
+    let env = read_string_array(envp_ptr, MAX_ENTRY_BYTES)?;
+    if argv.len() + env.len() > MAX_ENTRY_STRINGS {
+        return Err(E2BIG);
+    }
+    let total: usize = argv
+        .iter()
+        .chain(env.iter())
+        .map(|text| text.len() + 1)
+        .sum();
+    if total > MAX_ENTRY_BYTES {
+        return Err(E2BIG);
+    }
+
+    let node = vfs::walk(path, true).map_err(|error| match error {
+        VfsError::NotFound => ENOENT,
+        _ => EIO,
+    })?;
+    if node.is_directory() {
+        return Err(EISDIR);
+    }
+    let size = node.size();
+    if size == 0 {
+        return Err(ENOEXEC);
+    }
+    if size > elf::MAX_IMAGE_BYTES as u64 {
+        return Err(E2BIG);
+    }
+    let source = FileSource { node, size };
+
+    let space = paging::create_user_space().map_err(|_| ENOMEM)?;
+    let mut loaded = match elf::load_in(space.root, &source, 0) {
+        Ok(loaded) => loaded,
+        Err(ElfError::Source(_)) => {
+            paging::free_user_space(space.root);
+            return Err(EIO);
+        }
+        Err(ElfError::OutOfFrames) => {
+            paging::free_user_space(space.root);
+            return Err(ENOMEM);
+        }
+        Err(_) => {
+            paging::free_user_space(space.root);
+            return Err(ENOEXEC);
+        }
+    };
+
+    let Some(stack_base) = pmm::alloc_frames_contiguous(USER_STACK_PAGES) else {
+        loaded.release();
+        paging::free_user_space(space.root);
+        return Err(ENOMEM);
+    };
+    for page in 0..USER_STACK_PAGES {
+        let va = USER_STACK_BASE + page * FRAME_SIZE;
+        let pa = stack_base + page * FRAME_SIZE;
+        if paging::map_in(space.root, va, pa, Flags::user_rw()).is_err() {
+            release_stack_in(space.root, stack_base);
+            loaded.release();
+            paging::free_user_space(space.root);
+            return Err(ENOMEM);
+        }
+        // SAFETY: as in `run_source`: a freshly mapped user-stack frame.
+        unsafe { core::ptr::write_bytes(pa as *mut u8, 0, FRAME_SIZE) };
+    }
+
+    let argv_refs: Vec<&str> = match argv
+        .iter()
+        .map(|text| core::str::from_utf8(text).map_err(|_| EINVAL))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(refs) => refs,
+        Err(error) => {
+            release_stack_in(space.root, stack_base);
+            loaded.release();
+            paging::free_user_space(space.root);
+            return Err(error);
+        }
+    };
+    let env_refs: Vec<&str> = match env
+        .iter()
+        .map(|text| core::str::from_utf8(text).map_err(|_| EINVAL))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(refs) => refs,
+        Err(error) => {
+            release_stack_in(space.root, stack_base);
+            loaded.release();
+            paging::free_user_space(space.root);
+            return Err(error);
+        }
+    };
+    let built = match build_entry_stack_in(space.root, &argv_refs, &env_refs) {
+        Ok(built) => built,
+        Err(UserError::ArgumentsTooLong) => {
+            release_stack_in(space.root, stack_base);
+            loaded.release();
+            paging::free_user_space(space.root);
+            return Err(E2BIG);
+        }
+        Err(_) => {
+            release_stack_in(space.root, stack_base);
+            loaded.release();
+            paging::free_user_space(space.root);
+            return Err(EFAULT);
+        }
+    };
+
+    let new_entry = loaded.entry;
+
+    // Everything fallible is done. Switch the hart to the new root, retire the
+    // siblings that still point at the old image, then replace the process's
+    // address-space fields. The old pages are freed while the new root is
+    // active; the freed root is never the one executing this code again.
+    crate::arch::riscv64::mmu::activate_satp(space.satp);
+    scheduler::set_current_satp(space.satp);
+    let _ = scheduler::kill_group(pid);
+    let replaced = process::with_slot_mut(slot, |proc| {
+        release_process_memory(proc, Some(slot));
+        proc.root = space.root;
+        proc.satp = space.satp;
+        proc.asid = space.asid;
+        proc.stack_base = stack_base;
+        proc.heap_end = USER_HEAP_BASE;
+        proc.heap_count = 0;
+        proc.mmap_count = 0;
+        proc.mmap_regions = [MmapRegion::empty(); MAX_MMAP_REGIONS];
+        proc.entry = new_entry;
+        proc.sp = built.sp;
+        proc.argc = built.argc;
+        proc.argv = built.argv;
+        proc.name = RunName::new(argv_refs.first().copied().unwrap_or(path));
+        proc.threads = 1;
+        proc.main_tid = scheduler::current_id();
+        proc.main_code = None;
+        proc.exit = None;
+        proc.signal = None;
+        // Any sibling killed above may have been the one blocked in `wait4`.
+        // Leaving its tid here would make a later child-exit wake an unrelated
+        // task, so the new image starts with nobody waiting.
+        proc.wait_tid = 0;
+    });
+    if replaced.is_none() {
+        crate::kprintln!("[user] execve lost its process slot; ending the task");
+        scheduler::exit()
+    }
+    process::set_image(slot, loaded);
+    signal::exec_process(slot, pid);
+    futex::clear_run(pid);
+
+    *frame = TrapFrame::zeroed();
+    frame.sepc = new_entry;
+    frame.sp = built.sp;
+    frame.a0 = built.argc;
+    frame.a1 = built.argv;
+    frame.sstatus = crate::arch::riscv64::csr::user_entry_status();
+    Ok(())
+}
+
+/// `wait4(pid, status, options, rusage)`.
+pub(crate) fn wait4(pid_spec: isize, status_ptr: usize, options: usize, _rusage: usize) -> isize {
+    const WNOHANG: usize = 1;
+    const ECHILD: isize = -10;
+    const EINTR: isize = -4;
+    const EFAULT: isize = -14;
+    const EINVAL: isize = -22;
+
+    if options & !WNOHANG != 0 {
+        return EINVAL;
+    }
+    if pid_spec < -1 {
+        return EINVAL;
+    }
+    if status_ptr != 0 && !syscall::user_range_valid(status_ptr, status_ptr + 4, true) {
+        return EFAULT;
+    }
+    let Some(parent) = process::current_pid() else {
+        return ECHILD;
+    };
+    let want = if pid_spec > 0 {
+        Some(pid_spec as u64)
+    } else {
+        None
+    };
+
+    loop {
+        let mut children = 0usize;
+        let mut zombie: Option<(usize, u64)> = None;
+        process::with_table(|table| {
+            for (slot, entry) in table.iter().enumerate() {
+                let Some(proc) = entry.as_ref() else {
+                    continue;
+                };
+                if !proc.ready || proc.ppid != parent {
+                    continue;
+                }
+                if let Some(want) = want {
+                    if proc.pid != want {
+                        continue;
+                    }
+                }
+                children += 1;
+                if proc.threads == 0 {
+                    zombie = Some((slot, proc.pid));
+                    break;
+                }
+            }
+        });
+        if let Some((slot, child_pid)) = zombie {
+            let child_signal = process::peek(child_pid, |proc| wait_status(proc)).unwrap_or(0);
+            process::update(child_pid, |proc| {
+                proc.ready = true;
+            });
+            syscall::release_fds(slot);
+            signal::clear_process(slot, child_pid);
+            futex::clear_run(child_pid);
+            if process::with_slot_mut(slot, |proc| release_process_memory(proc, Some(slot)))
+                .is_none()
+            {
+                continue;
+            }
+            process::clear_slot(slot);
+            let _ = scheduler::reap();
+            if status_ptr != 0 {
+                if let Err(error) = syscall::copy_to_user(status_ptr, &child_signal.to_le_bytes()) {
+                    return error;
+                }
+            }
+            return child_pid as isize;
+        }
+        if children == 0 {
+            return ECHILD;
+        }
+        if options & WNOHANG != 0 {
+            return 0;
+        }
+        if crate::user::signal::interrupted() {
+            return EINTR;
+        }
+        let tid = scheduler::current_id();
+        process::update(parent, |proc| proc.wait_tid = tid);
+        scheduler::block_current(None);
+        process::update(parent, |proc| proc.wait_tid = 0);
+        if crate::user::signal::interrupted() {
+            return EINTR;
+        }
+    }
+}
+
+/// Encode a process's exit as a POSIX `wait` status.
+///
+/// A normal exit is `code << 8` (the low byte only, as Linux does); a signal or
+/// fault death is the signal number in the low seven bits with no core-dump bit
+/// and no exit code.
+fn wait_status(child: &Process) -> u32 {
+    if let Some(signal) = child.signal {
+        return (signal as u32) & 0x7f;
+    }
+    match child.exit {
+        Some(Exit::Code(code)) => (code & 0xff) << 8,
+        Some(Exit::Fault { cause, .. }) => fault_signal(cause).unwrap_or(0) as u32,
+        None => 0,
+    }
+}
+
+/// Read a NUL-terminated user string into `out`, returning it without the NUL.
+fn read_user_cstring<'a>(pointer: usize, out: &'a mut [u8]) -> Result<&'a str, isize> {
+    const EFAULT: isize = -14;
+    const EINVAL: isize = -22;
+    if pointer == 0 {
+        return Err(EFAULT);
+    }
+    let mut length = 0usize;
+    loop {
+        if length == out.len() {
+            return Err(EINVAL);
+        }
+        let mut byte = [0u8; 1];
+        syscall::copy_from_user(&mut byte, pointer + length)?;
+        if byte[0] == 0 {
+            break;
+        }
+        out[length] = byte[0];
+        length += 1;
+    }
+    core::str::from_utf8(&out[..length]).map_err(|_| EINVAL)
+}
+
+/// Read a user `char **` into owned byte strings.
+fn read_string_array(pointer: usize, byte_budget: usize) -> Result<Vec<Vec<u8>>, isize> {
+    const E2BIG: isize = -7;
+    const EFAULT: isize = -14;
+    if pointer == 0 {
+        return Ok(Vec::new());
+    }
+    let mut strings = Vec::new();
+    let mut bytes = 0usize;
+    for index in 0..MAX_ENTRY_STRINGS {
+        let word_address = pointer.checked_add(index * 8).ok_or(EFAULT)?;
+        let mut raw = [0u8; 8];
+        syscall::copy_from_user(&mut raw, word_address)?;
+        let target = u64::from_le_bytes(raw) as usize;
+        if target == 0 {
+            return Ok(strings);
+        }
+        let mut text = Vec::new();
+        let mut cursor = target;
+        loop {
+            let mut byte = [0u8; 1];
+            syscall::copy_from_user(&mut byte, cursor)?;
+            if byte[0] == 0 {
+                break;
+            }
+            text.push(byte[0]);
+            bytes += 1;
+            if bytes > byte_budget || bytes > MAX_ENTRY_BYTES {
+                return Err(E2BIG);
+            }
+            cursor = cursor.checked_add(1).ok_or(EFAULT)?;
+        }
+        strings.push(text);
+    }
+    Err(E2BIG)
 }

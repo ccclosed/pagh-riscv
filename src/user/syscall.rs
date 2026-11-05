@@ -1,7 +1,7 @@
 //! The native system-call ABI (libpagh): the RISC-V syscall numbers from
-//! `pagh-api/docs/abi.md`, a trap frame that carries the arguments, a per-run
-//! file-descriptor table, and pointer validation that never trusts a U-mode
-//! address.
+//! `pagh-api/docs/abi.md`, a trap frame that carries the arguments, a
+//! per-process file-descriptor table, and pointer validation that never trusts
+//! a U-mode address.
 //!
 //! Dispatch runs in the trap handler, with `sstatus.SIE = 0` (hardware cleared
 //! it on entry), so a syscall cannot be preempted by the timer halfway through a
@@ -11,9 +11,10 @@
 //!
 //! # The file-descriptor table
 //!
-//! One program runs at a time (`user::RUN`), so the table is one static with 16
-//! slots, reset when a run starts and released when it ends: 0 = console input,
-//! 1/2 = console output, 3.. = VFS nodes with an offset and the `openat` flags.
+//! Each process owns one row of 16 slots (`FdTables`); `run_source` resets the
+//! row before spawning, `fork` copies it, `execve` keeps it, and the teardown
+//! releases it after the last thread: 0 = console input, 1/2 = console output,
+//! 3.. = VFS nodes with an offset and the `openat` flags (or a pipe end/socket).
 //! A directory's children are snapshotted at open time (`getdents64`), because
 //! the VFS has no seekable directory cursor. The table's lock is never held
 //! across a VFS/block call: a read or write clones the `Arc` and the offset,
@@ -60,6 +61,7 @@ use crate::arch::riscv64::traps::TrapFrame;
 use crate::memory::{paging, FRAME_SIZE};
 use crate::net::tcp;
 use crate::sync::Spinlock;
+use crate::user::process::MAX_PROCESSES;
 use crate::user::{MmapError, USER_MMAP_PAGES};
 use crate::vfs::{self, VfsError, VfsNode};
 
@@ -102,7 +104,15 @@ const SYS_RT_SIGPROCMASK: usize = 135;
 const SYS_RT_SIGRETURN: usize = 139;
 const SYS_SCHED_YIELD: usize = 124;
 const SYS_GETPID: usize = 172;
+const SYS_GETPPID: usize = 173;
 const SYS_GETTID: usize = 178;
+// Process family. `execve`/`wait4`/`getppid` use the asm-generic numbers.
+// asm-generic has **no** fork; `fork = 1000` is a pagh-native extension outside
+// the Linux table, and `clone(220)` with all-zero arguments is accepted as its
+// alias so a libc-shaped caller does not need to know the private number.
+const SYS_EXECVE: usize = 221;
+const SYS_WAIT4: usize = 260;
+const SYS_FORK: usize = 1000;
 // Native threads (pagh's own signature, not Linux's raw `clone`):
 // `clone(flags, stack, entry, arg)`. See `clone` for the accepted bits.
 const SYS_CLONE: usize = 220;
@@ -131,13 +141,11 @@ const SYS_SHUTDOWN: usize = 210;
 
 // ─── errno values (negated in `a0`) ────────────────────────────────────────
 const ENOENT: isize = -2;
+const EINTR: isize = -4;
 const EIO: isize = -5;
 const EBADF: isize = -9;
 const EAGAIN: isize = -11;
 const ENOMEM: isize = -12;
-/// A blocking wait was interrupted by a deliverable signal; the handler runs
-/// before the syscall returns to the instruction after `ecall`.
-const EINTR: isize = -4;
 const EFAULT: isize = -14;
 const EEXIST: isize = -17;
 const ENOTDIR: isize = -20;
@@ -200,11 +208,12 @@ const POLLFD_SIZE: usize = 8;
 /// Bytes in one pipe ring. Fixed and small on purpose: this is a signalling
 /// buffer between two descriptors, not a socket.
 const PIPE_CAPACITY: usize = 4096;
-/// Pipes one run may hold open at once. Each is 4 KiB of static RAM; eight is
-/// enough for a shell pipeline and bounded.
+/// Pipes the kernel may hold open at once (shared by all processes through
+/// descriptor references). Each is 4 KiB of static RAM; eight is enough for a
+/// shell pipeline and bounded.
 const MAX_PIPES: usize = 8;
 
-/// File descriptors per run, including 0/1/2 (the ABI's limit).
+/// File descriptors per process, including 0/1/2 (the ABI's limit).
 pub(crate) const MAX_FDS: usize = 16;
 
 /// Longest absolute path accepted by a path-taking syscall, including the NUL.
@@ -295,8 +304,16 @@ pub struct Stats {
     pub futex_waits: u64,
     /// `futex` `WAKE` calls that returned.
     pub futex_wakes: u64,
-    /// `exit_group` calls (each ends one run).
+    /// `exit_group` calls (each ends one process).
     pub exit_groups: u64,
+    /// Successful `fork` calls (including the `clone(0,0,0,0)` form).
+    pub forks: u64,
+    /// Successful `execve` calls.
+    pub execs: u64,
+    /// `wait4` calls that returned a child pid.
+    pub waits: u64,
+    /// `getppid` calls.
+    pub getppids: u64,
     /// Unknown syscall numbers answered with `-ENOSYS`.
     pub unknown: u64,
     /// Bad user buffers answered with `-EFAULT`.
@@ -342,6 +359,10 @@ static CLONES: AtomicU64 = AtomicU64::new(0);
 static FUTEX_WAITS: AtomicU64 = AtomicU64::new(0);
 static FUTEX_WAKES: AtomicU64 = AtomicU64::new(0);
 static EXIT_GROUPS: AtomicU64 = AtomicU64::new(0);
+static FORKS: AtomicU64 = AtomicU64::new(0);
+static EXECS: AtomicU64 = AtomicU64::new(0);
+static WAITS: AtomicU64 = AtomicU64::new(0);
+static GETPPIDS: AtomicU64 = AtomicU64::new(0);
 static UNKNOWN: AtomicU64 = AtomicU64::new(0);
 static FAULTS: AtomicU64 = AtomicU64::new(0);
 
@@ -388,6 +409,10 @@ pub fn stats() -> Stats {
         futex_waits: FUTEX_WAITS.load(Ordering::Relaxed),
         futex_wakes: FUTEX_WAKES.load(Ordering::Relaxed),
         exit_groups: EXIT_GROUPS.load(Ordering::Relaxed),
+        forks: FORKS.load(Ordering::Relaxed),
+        execs: EXECS.load(Ordering::Relaxed),
+        waits: WAITS.load(Ordering::Relaxed),
+        getppids: GETPPIDS.load(Ordering::Relaxed),
         unknown: UNKNOWN.load(Ordering::Relaxed),
         faults: FAULTS.load(Ordering::Relaxed),
     }
@@ -503,13 +528,6 @@ impl PipeTable {
         None
     }
 
-    /// Release every ring in place (no whole-table temporary).
-    fn clear(&mut self) {
-        for pipe in &mut self.pipes {
-            pipe.reset();
-        }
-    }
-
     /// Drop one descriptor reference; both ends gone frees the ring.
     fn release(&mut self, id: usize, read: bool) {
         let Some(pipe) = self.pipes.get_mut(id) else {
@@ -574,7 +592,7 @@ enum FdEntry {
         read: bool,
     },
     /// A BSD-style socket descriptor. The kernel has exactly one TCP
-    /// connection, so at most one of these exists per run; `id` is the stack's
+    /// connection, so at most one of these exists in a live process; `id` is the stack's
     /// socket number (always 0 today) and `connected` records that a
     /// `connect` succeeded, which is what separates "never connected"
     /// (`-ENOTCONN`) from "shut down" (read returns 0, write `-EPIPE`).
@@ -582,6 +600,9 @@ enum FdEntry {
         id: u8,
         connected: bool,
     },
+    /// A forked child's copy of a parent socket descriptor. It is not a second
+    /// owner of the connection; operations answer `-ENOTSUP`.
+    Unsupported,
 }
 
 impl Clone for FdEntry {
@@ -601,6 +622,7 @@ impl Clone for FdEntry {
                 id: *id,
                 connected: *connected,
             },
+            FdEntry::Unsupported => FdEntry::Unsupported,
         }
     }
 }
@@ -615,14 +637,282 @@ impl FdTable {
             slots: [const { None }; MAX_FDS],
         }
     }
+
+    fn console() -> Self {
+        let mut table = FdTable::empty();
+        table.slots[0] = Some(FdEntry::Stdin);
+        table.slots[1] = Some(FdEntry::Stdout);
+        table.slots[2] = Some(FdEntry::Stdout);
+        table
+    }
 }
 
-static FDS: Spinlock<FdTable> = Spinlock::new(FdTable::empty());
+/// Every process's descriptor row. A process owns its table: `fork` copies rows,
+/// `execve` keeps them, teardown drops one row. Pipe rings stay global and
+/// reference-counted, which is the one resource a fork shares.
+struct FdTables {
+    rows: [FdTable; MAX_PROCESSES],
+}
+
+impl FdTables {
+    const fn empty() -> Self {
+        FdTables {
+            rows: [const { FdTable::empty() }; MAX_PROCESSES],
+        }
+    }
+}
+
+static FDS: Spinlock<FdTables> = Spinlock::new(FdTables::empty());
+
+/// Run `f` on the calling process's descriptor row. `None` when the caller is
+/// not a user process (a stale syscall after teardown).
+fn with_fds<R>(f: impl FnOnce(&mut FdTable) -> R) -> Option<R> {
+    let slot = crate::user::process::current_slot()?;
+    let mut tables = FDS.lock();
+    Some(f(&mut *tables.rows.get_mut(slot)?))
+}
+
+/// Fill one process's row with the three console descriptors. Called before the
+/// process's first task can issue an `ecall`.
+pub(crate) fn reset_fds(slot: usize) {
+    let had_socket = {
+        let mut tables = FDS.lock();
+        let had = tables.rows[slot]
+            .slots
+            .iter()
+            .any(|entry| matches!(entry, Some(FdEntry::Socket { .. })));
+        tables.rows[slot] = FdTable::console();
+        had
+    };
+    if had_socket {
+        crate::net::tcp::close();
+    }
+    if let Some(row) = MODES.lock().rows.get_mut(slot) {
+        *row = ModeTable::empty();
+    }
+}
+
+/// Drop one process's open nodes and pipe references. A socket close sends a
+/// FIN, so the table lock is released first.
+pub(crate) fn release_fds(slot: usize) {
+    // Collect the resources to release outside the table lock: a socket close
+    // sends a FIN and may poll the NIC, and a pipe reference is a second lock
+    // this path does not need to hold while doing it.
+    let mut pipes = [(0usize, false); MAX_FDS];
+    let mut pipe_count = 0usize;
+    let had_socket = {
+        let mut tables = FDS.lock();
+        let Some(row) = tables.rows.get_mut(slot) else {
+            return;
+        };
+        let mut had = false;
+        for entry in row.slots.iter_mut() {
+            match entry.take() {
+                Some(FdEntry::Pipe { id, read }) => {
+                    if pipe_count < pipes.len() {
+                        pipes[pipe_count] = (id, read);
+                        pipe_count += 1;
+                    }
+                }
+                Some(FdEntry::Socket { .. }) => had = true,
+                Some(_) | None => {}
+            }
+        }
+        had
+    };
+    for &(id, read) in pipes[..pipe_count].iter() {
+        pipe_release(id, read);
+    }
+    if had_socket {
+        crate::net::tcp::close();
+    }
+    if let Some(row) = MODES.lock().rows.get_mut(slot) {
+        *row = ModeTable::empty();
+    }
+}
+
+/// Copy a parent's descriptor row into a child's.
+///
+/// Files and pipes are cloned (the pipe's ring gains one reference for each end);
+/// a socket is replaced by [`FdEntry::Unsupported`] because the kernel owns
+/// exactly one TCP connection and a forked child must not become a second owner
+/// of it. A later `read`/`write`/`poll` on that descriptor is `-ENOTSUP`, and
+/// `close` simply drops it.
+pub(crate) fn fork_fds(parent: usize, child: usize) -> bool {
+    let mut tables = FDS.lock();
+    if parent == child || parent >= MAX_PROCESSES || child >= MAX_PROCESSES {
+        return false;
+    }
+    let mut copy: [Option<FdEntry>; MAX_FDS] = [const { None }; MAX_FDS];
+    for (index, entry) in tables.rows[parent].slots.iter().enumerate() {
+        copy[index] = match entry {
+            Some(FdEntry::Socket { .. }) => Some(FdEntry::Unsupported),
+            Some(entry) => Some(entry.clone()),
+            None => None,
+        };
+    }
+    tables.rows[child].slots = copy;
+    true
+}
+
+/// What a syscall needs from a descriptor, copied out of the table so the lock
+/// is not held across a VFS/block call. `ConsoleOut` is also returned for fd 2;
+/// the two write to the same console.
+enum OpenFd {
+    ConsoleIn,
+    ConsoleOut,
+    File {
+        node: Arc<dyn VfsNode>,
+        offset: u64,
+        flags: usize,
+    },
+    Pipe {
+        id: usize,
+        read: bool,
+    },
+    Socket {
+        id: u8,
+        connected: bool,
+    },
+    /// A descriptor inherited from a parent's socket. The one TCP connection has
+    /// an owner; this row is a tombstone for the fd number.
+    Unsupported,
+}
+
+fn lookup(fd: usize) -> Result<OpenFd, isize> {
+    with_fds(
+        |table| match table.slots.get(fd).and_then(|slot| slot.as_ref()) {
+            Some(FdEntry::Stdin) => Ok(OpenFd::ConsoleIn),
+            Some(FdEntry::Stdout) => Ok(OpenFd::ConsoleOut),
+            Some(FdEntry::File(file)) => Ok(OpenFd::File {
+                node: Arc::clone(&file.node),
+                offset: file.offset,
+                flags: file.flags,
+            }),
+            Some(FdEntry::Pipe { id, read }) => Ok(OpenFd::Pipe {
+                id: *id,
+                read: *read,
+            }),
+            Some(FdEntry::Socket { id, connected }) => Ok(OpenFd::Socket {
+                id: *id,
+                connected: *connected,
+            }),
+            Some(FdEntry::Unsupported) => Ok(OpenFd::Unsupported),
+            None => Err(EBADF),
+        },
+    )
+    .unwrap_or(Err(EBADF))
+}
+
+/// First empty descriptor slot, including 0/1/2 once a program has closed them.
+fn alloc_fd() -> Option<usize> {
+    with_fds(|table| table.slots.iter().position(|slot| slot.is_none())).flatten()
+}
+
+/// Put an entry in `fd`, returning the previous occupant (released by the
+/// caller). `None` means the slot was free or out of range.
+fn take_slot(fd: usize) -> Option<FdEntry> {
+    with_fds(|table| table.slots.get_mut(fd).and_then(|slot| slot.take())).flatten()
+}
+
+/// Release one descriptor entry, dropping a pipe reference if it was one end.
+fn drop_entry(entry: FdEntry) {
+    match entry {
+        FdEntry::Pipe { id, read } => pipe_release(id, read),
+        FdEntry::Socket { connected, .. } => {
+            if connected {
+                with_network_interrupts(crate::net::tcp::close);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Install a pipe end in the first free slot.
+fn install_pipe(id: usize, read: bool) -> Result<usize, isize> {
+    with_fds(|table| {
+        let Some(fd) = table.slots.iter().position(|slot| slot.is_none()) else {
+            return Err(ENOSPC);
+        };
+        table.slots[fd] = Some(FdEntry::Pipe { id, read });
+        Ok(fd)
+    })
+    .unwrap_or(Err(EBADF))
+}
+
+/// Publish the new offset of an open file.
+fn set_offset(fd: usize, offset: u64) {
+    let _ = with_fds(|table| {
+        if let Some(Some(FdEntry::File(file))) = table.slots.get_mut(fd) {
+            file.offset = offset;
+        }
+    });
+}
+
+/// Install a socket descriptor. The kernel stack owns one connection, so a
+/// second `socket()` anywhere is refused with `ENOSPC`.
+fn install_socket() -> Result<usize, isize> {
+    let slot = crate::user::process::current_slot().ok_or(EBADF)?;
+    let mut tables = FDS.lock();
+    for row in tables.rows.iter() {
+        for entry in row.slots.iter() {
+            if matches!(entry, Some(FdEntry::Socket { .. })) {
+                return Err(ENOSPC);
+            }
+        }
+    }
+    let table = &mut tables.rows[slot];
+    for fd in 3..MAX_FDS {
+        if table.slots[fd].is_none() {
+            table.slots[fd] = Some(FdEntry::Socket {
+                id: 0,
+                connected: false,
+            });
+            return Ok(fd);
+        }
+    }
+    Err(ENOSPC)
+}
+
+/// Record that the socket on `fd` completed its handshake.
+fn mark_socket_connected(fd: usize) {
+    let _ = with_fds(|table| {
+        if let Some(Some(FdEntry::Socket { connected, .. })) = table.slots.get_mut(fd) {
+            *connected = true;
+        }
+    });
+}
+
+/// Remove a descriptor from the table and return it, so its resources (an
+/// `Arc`, a socket's connection) are handled without the table lock held.
+fn take_entry(fd: usize) -> Option<FdEntry> {
+    with_fds(|table| table.slots.get_mut(fd).and_then(|slot| slot.take())).flatten()
+}
+
+/// Install a node in the first free slot at or above 3.
+fn install(node: Arc<dyn VfsNode>, flags: usize, dir: Option<DirSnapshot>) -> Result<usize, isize> {
+    with_fds(|table| {
+        for fd in 3..MAX_FDS {
+            if table.slots[fd].is_none() {
+                table.slots[fd] = Some(FdEntry::File(FileHandle {
+                    node,
+                    offset: 0,
+                    flags,
+                    dir,
+                }));
+                return Ok(fd);
+            }
+        }
+        // The ABI's error list does not include EMFILE; ENOSPC is the kernel's
+        // honest "no space left" for "all 16 descriptors are open".
+        Err(ENOSPC)
+    })
+    .unwrap_or(Err(EBADF))
+}
 
 // ─── permission-mode overrides (fchmodat) ─────────────────────────────────
 
-/// Distinct inodes one run may retarget with `fchmodat`. Sixteen covers a
-/// program that chmods a handful of files; a seventeenth call is `-ENOSPC`.
+/// Distinct inodes one process may retarget with `fchmodat`.
 const MAX_MODE_OVERRIDES: usize = 16;
 
 #[derive(Clone, Copy)]
@@ -631,14 +921,11 @@ struct ModeOverride {
     mode: u16,
 }
 
-/// `fchmodat` has no VFS counterpart: [`VfsNode`] exposes `mode()` but no
-/// `set_mode`, and ext2's writer has no permission-bit path behind the trait.
-/// The syscall therefore records the new `0o7777` bits here, and [`fstat`]
-/// reports them for the rest of the run — the same per-run shim the x86 tree
-/// used before its filesystem grew a writable mode. The table is keyed by
-/// [`VfsNode::fs_ino`] (so a hard link sees the change too), cleared with the
-/// descriptor table, and deliberately not persisted: this is observable
-/// metadata, not an on-disk permission change, and no access check consults it.
+/// `fchmodat` records the new `0o7777` bits here and [`fstat`] reports them for
+/// the rest of the process's life; the table is keyed by [`VfsNode::fs_ino`] and
+/// deliberately not persisted. One row per process: a child does not inherit
+/// chmod overrides any more than it inherits the parent's file descriptors by
+/// reference.
 struct ModeTable {
     entries: [ModeOverride; MAX_MODE_OVERRIDES],
     count: usize,
@@ -676,220 +963,35 @@ impl ModeTable {
     }
 }
 
-static MODES: Spinlock<ModeTable> = Spinlock::new(ModeTable::empty());
+struct ModeTables {
+    rows: [ModeTable; MAX_PROCESSES],
+}
 
-/// The override recorded for `ino`, if this run chmod'ed it. Synthetic nodes
-/// (`ino == 0`) are never recorded.
+impl ModeTables {
+    const fn empty() -> Self {
+        ModeTables {
+            rows: [const { ModeTable::empty() }; MAX_PROCESSES],
+        }
+    }
+}
+
+static MODES: Spinlock<ModeTables> = Spinlock::new(ModeTables::empty());
+
+/// The override recorded for `ino` by the calling process.
 fn mode_override(ino: u64) -> Option<u16> {
     if ino == 0 {
         return None;
     }
-    MODES.lock().get(ino)
+    let slot = crate::user::process::current_slot()?;
+    let tables = MODES.lock();
+    tables.rows.get(slot)?.get(ino)
 }
 
-/// Fill the table with the three console descriptors. Called by the runner
-/// before a task starts; a second call discards whatever a previous run left.
-/// The `fchmodat` overrides are per run too, so they are cleared here.
-///
-/// A socket descriptor left behind (only possible when a run ended without
-/// closing it) would keep the kernel's one TCP connection alive across runs, so
-/// the connection is closed here — after the table lock is released, because
-/// `tcp::close` builds and sends a segment and may poll the NIC.
-pub(crate) fn reset_fds() {
-    let had_socket = {
-        let mut table = FDS.lock();
-        let had = table
-            .slots
-            .iter()
-            .any(|slot| matches!(slot, Some(FdEntry::Socket { .. })));
-        *table = FdTable::empty();
-        table.slots[0] = Some(FdEntry::Stdin);
-        table.slots[1] = Some(FdEntry::Stdout);
-        table.slots[2] = Some(FdEntry::Stdout);
-        had
-    };
-    if had_socket {
-        crate::net::tcp::close();
-    }
-    *MODES.lock() = ModeTable::empty();
-    // A pipe whose descriptors a previous run forgot is dead storage, not state
-    // the next program can reach: the table is per run, the rings with it.
-    PIPES.lock().clear();
-}
-
-/// Drop every open node. Called by the runner after the task is gone, before the
-/// image mappings are released; `Arc::drop` is the only side effect, and the
-/// whole pipe table is discarded because no descriptor can outlive the run.
-/// image mappings are released; `Arc::drop` is the only side effect for a file.
-/// A socket close sends a FIN, so the table lock is released first.
-pub(crate) fn release_fds() {
-    let had_socket = {
-        let mut table = FDS.lock();
-        let mut had = false;
-        for slot in table.slots.iter_mut() {
-            if matches!(slot, Some(FdEntry::Socket { .. })) {
-                had = true;
-            }
-            // `take` drops the entry here, but a socket entry's only resource
-            // is the global connection handled below.
-            *slot = None;
-        }
-        had
-    };
-    if had_socket {
-        crate::net::tcp::close();
-    }
-    *MODES.lock() = ModeTable::empty();
-    PIPES.lock().clear();
-}
-
-/// What a syscall needs from a descriptor, copied out of the table so the lock
-/// is not held across a VFS/block call. `ConsoleOut` is also returned for fd 2;
-/// the two write to the same console.
-enum OpenFd {
-    ConsoleIn,
-    ConsoleOut,
-    File {
-        node: Arc<dyn VfsNode>,
-        offset: u64,
-        flags: usize,
-    },
-    Pipe {
-        id: usize,
-        read: bool,
-    },
-    Socket {
-        id: u8,
-        connected: bool,
-    },
-}
-
-fn lookup(fd: usize) -> Result<OpenFd, isize> {
-    let table = FDS.lock();
-    match table.slots.get(fd).and_then(|slot| slot.as_ref()) {
-        Some(FdEntry::Stdin) => Ok(OpenFd::ConsoleIn),
-        Some(FdEntry::Stdout) => Ok(OpenFd::ConsoleOut),
-        Some(FdEntry::File(file)) => Ok(OpenFd::File {
-            node: Arc::clone(&file.node),
-            offset: file.offset,
-            flags: file.flags,
-        }),
-        Some(FdEntry::Pipe { id, read }) => Ok(OpenFd::Pipe {
-            id: *id,
-            read: *read,
-        }),
-        Some(FdEntry::Socket { id, connected }) => Ok(OpenFd::Socket {
-            id: *id,
-            connected: *connected,
-        }),
-        None => Err(EBADF),
-    }
-}
-
-/// First empty descriptor slot, including 0/1/2 once a program has closed them.
-/// `dup` and `pipe2` use it, which is why they can hand back 0 after a program
-/// closed its stdin — the ABI's "0/1/2 are console" describes the initial table,
-/// not a permanent reservation.
-fn alloc_fd() -> Option<usize> {
-    let table = FDS.lock();
-    table.slots.iter().position(|slot| slot.is_none())
-}
-
-/// Put an entry in `fd`, returning the previous occupant (released by the
-/// caller). `None` means the slot was free or out of range.
-fn take_slot(fd: usize) -> Option<FdEntry> {
-    let mut table = FDS.lock();
-    table.slots.get_mut(fd).and_then(|slot| slot.take())
-}
-
-/// Release one descriptor entry, dropping a pipe reference if it was one end.
-fn drop_entry(entry: FdEntry) {
-    match entry {
-        FdEntry::Pipe { id, read } => pipe_release(id, read),
-        FdEntry::Socket { connected, .. } => {
-            if connected {
-                with_network_interrupts(crate::net::tcp::close);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Install a pipe end in the first free slot.
-fn install_pipe(id: usize, read: bool) -> Result<usize, isize> {
-    let mut table = FDS.lock();
-    let Some(fd) = table.slots.iter().position(|slot| slot.is_none()) else {
-        return Err(ENOSPC);
-    };
-    table.slots[fd] = Some(FdEntry::Pipe { id, read });
-    Ok(fd)
-}
-
-/// Publish the new offset of an open file. A descriptor closed in between (only
-/// possible if the program itself did it, since one program runs at a time) is
-/// simply not found and the offset is dropped with it.
-fn set_offset(fd: usize, offset: u64) {
-    let mut table = FDS.lock();
-    if let Some(Some(FdEntry::File(file))) = table.slots.get_mut(fd) {
-        file.offset = offset;
-    }
-}
-
-/// Install a socket descriptor. The kernel stack owns one connection, so a
-/// second `socket()` while one descriptor is open is refused instead of
-/// pretending there is another socket: `ENOSPC` (the ABI's fd-space error).
-fn install_socket() -> Result<usize, isize> {
-    let mut table = FDS.lock();
-    for slot in table.slots.iter() {
-        if let Some(FdEntry::Socket { id, .. }) = slot {
-            let _ = id; // the stack's single socket id, kept for the record
-            return Err(ENOSPC);
-        }
-    }
-    for fd in 3..MAX_FDS {
-        if table.slots[fd].is_none() {
-            table.slots[fd] = Some(FdEntry::Socket {
-                id: 0,
-                connected: false,
-            });
-            return Ok(fd);
-        }
-    }
-    Err(ENOSPC)
-}
-
-/// Record that the socket on `fd` completed its handshake.
-fn mark_socket_connected(fd: usize) {
-    let mut table = FDS.lock();
-    if let Some(Some(FdEntry::Socket { connected, .. })) = table.slots.get_mut(fd) {
-        *connected = true;
-    }
-}
-
-/// Remove a descriptor from the table and return it, so its resources (an
-/// `Arc`, a socket's connection) are handled without the table lock held.
-fn take_entry(fd: usize) -> Option<FdEntry> {
-    let mut table = FDS.lock();
-    table.slots.get_mut(fd).and_then(|slot| slot.take())
-}
-
-/// Install a node in the first free slot at or above 3.
-fn install(node: Arc<dyn VfsNode>, flags: usize, dir: Option<DirSnapshot>) -> Result<usize, isize> {
-    let mut table = FDS.lock();
-    for fd in 3..MAX_FDS {
-        if table.slots[fd].is_none() {
-            table.slots[fd] = Some(FdEntry::File(FileHandle {
-                node,
-                offset: 0,
-                flags,
-                dir,
-            }));
-            return Ok(fd);
-        }
-    }
-    // The ABI's error list does not include EMFILE; ENOSPC is the kernel's
-    // honest "no space left" for "all 16 descriptors are open".
-    Err(ENOSPC)
+/// Record an override for the calling process.
+fn mode_set(ino: u64, mode: u16) -> Result<(), isize> {
+    let slot = crate::user::process::current_slot().ok_or(EBADF)?;
+    let mut tables = MODES.lock();
+    tables.rows.get_mut(slot).ok_or(EBADF)?.set(ino, mode)
 }
 
 // ─── dispatch ──────────────────────────────────────────────────────────────
@@ -971,6 +1073,16 @@ pub fn dispatch(frame: &mut TrapFrame) {
             Err(error) => error,
         },
         SYS_FUTEX => futex(frame.a0, frame.a1, frame.a2, frame.a3),
+        // `clone(0, 0, 0, 0)` is the native `fork` spelling. Any other argument
+        // value falls through to the thread form, which rejects flags 0. The
+        // guard must precede the generic arm: match arms are ordered.
+        SYS_CLONE if frame.a0 == 0 && frame.a1 == 0 && frame.a2 == 0 && frame.a3 == 0 => {
+            let result = crate::user::fork(frame);
+            if result > 0 {
+                FORKS.fetch_add(1, Ordering::Relaxed);
+            }
+            result
+        }
         SYS_CLONE => clone(frame.a0, frame.a1, frame.a2, frame.a3, frame.gp, frame.tp),
         SYS_SCHED_YIELD => {
             crate::task::scheduler::yield_now();
@@ -981,7 +1093,32 @@ pub fn dispatch(frame: &mut TrapFrame) {
             GETPIDS.fetch_add(1, Ordering::Relaxed);
             crate::user::process_id() as isize
         }
+        SYS_GETPPID => {
+            GETPPIDS.fetch_add(1, Ordering::Relaxed);
+            crate::user::parent_id() as isize
+        }
         SYS_GETTID => crate::user::thread_id() as isize,
+        SYS_FORK => {
+            let result = crate::user::fork(frame);
+            if result > 0 {
+                FORKS.fetch_add(1, Ordering::Relaxed);
+            }
+            result
+        }
+        SYS_EXECVE => match crate::user::execve(frame, frame.a0, frame.a1, frame.a2) {
+            Ok(()) => {
+                EXECS.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            Err(error) => error,
+        },
+        SYS_WAIT4 => {
+            let result = crate::user::wait4(frame.a0 as isize, frame.a1, frame.a2, frame.a3);
+            if result > 0 {
+                WAITS.fetch_add(1, Ordering::Relaxed);
+            }
+            result
+        }
         _ => {
             UNKNOWN.fetch_add(1, Ordering::Relaxed);
             ENOSYS
@@ -1008,14 +1145,14 @@ pub fn dispatch(frame: &mut TrapFrame) {
 
 /// `CLONE_VM`: share the address space (required).
 const CLONE_VM: usize = 0x0000_0100;
-/// `CLONE_FS`: share filesystem state. pagh has one run-wide cwd-less VFS view,
-/// so this flag is accepted and changes nothing.
+/// `CLONE_FS`: share filesystem state. pagh has one process-wide cwd-less VFS
+/// view, so this flag is accepted and changes nothing.
 const CLONE_FS: usize = 0x0000_0200;
 /// `CLONE_FILES`: share the descriptor table (required by the implementation,
 /// though the native contract only demands `VM|THREAD`).
 const CLONE_FILES: usize = 0x0000_0400;
-/// `CLONE_SIGHAND`: share signal handlers. Handlers are per run in pagh, so a
-/// `clone` child already shares them; this flag is accepted and changes
+/// `CLONE_SIGHAND`: share signal handlers. Handlers are per process in pagh, so
+/// a `clone` child already shares them; this flag is accepted and changes
 /// nothing.
 const CLONE_SIGHAND: usize = 0x0000_0800;
 /// `CLONE_THREAD`: put the new task in the caller's thread group (required).
@@ -1100,7 +1237,15 @@ fn clone(flags: usize, stack: usize, entry: usize, arg: usize, gp: usize, tp: us
     if !crate::user::charge_thread() {
         return EINVAL;
     }
-    match crate::task::scheduler::spawn_user_thread(entry, stack, arg, gp, tp, run_id) {
+    match crate::task::scheduler::spawn_user_thread(
+        entry,
+        stack,
+        arg,
+        gp,
+        tp,
+        run_id,
+        crate::arch::riscv64::mmu::read_satp(),
+    ) {
         Some(tid) => {
             CLONES.fetch_add(1, Ordering::Relaxed);
             tid as isize
@@ -1229,6 +1374,7 @@ fn read(fd: usize, buf: usize, len: usize) -> isize {
     match lookup(fd) {
         Ok(OpenFd::ConsoleIn) => read_console(buf),
         Ok(OpenFd::ConsoleOut) => EBADF,
+        Ok(OpenFd::Unsupported) => ENOTSUP,
         Ok(OpenFd::Pipe { id, read }) => read_pipe(id, read, buf, len),
         Ok(OpenFd::Socket { id, connected }) => {
             let _ = id;
@@ -1313,6 +1459,7 @@ fn write(fd: usize, buf: usize, len: usize) -> isize {
     match lookup(fd) {
         Ok(OpenFd::ConsoleIn) => EBADF,
         Ok(OpenFd::ConsoleOut) => write_console(buf, len),
+        Ok(OpenFd::Unsupported) => ENOTSUP,
         Ok(OpenFd::Pipe { id, read }) => write_pipe(id, read, buf, len),
         Ok(OpenFd::Socket { id, connected }) => {
             let _ = id;
@@ -1512,9 +1659,9 @@ fn write_pipe(id: usize, read: bool, buf: usize, len: usize) -> isize {
 
 /// `pipe2(*fds, flags)`: create a pipe and install its two ends.
 ///
-/// `flags` must be 0: `O_NONBLOCK` is already the only mode and `O_CLOEXEC` has
-/// no meaning without `exec`, so a bit the ABI does not implement is `-EINVAL`
-/// rather than silently dropped. The read end is installed first, the write end
+/// `flags` must be 0: `O_NONBLOCK` is already the only mode and `O_CLOEXEC` is
+/// not implemented (it would need a close-on-exec flag in `FdEntry`), so a bit
+/// the ABI does not implement is `-EINVAL` rather than silently dropped. The read end is installed first, the write end
 /// second; if either the second slot or the `fds` write fails, both references
 /// are dropped, so a failed `pipe2` leaves neither a descriptor nor a ring.
 fn pipe2(fds: usize, flags: usize) -> isize {
@@ -1561,11 +1708,20 @@ fn pipe2(fds: usize, flags: usize) -> isize {
 
 /// Clone one descriptor table entry, if it exists.
 fn clone_slot(fd: usize) -> Option<FdEntry> {
-    FDS.lock()
-        .slots
-        .get(fd)
-        .and_then(|slot| slot.as_ref())
-        .cloned()
+    with_fds(|table| table.slots.get(fd).and_then(|slot| slot.as_ref()).cloned()).flatten()
+}
+
+/// Publish `entry` in `fd` of the calling process's row.
+fn put_slot(fd: usize, entry: FdEntry) -> bool {
+    with_fds(|table| {
+        if let Some(slot) = table.slots.get_mut(fd) {
+            *slot = Some(entry);
+            true
+        } else {
+            false
+        }
+    })
+    .unwrap_or(false)
 }
 
 /// `dup(oldfd)`: duplicate into the first free descriptor slot.
@@ -1583,7 +1739,9 @@ fn dup(oldfd: usize) -> isize {
         drop_entry(entry);
         return ENOSPC;
     };
-    FDS.lock().slots[fd] = Some(entry);
+    if !put_slot(fd, entry) {
+        return EBADF;
+    }
     DUPS.fetch_add(1, Ordering::Relaxed);
     fd as isize
 }
@@ -1609,7 +1767,9 @@ fn dup2(oldfd: usize, newfd: usize, flags: usize) -> isize {
         return newfd as isize;
     }
     let previous = take_slot(newfd);
-    FDS.lock().slots[newfd] = Some(entry);
+    if !put_slot(newfd, entry) {
+        return EBADF;
+    }
     if let Some(previous) = previous {
         drop_entry(previous);
     }
@@ -1685,6 +1845,7 @@ fn poll_one(fd: usize, events: i16) -> i16 {
             }
             revents
         }
+        Ok(OpenFd::Unsupported) => POLLNVAL,
         Ok(OpenFd::Socket { connected, .. }) => {
             if !connected {
                 return POLLERR;
@@ -2109,6 +2270,7 @@ fn stream_errno(error: tcp::Error) -> isize {
 fn connect(fd: usize, address: usize, length: usize) -> isize {
     let connected = match lookup(fd) {
         Ok(OpenFd::Socket { connected, .. }) => connected,
+        Ok(OpenFd::Unsupported) => return ENOTSUP,
         Ok(_) => return ENOTSOCK,
         Err(error) => return error,
     };
@@ -2155,6 +2317,7 @@ fn send_socket(
     }
     let connected = match lookup(fd) {
         Ok(OpenFd::Socket { connected, .. }) => connected,
+        Ok(OpenFd::Unsupported) => return ENOTSUP,
         Ok(_) => return ENOTSOCK,
         Err(error) => return error,
     };
@@ -2196,6 +2359,7 @@ fn recv_socket(
     }
     let connected = match lookup(fd) {
         Ok(OpenFd::Socket { connected, .. }) => connected,
+        Ok(OpenFd::Unsupported) => return ENOTSUP,
         Ok(_) => return ENOTSOCK,
         Err(error) => return error,
     };
@@ -2318,6 +2482,7 @@ fn shutdown(fd: usize, how: usize) -> isize {
     }
     let connected = match lookup(fd) {
         Ok(OpenFd::Socket { connected, .. }) => connected,
+        Ok(OpenFd::Unsupported) => return ENOTSUP,
         Ok(_) => return ENOTSOCK,
         Err(error) => return error,
     };
@@ -2338,6 +2503,7 @@ fn shutdown(fd: usize, how: usize) -> isize {
 fn setsockopt(fd: usize, level: usize, name: usize, value: usize, length: usize) -> isize {
     match lookup(fd) {
         Ok(OpenFd::Socket { .. }) => {}
+        Ok(OpenFd::Unsupported) => return ENOTSUP,
         Ok(_) => return ENOTSOCK,
         Err(error) => return error,
     }
@@ -2375,6 +2541,7 @@ fn setsockopt(fd: usize, level: usize, name: usize, value: usize, length: usize)
 fn getsockopt(fd: usize, level: usize, name: usize, value: usize, length: usize) -> isize {
     match lookup(fd) {
         Ok(OpenFd::Socket { .. }) => {}
+        Ok(OpenFd::Unsupported) => return ENOTSUP,
         Ok(_) => return ENOTSOCK,
         Err(error) => return error,
     }
@@ -2566,8 +2733,11 @@ fn close(fd: usize) -> isize {
 fn lseek(fd: usize, offset: usize, whence: usize) -> isize {
     let delta = offset as isize as i128;
     match lookup(fd) {
-        Ok(OpenFd::ConsoleIn) | Ok(OpenFd::ConsoleOut) | Ok(OpenFd::Pipe { .. }) => EINVAL,
-        Ok(OpenFd::ConsoleIn) | Ok(OpenFd::ConsoleOut) | Ok(OpenFd::Socket { .. }) => EINVAL,
+        Ok(OpenFd::Unsupported) => ENOTSUP,
+        Ok(OpenFd::ConsoleIn)
+        | Ok(OpenFd::ConsoleOut)
+        | Ok(OpenFd::Pipe { .. })
+        | Ok(OpenFd::Socket { .. }) => EINVAL,
         Ok(OpenFd::File { node, offset, .. }) => {
             if node.is_directory() {
                 return EINVAL;
@@ -2611,6 +2781,7 @@ const KIND_OTHER: u32 = 3;
 fn fstat(fd: usize, pointer: usize) -> isize {
     let (kind, mode, size, ino) = match lookup(fd) {
         Ok(OpenFd::ConsoleIn) | Ok(OpenFd::ConsoleOut) => (KIND_OTHER, 0o644u32, 0u64, 0u64),
+        Ok(OpenFd::Unsupported) => return ENOTSUP,
         // A pipe reports `OTHER`, no inode and the bytes currently queued as
         // its size: there is no filesystem object behind it, and the ABI's
         // `Stat` is the only metadata query a pipe has.
@@ -2625,9 +2796,7 @@ fn fstat(fd: usize, pointer: usize) -> isize {
                 .map_or(0, |pipe| pipe.len as u64),
             0u64,
         ),
-        Ok(OpenFd::ConsoleIn) | Ok(OpenFd::ConsoleOut) | Ok(OpenFd::Socket { .. }) => {
-            (KIND_OTHER, 0o644u32, 0u64, 0u64)
-        }
+        Ok(OpenFd::Socket { .. }) => (KIND_OTHER, 0o644u32, 0u64, 0u64),
         Ok(OpenFd::File { node, .. }) => {
             let is_dir = node.is_directory();
             let is_link = node.is_symlink();
@@ -2694,8 +2863,11 @@ fn getdents64(fd: usize, buf: usize, len: usize) -> isize {
     if buf.checked_add(len).is_none() {
         return fault();
     }
-    let mut table = FDS.lock();
-    let Some(Some(FdEntry::File(file))) = table.slots.get_mut(fd) else {
+    let Some(slot) = crate::user::process::current_slot() else {
+        return EBADF;
+    };
+    let mut tables = FDS.lock();
+    let Some(Some(FdEntry::File(file))) = tables.rows[slot].slots.get_mut(fd) else {
         return EBADF;
     };
     let Some(dir) = file.dir.as_mut() else {
@@ -3040,7 +3212,7 @@ fn fchmodat(dirfd: usize, path_ptr: usize, mode: usize, flags: usize) -> isize {
     if ino == 0 {
         return ENOTSUP;
     }
-    match MODES.lock().set(ino, (mode & 0o7777) as u16) {
+    match mode_set(ino, (mode & 0o7777) as u16) {
         Ok(()) => {
             CHMODS.fetch_add(1, Ordering::Relaxed);
             0
@@ -3063,8 +3235,11 @@ fn ftruncate(fd: usize, length: usize) -> isize {
         return EINVAL;
     }
     match lookup(fd) {
-        Ok(OpenFd::ConsoleIn) | Ok(OpenFd::ConsoleOut) | Ok(OpenFd::Pipe { .. }) => EINVAL,
-        Ok(OpenFd::ConsoleIn) | Ok(OpenFd::ConsoleOut) | Ok(OpenFd::Socket { .. }) => EINVAL,
+        Ok(OpenFd::Unsupported) => ENOTSUP,
+        Ok(OpenFd::ConsoleIn)
+        | Ok(OpenFd::ConsoleOut)
+        | Ok(OpenFd::Pipe { .. })
+        | Ok(OpenFd::Socket { .. }) => EINVAL,
         Ok(OpenFd::File { node, flags, .. }) => {
             if node.is_directory() {
                 return EISDIR;

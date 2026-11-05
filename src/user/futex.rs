@@ -1,4 +1,4 @@
-//! The futex wait queue: static storage, a `(run, uaddr)` key and the scheduler
+//! The futex wait queue: static storage, a `(pid, uaddr)` key and the scheduler
 //! block/wake pair.
 //!
 //! This is the minimum a pthread-style implementation needs: `FUTEX_WAIT`
@@ -7,20 +7,20 @@
 //! no requeue, no priority inheritance and no PI futex — those operations are
 //! `-ENOSYS` in the syscall layer, not half-implemented here.
 //!
-//! # Why `(run, uaddr)` and not `uaddr` alone
+//! # Why `(pid, uaddr)` and not `uaddr` alone
 //!
-//! User virtual addresses are process-relative only in name: this kernel has one
-//! address space, and the next program will map a stack or a `mmap` page at the
-//! same virtual address. Keying on the run id (monotonic for the boot, see
-//! `user::NEXT_RUN_ID`) makes a waiter left behind by a killed run invisible to
-//! the next one; [`clear_run`] additionally drops them at teardown so the fixed
-//! table cannot fill up across `selftest` passes.
+//! User virtual addresses are process-relative: two processes can map a stack or
+//! a `mmap` page at the same virtual address, and a forked child inherits the
+//! parent's page layout. Keying on the pid (monotonic for the boot) makes a
+//! waiter left behind by a killed process invisible to the next one;
+//! [`clear_run`] additionally drops them at teardown and `execve` drops them with
+//! the old image, so the fixed table cannot fill up across `selftest` passes.
 //!
 //! # Storage and limits
 //!
 //! [`MAX_WAITERS`] (`32`) waiter slots, at most [`MAX_ADDRESSES`] (`16`)
-//! distinct user addresses at a time (across all runs, though only one run can be
-//! live). Each waiter stores only `run`, `uaddr` and the scheduler tid — 32
+//! distinct user addresses at a time (across all live processes). Each waiter
+//! stores only the pid, `uaddr` and the scheduler tid — 32
 //! entries of a few machine words, no heap and no allocation on the wait path.
 //! A full waiter table is `-EAGAIN`, a seventeenth address is `-ENOMEM`; both are
 //! checked before the blocking switch, so a failed wait changes nothing.

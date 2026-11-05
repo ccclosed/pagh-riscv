@@ -40,8 +40,10 @@
 //! allocates tables is not a short section either. Lock order is address space,
 //! then frame allocator; the frame allocator never calls back here.
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::arch::riscv64::csr;
-use crate::arch::riscv64::mmu::{self, Flags, PageTable};
+use crate::arch::riscv64::mmu::{self, Flags, PageTable, PTE_U};
 use crate::memory::pmm;
 use crate::memory::FRAME_SIZE;
 use crate::sync::Spinlock;
@@ -137,6 +139,41 @@ pub struct Snapshot {
     pub device_pages: usize,
 }
 
+/// A process address space: its own Sv39 root, the `satp` value that selects
+/// it and the ASID that tags its TLB entries.
+///
+/// The root holds a *copy* of every supervisor mapping the kernel had at
+/// creation time (RAM identity map, UART, PLIC and virtio windows) plus only
+/// the user pages its process owns. Two spaces therefore never share a user
+/// mapping, an ASID or a root frame; [`free_user_space`] returns the tables,
+/// while the process layer owns and frees the user frames themselves.
+#[derive(Clone, Copy)]
+pub struct UserSpace {
+    /// Physical address of the root table.
+    pub root: usize,
+    /// `satp` value (Sv39, this ASID, this root).
+    pub satp: usize,
+    /// Nonzero TLB tag; ASID 0 is reserved for the kernel.
+    pub asid: usize,
+}
+
+/// Next ASID handed to a new process. Monotonic and never reused until the
+/// 16-bit field wraps; every switch also flushes, which is what makes a wrap
+/// harmless. ASID 0 is the kernel's.
+static NEXT_ASID: AtomicUsize = AtomicUsize::new(1);
+
+/// Claim the next ASID. The caller must be creating an address space.
+fn next_asid() -> usize {
+    let asid = NEXT_ASID.fetch_add(1, Ordering::Relaxed);
+    let asid = 1 + (asid - 1) % mmu::SATP_ASID_MASK;
+    if asid == 1 {
+        // The tag space wrapped: an ASID may still name a translation from a
+        // much older address space. Empty the TLB before handing the tag out.
+        mmu::sfence_vma_all();
+    }
+    asid
+}
+
 /// Run `f` with the address space locked and interrupts masked.
 ///
 /// The masking is the point, not decoration: the lock is not reentrant, this
@@ -147,6 +184,35 @@ pub struct Snapshot {
 /// another masked section is harmless.
 fn with_space<R>(f: impl FnOnce(&mut Space) -> R) -> R {
     csr::without_interrupts(|| f(&mut SPACE.lock()))
+}
+
+/// The root the hart is translating through, or the kernel root before the map
+/// is active.
+///
+/// Read from `satp`, not from `Space`, because a process space is installed by
+/// the scheduler and the kernel root is just the one that happens to have ASID
+/// 0. Every caller holds the address-space lock.
+fn active_root_locked(space: &Space) -> usize {
+    if mmu::paging_enabled() {
+        mmu::satp_root(mmu::read_satp())
+    } else {
+        space.root
+    }
+}
+
+/// The root the hart is translating through right now.
+pub fn active_root() -> usize {
+    with_space(|space| active_root_locked(space))
+}
+
+/// The kernel's own root table (ASID 0), or `0` before [`init`].
+pub fn kernel_root() -> usize {
+    with_space(|space| space.root)
+}
+
+/// The `satp` value for the kernel address space.
+pub fn kernel_satp() -> usize {
+    mmu::satp_for(kernel_root())
 }
 
 /// Build the kernel address space and turn it on.
@@ -186,9 +252,9 @@ pub fn init(
     let mut space = Space::new();
     space.root = root;
     let split = kernel_end.clamp(ram_start, ram_end);
-    install_range(&mut space, ram_start, split, Flags::kernel_rwx())?;
+    install_range(&mut space, root, ram_start, split, Flags::kernel_rwx())?;
     if split < ram_end {
-        install_range(&mut space, split, ram_end, Flags::kernel_rw())?;
+        install_range(&mut space, root, split, ram_end, Flags::kernel_rw())?;
     }
     for &(base, length) in devices {
         if length == 0 {
@@ -198,7 +264,7 @@ pub fn init(
         // still owns the page it touches.
         let start = base & !(FRAME_SIZE - 1);
         let end = (base + length + FRAME_SIZE - 1) & !(FRAME_SIZE - 1);
-        install_range(&mut space, start, end, Flags::device_rw())?;
+        install_range(&mut space, root, start, end, Flags::device_rw())?;
         space.device_pages += (end - start) / FRAME_SIZE;
     }
     space.identity = (ram_start, ram_end);
@@ -223,13 +289,14 @@ pub fn init(
 /// Map `[start, end)` identity (`va == pa`) with `flags`, one page at a time.
 fn install_range(
     space: &mut Space,
+    root: usize,
     start: usize,
     end: usize,
     flags: Flags,
 ) -> Result<(), MapError> {
     let mut address = start;
     while address < end {
-        install(space, address, address, flags)?;
+        install(space, root, address, address, flags)?;
         address += FRAME_SIZE;
     }
     Ok(())
@@ -239,11 +306,17 @@ fn install_range(
 ///
 /// Called with the space already owned by the caller — either the local `Space`
 /// of [`init`] or the locked one from [`map`].
-fn install(space: &mut Space, va: usize, pa: usize, flags: Flags) -> Result<(), MapError> {
-    if space.root == 0 {
+fn install(
+    space: &mut Space,
+    root: usize,
+    va: usize,
+    pa: usize,
+    flags: Flags,
+) -> Result<(), MapError> {
+    if root == 0 {
         return Err(MapError::NotInitialised);
     }
-    let mut table = space.root as *mut PageTable;
+    let mut table = root as *mut PageTable;
     // The two levels that can create a table, and the entry each new table was
     // linked from, so a failure can undo exactly what it did: `map` promises
     // "nothing changed" when it returns an error, and a walk that leaks frames on
@@ -292,7 +365,10 @@ fn install(space: &mut Space, va: usize, pa: usize, flags: Flags) -> Result<(), 
     // on `va`. The volatile store, plus the `sfence.vma` in `map` (or the one in
     // `activate`, during `init`), is what publishes it to the walker.
     unsafe { PageTable::set_entry(table, index, mmu::pte_leaf(pa, flags)) };
-    space.mappings += 1;
+    // The report line counts the *kernel* map; a process root is private.
+    if root == space.root {
+        space.mappings += 1;
+    }
     Ok(())
 }
 
@@ -317,12 +393,23 @@ fn rollback(
     error
 }
 
-/// Map one 4 KiB page. `Err` when the address is unusable or already mapped.
+/// Map one 4 KiB page in the *active* address space.
 ///
 /// With the map active the translation of `va` is flushed before returning, so
 /// the caller can use the address immediately; on error nothing changed, and the
 /// flush is skipped because there is nothing new to publish.
 pub fn map(va: usize, pa: usize, flags: Flags) -> Result<(), MapError> {
+    let root = active_root();
+    map_in(root, va, pa, flags)
+}
+
+/// Map one 4 KiB page in the address space whose root is `root`.
+///
+/// This is the primitive a process-space builder uses while the parent's (or the
+/// kernel's) space is still the active one. The walk and every table it creates
+/// belong to `root`; the TLB is only flushed when `root` is what the hart is
+/// translating through right now.
+pub fn map_in(root: usize, va: usize, pa: usize, flags: Flags) -> Result<(), MapError> {
     if va % FRAME_SIZE != 0 || pa % FRAME_SIZE != 0 {
         return Err(MapError::Misaligned(if va % FRAME_SIZE != 0 {
             va
@@ -333,14 +420,15 @@ pub fn map(va: usize, pa: usize, flags: Flags) -> Result<(), MapError> {
     if !mmu::is_canonical(va) {
         return Err(MapError::NotCanonical(va));
     }
-    let result = with_space(|space| install(space, va, pa, flags));
-    if result.is_ok() {
+    let active = active_root();
+    let result = with_space(|space| install(space, root, va, pa, flags));
+    if result.is_ok() && root == active {
         mmu::sfence_vma_page(va);
     }
     result
 }
 
-/// Replace the permission bits of the mapping at `va`, keeping its frame.
+/// Replace the permission bits of the mapping at `va` in the active space.
 ///
 /// This is the `mprotect` half of the map: the physical address in the leaf is
 /// preserved (only the flags half is rewritten), so a caller can narrow or widen
@@ -352,14 +440,27 @@ pub fn map(va: usize, pa: usize, flags: Flags) -> Result<(), MapError> {
 /// A missing page is [`MapError::NotMapped`] and a superpage is refused rather
 /// than half-updated. Nothing changes on error.
 pub fn protect(va: usize, flags: Flags) -> Result<(), MapError> {
+    let root = active_root();
+    let result = protect_in(root, va, flags);
+    if result.is_ok() && root == active_root() {
+        // Without this a freshly executable page may be fetched from a stale
+        // instruction cache; `fence.i` is cheap and unconditional, like the flush.
+        mmu::fence_i();
+    }
+    result
+}
+
+/// [`protect`] for an explicit root.
+pub fn protect_in(root: usize, va: usize, flags: Flags) -> Result<(), MapError> {
     if va % FRAME_SIZE != 0 {
         return Err(MapError::Misaligned(va));
     }
-    with_space(|space| {
-        if space.root == 0 {
+    let active = active_root();
+    with_space(|_space| {
+        if root == 0 {
             return Err(MapError::NotInitialised);
         }
-        let mut table = space.root;
+        let mut table = root;
         for level in (1..mmu::LEVELS).rev() {
             // SAFETY: `table` is the live root or a table reached through a
             // valid entry; `vpn` keeps the index in range.
@@ -385,24 +486,29 @@ pub fn protect(va: usize, flags: Flags) -> Result<(), MapError> {
         unsafe { PageTable::set_entry(table as *mut PageTable, index, mmu::pte_leaf(pa, flags)) };
         Ok(())
     })?;
-    mmu::sfence_vma_page(va);
-    // Without this a freshly executable page may be fetched from a stale
-    // instruction cache; `fence.i` is cheap and unconditional, like the flush.
-    mmu::fence_i();
+    if root == active {
+        mmu::sfence_vma_page(va);
+    }
     Ok(())
 }
 
-/// Remove the mapping at `va`, returning the physical address it pointed at.
+/// Remove the mapping at `va` in the active address space.
 ///
 /// Tables that become empty are handed back to the frame allocator, so a
 /// map/unmap pair leaves the pool exactly as it found it — the property the
 /// self-test's free-frame ledger measures.
 pub fn unmap(va: usize) -> Result<usize, MapError> {
+    unmap_in(active_root(), va)
+}
+
+/// [`unmap`] for an explicit root.
+pub fn unmap_in(root: usize, va: usize) -> Result<usize, MapError> {
     if va % FRAME_SIZE != 0 {
         return Err(MapError::Misaligned(va));
     }
-    with_space(|space| {
-        if space.root == 0 {
+    let active = active_root();
+    let result = with_space(|space| {
+        if root == 0 {
             return Err(MapError::NotInitialised);
         }
         // The path down: `tables[depth]`, and the index in its parent that
@@ -410,7 +516,7 @@ pub fn unmap(va: usize) -> Result<usize, MapError> {
         let mut tables = [0usize; mmu::LEVELS];
         let mut indices = [0usize; mmu::LEVELS];
         let mut depth = 0usize;
-        tables[0] = space.root;
+        tables[0] = root;
         for level in (1..mmu::LEVELS).rev() {
             let index = mmu::vpn(va, level);
             // SAFETY: `tables[depth]` is the root or a table reached through a
@@ -436,7 +542,9 @@ pub fn unmap(va: usize) -> Result<usize, MapError> {
         let pa = mmu::pte_address(leaf);
         // SAFETY: the entry is live and this walk owns the tables it reaches.
         unsafe { PageTable::set_entry(tables[depth] as *mut PageTable, index, 0) };
-        space.mappings -= 1;
+        if root == space.root {
+            space.mappings -= 1;
+        }
 
         // Free every table that just became empty, leaf first. The root is never
         // freed: `depth > 0` is the guard, and it is the only thing stopping this
@@ -449,9 +557,116 @@ pub fn unmap(va: usize) -> Result<usize, MapError> {
             pmm::free_frame(frame);
             depth -= 1;
         }
-        mmu::sfence_vma_page(va);
         Ok(pa)
+    });
+    if result.is_ok() && root == active {
+        mmu::sfence_vma_page(va);
+    }
+    result
+}
+
+/// Create a process address space: a fresh root holding a copy of every
+/// supervisor mapping the kernel currently has.
+///
+/// Only non-user leaves are copied, so a user page that a selftest loaded into
+/// the kernel root (the loader's accept/refuse matrix) can never leak into a
+/// process. User pages are added afterwards by the process loader; two process
+/// roots share no table frame, no ASID and no user frame.
+///
+/// On failure every table this call allocated is returned to the frame pool and
+/// the PMM ledger is unchanged.
+pub fn create_user_space() -> Result<UserSpace, MapError> {
+    let asid = next_asid();
+    let root = with_space(|space| {
+        if space.root == 0 {
+            return Err(MapError::NotInitialised);
+        }
+        let Some(root) = pmm::alloc_frame() else {
+            return Err(MapError::OutOfFrames);
+        };
+        // SAFETY: a fresh PMM frame, aligned and owned by this call.
+        unsafe { PageTable::zeroed_at(root) };
+        if let Err(error) = clone_kernel_tree(space.root, root, mmu::LEVELS - 1) {
+            free_tables(root);
+            return Err(error);
+        }
+        Ok(root)
+    })?;
+    Ok(UserSpace {
+        root,
+        satp: mmu::satp_for_asid(root, asid),
+        asid,
     })
+}
+
+/// Copy every supervisor mapping of `src` into `dst`, allocating the table
+/// structure `dst` needs.
+///
+/// Called with the address-space lock held. A failure leaves the partial tree in
+/// `dst`; [`create_user_space`] frees it.
+fn clone_kernel_tree(src: usize, dst: usize, level: usize) -> Result<(), MapError> {
+    for index in 0..mmu::ENTRIES_PER_TABLE {
+        // SAFETY: `src` and `dst` are live tables owned by this walk; `index` is
+        // in range.
+        let entry = unsafe { PageTable::entry(src as *const PageTable, index) };
+        if !mmu::pte_is_valid(entry) {
+            continue;
+        }
+        if mmu::pte_is_leaf(entry) {
+            // `U` marks a page a process owns; the process loader creates those
+            // separately in the new root.
+            if entry & PTE_U != 0 {
+                continue;
+            }
+            // SAFETY: `dst` is live and the entry is free in a fresh table.
+            unsafe { PageTable::set_entry(dst as *mut PageTable, index, entry) };
+            continue;
+        }
+        if level == 0 {
+            // A table entry at the leaf level is not a shape this kernel makes.
+            return Err(MapError::Superpage(0));
+        }
+        let Some(frame) = pmm::alloc_frame() else {
+            return Err(MapError::OutOfFrames);
+        };
+        // SAFETY: fresh frame from the allocator, aligned and owned here. The
+        // walker needs a zeroed table before its first entry is linked.
+        unsafe { PageTable::zeroed_at(frame) };
+        // SAFETY: `dst` is live and the entry is free in a fresh table.
+        unsafe { PageTable::set_entry(dst as *mut PageTable, index, mmu::pte_table(frame)) };
+        clone_kernel_tree(mmu::pte_address(entry), frame, level - 1)?;
+    }
+    Ok(())
+}
+
+/// Return a process address space's table frames to the PMM.
+///
+/// The caller must have unmapped every user page first; this function frees the
+/// table structure only and never the frames a leaf points at (the kernel's
+/// identity map is one of those leaves and must survive). The kernel root is
+/// refused: it is never a process space.
+pub fn free_user_space(root: usize) {
+    if root == 0 {
+        return;
+    }
+    let kernel = kernel_root();
+    if root == kernel {
+        return;
+    }
+    with_space(|_space| free_tables(root));
+}
+
+/// Free `table` and every table below it, bottom-up.
+fn free_tables(table: usize) {
+    for index in 0..mmu::ENTRIES_PER_TABLE {
+        // SAFETY: `table` is a live table owned by this teardown; `index` is in
+        // range.
+        let entry = unsafe { PageTable::entry(table as *const PageTable, index) };
+        if mmu::pte_is_valid(entry) && !mmu::pte_is_leaf(entry) {
+            free_tables(mmu::pte_address(entry));
+        }
+    }
+    pmm::free_frame(table);
 }
 
 /// True when every entry of the table at `table` is absent.
@@ -466,33 +681,46 @@ fn table_is_empty(table: usize) -> bool {
     true
 }
 
-/// The physical address `va` translates to, or `None` when it is not mapped.
+/// The physical address `va` translates to in the active space, or `None`.
 ///
 /// Read-only, but it takes the same lock and mask as the writers: a trap must not
 /// be able to walk the tables in the middle of a leaf being installed, and the
 /// lock is not reentrant.
 pub fn translate(va: usize) -> Option<usize> {
-    with_space(|space| walk(space, va).map(|(pa, _)| pa))
+    let root = active_root();
+    translate_in(root, va)
 }
 
-/// How `va` is mapped — the permission bits of its leaf entry — or `None` when it
-/// is not mapped.
+/// [`translate`] for an explicit root.
+pub fn translate_in(root: usize, va: usize) -> Option<usize> {
+    with_space(|_space| walk(root, va).map(|(pa, _)| pa))
+}
+
+/// How `va` is mapped in the active space — the permission bits of its leaf
+/// entry — or `None` when it is not mapped.
 ///
 /// The companion to [`translate`]: one answers "where does this go", this one
 /// "what may be done with it", and together they are what makes the map's W^X
 /// claim checkable from outside the module instead of asserted in a comment.
 pub fn flags(va: usize) -> Option<Flags> {
-    with_space(|space| {
-        walk(space, va).map(|(_, entry)| Flags::from_bits(mmu::pte_permissions(entry)))
+    let root = active_root();
+    flags_in(root, va)
+}
+
+/// [`flags`] for an explicit root.
+pub fn flags_in(root: usize, va: usize) -> Option<Flags> {
+    with_space(|_space| {
+        walk(root, va).map(|(_, entry)| Flags::from_bits(mmu::pte_permissions(entry)))
     })
 }
 
-/// Walk the tables to the leaf covering `va`: `(physical address, entry bits)`.
-fn walk(space: &Space, va: usize) -> Option<(usize, u64)> {
-    if space.root == 0 {
+/// Walk the tables of `root` to the leaf covering `va`: `(physical address,
+/// entry bits)`.
+fn walk(root: usize, va: usize) -> Option<(usize, u64)> {
+    if root == 0 {
         return None;
     }
-    let mut table = space.root;
+    let mut table = root;
     for level in (1..mmu::LEVELS).rev() {
         // SAFETY: `table` is the live root or a table reached through a valid
         // entry; `vpn` keeps the index in range.
