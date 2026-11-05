@@ -881,7 +881,7 @@ SHA-256 из индекса**. Это целостность, не аутент�
    `PPKG0001`, `manifest_len`, `payload_len` и манифест; сумма длин обязана
    совпасть с размером из индекса, `manifest_len ≤ 2 KiB`,
    `payload_len ≤ 8 MiB`, `name` манифеста — с запрошенным; у bundle'а не
-больше 32 команд.
+больше 160 команд.
 5. `kind=app` копирует payload в `/mnt/bin/<name>`; `kind=applet-bundle` — в
    `/mnt/bin/paghbox` и создаёт симлинки из `commands`. Манифест
    `/mnt/pkg/<name>.manifest` пишется последним.

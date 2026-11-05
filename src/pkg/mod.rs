@@ -65,11 +65,13 @@ const INDEX_LINE_CAPACITY: usize = 2048;
 /// Manifest bytes read into one stack buffer. The format has no explicit
 /// ceiling; 2 KiB is generous for the keys the installer reads.
 const MANIFEST_CAPACITY: usize = 2048;
-const COMMANDS_CAPACITY: usize = 512;
-/// Command names honoured from one `applet-bundle` manifest.
-const MAX_COMMANDS: usize = 32;
+const COMMANDS_CAPACITY: usize = 1024;
+/// Command names honoured from one `applet-bundle` manifest. The bundle
+/// catalogue targets 120 applets, so 160 leaves headroom without a heap
+/// allocation in the trap-adjacent install path.
+const MAX_COMMANDS: usize = 160;
 /// A stored manifest is a small text file under `/mnt/pkg`.
-const STORED_MANIFEST_CAPACITY: usize = 512;
+const STORED_MANIFEST_CAPACITY: usize = 1024;
 /// Stream chunk: the same 4 KiB the shell's `cat`/`cp` use and the TCP client's
 /// receive buffer holds.
 const IO_CHUNK: usize = 4096;

@@ -393,7 +393,7 @@ pkg remove hello                             # pkg: removed hello
 (there is no TLS yet)» на `https://` и не притворяется apt.
 
 Ограничения MVP: до 64 пакетов в индексе, IPv4-хост в URL (без DNS), один
-пакет за раз, `payload ≤ 8 MiB`, до 32 команд в `applet-bundle`, `/mnt`
+пакет за раз, `payload ≤ 8 MiB`, до 160 команд в `applet-bundle`, `/mnt`
 обязателен. `pkg` без аргументов
 печатает usage; `pkg selftest` проверяет SHA-256 по векторам FIPS.
 
