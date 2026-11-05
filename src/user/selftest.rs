@@ -492,6 +492,8 @@ fn user_abi_syscalls(_buf: &mut Vec<u8>) -> Outcome {
         || stats.closes <= stats_before.closes
         || stats.fstats <= stats_before.fstats
         || stats.sleeps <= stats_before.sleeps
+        || stats.sockets <= stats_before.sockets
+        || stats.sockopts <= stats_before.sockopts
     {
         crate::kprintln!(
             "[selftest] user: ABI counters did not move as expected (before {:?}, after {:?})",

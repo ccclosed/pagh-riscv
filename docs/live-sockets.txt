@@ -1,0 +1,222 @@
+# Live BSD-socket acceptance for pagh-riscv
+# kernel: /home/oleg/pagh-riscv-net/target/riscv64gc-unknown-none-elf/debug/pagh
+# http_get: /home/oleg/pagh-api-sock/target/riscv64gc-unknown-none-elf/release/examples/http_get (134976 bytes)
+# host server: 127.0.0.1:8000 (guest reachable as 10.0.2.2:8000)
+
+== format boot ==
+
+OpenSBI v1.7
+   ____                    _____ ____ _____
+  / __ \                  / ____|  _ \_   _|
+ | |  | |_ __   ___ _ __ | (___ | |_) || |
+ | |  | | '_ \ / _ \ '_ \ \___ \|  _ < | |
+ | |__| | |_) |  __/ | | |____) | |_) || |_
+  \____/| .__/ \___|_| |_|_____/|____/_____|
+        | |
+        |_|
+
+Platform Name               : riscv-virtio,qemu
+Platform Features           : medeleg
+Platform HART Count         : 1
+Platform IPI Device         : aclint-mswi
+Platform Timer Device       : aclint-mtimer @ 10000000Hz
+Platform Console Device     : uart8250
+Platform HSM Device         : ---
+Platform PMU Device         : ---
+Platform Reboot Device      : syscon-reboot
+Platform Shutdown Device    : syscon-poweroff
+Platform Suspend Device     : ---
+Platform CPPC Device        : ---
+Firmware Base               : 0x80000000
+Firmware Size               : 317 KB
+Firmware RW Offset          : 0x40000
+Firmware RW Size            : 61 KB
+Firmware Heap Offset        : 0x46000
+Firmware Heap Size          : 37 KB (total), 2 KB (reserved), 11 KB (used), 23 KB (free)
+Firmware Scratch Size       : 4096 B (total), 1400 B (used), 2696 B (free)
+Runtime SBI Version         : 3.0
+Standard SBI Extensions     : time,rfnc,ipi,base,hsm,srst,pmu,dbcn,fwft,legacy,dbtr,sse
+Experimental SBI Extensions : none
+
+Domain0 Name                : root
+Domain0 Boot HART           : 0
+Domain0 HARTs               : 0*
+Domain0 Region00            : 0x0000000000100000-0x0000000000100fff M: (I,R,W) S/U: (R,W)
+Domain0 Region01            : 0x0000000010000000-0x0000000010000fff M: (I,R,W) S/U: (R,W)
+Domain0 Region02            : 0x0000000002000000-0x000000000200ffff M: (I,R,W) S/U: ()
+Domain0 Region03            : 0x0000000080040000-0x000000008004ffff M: (R,W) S/U: ()
+Domain0 Region04            : 0x0000000080000000-0x000000008003ffff M: (R,X) S/U: ()
+Domain0 Region05            : 0x000000000c400000-0x000000000c5fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region06            : 0x000000000c000000-0x000000000c3fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region07            : 0x0000000000000000-0xffffffffffffffff M: () S/U: (R,W,X)
+Domain0 Next Address        : 0x0000000080200000
+Domain0 Next Arg1           : 0x000000008fe00000
+Domain0 Next Mode           : S-mode
+Domain0 SysReset            : yes
+Domain0 SysSuspend          : yes
+
+Boot HART ID                : 0
+Boot HART Domain            : root
+Boot HART Priv Version      : v1.12
+Boot HART Base ISA          : rv64imafdch
+Boot HART ISA Extensions    : sstc,zicntr,zihpm,zicboz,zicbom,sdtrig,svadu
+Boot HART PMP Count         : 16
+Boot HART PMP Granularity   : 2 bits
+Boot HART PMP Address Bits  : 54
+Boot HART MHPM Info         : 16 (0x0007fff8)
+Boot HART Debug Triggers    : 2 triggers
+Boot HART MIDELEG           : 0x0000000000001666
+Boot HART MEDELEG           : 0x0000000000f4b509
+framebuffer  ramfb: no such fw_cfg item — serial console only
+
+========================================
+   pagh OS — RISC-V (RV64)
+========================================
+boot hart   0
+device tree 0x8fe00000
+memory      0x80000000..0x90000000 (256 MiB)
+timebase    10000000 Hz
+console     NS16550 @ 0x10000000
+pmm         62668/65536 frames free (256 MiB tracked), heap 0 KiB in 0 chunk(s)
+sv39        on, satp=0x8000000000080b32, identity 0x80000000..0x90000000 (RWX below 0x80b32000, RW above), 65548 pages, 12 device
+timer       10 ms ticks (100 Hz, timebase 10000000 Hz)
+plic        0xc000000 context 1, uart irq 10 (rx interrupt on)
+task        8 slots, 16 KiB stack + 4 KiB guard, quantum 8 ticks, timer clock
+virtio-blk: virtio-blk0 at 0x10006000: 131072 sectors (64 MiB)
+virtio-input: tablet at 0x10008000, abs X 0..32767, Y 0..32767
+fs          virtio-blk0 (131072 sectors, 65536 KiB)
+fs          virtio-blk0 is blank — formatting ext2
+fs          ext2 on /mnt, 4096 B blocks, 16250/16384 blocks free, 4085/4096 inodes free
+virtio-net: virtio-net0 at 0x10007000: MAC 52:54:00:12:34:56
+net         DHCP ip 10.0.2.15/255.255.255.0 gw 10.0.2.2 dns 10.0.2.3 lease 86400 s
+
+Type 'help' for the command list.
+
+pagh:rv64> halt
+halt: powering off
+
+== main boot ==
+ ls /mnt
+lost+found/
+http_get
+pagh:rv64>
+ selftest
+[selftest] free frames before: 62513 of 65536
+SELFTEST frames-roundtrip PASS
+SELFTEST frame-pattern PASS
+SELFTEST sv39-map-roundtrip PASS
+SELFTEST sv39-translate PASS
+[selftest] heap: 46957 B in use, 65536 B mapped, 1 chunk(s)
+SELFTEST heap-vec PASS
+heap: double free of 0x80bc6940 ignored
+heap: refusing to free 0x80319990: not a heap block
+SELFTEST heap-defenses PASS
+SELFTEST heap-chunks PASS
+SELFTEST SUMMARY: 7/7 passed
+[selftest] PMM hygiene: free frames 62513 -> 62513
+SELFTEST block-memblock PASS
+virtio-blk: request failed: 513 bytes is not a non-empty, whole-sector buffer
+virtio-blk: request failed: 0 bytes is not a non-empty, whole-sector buffer
+virtio-blk: request failed: sectors 131072..131073 are outside the 131072-sector device
+SELFTEST block-device PASS
+[selftest] input: tablet present, no framebuffer to point at
+SELFTEST input-device PASS
+[selftest] block heap: 38701 B used / 65536 B mapped (1 chunk(s)) before, 38701 B / 65536 B (1 chunk(s)) after
+SELFTEST block-heap-hygiene PASS
+SELFTEST SUMMARY (block): 4/4 passed
+[fs selftest] free frames before: 62513 of 65536
+SELFTEST ext2-format PASS
+SELFTEST ext2-write-read PASS
+SELFTEST ext2-dirs PASS
+SELFTEST ext2-truncate PASS
+SELFTEST ext2-symlink PASS
+SELFTEST ext2-rename PASS
+SELFTEST ext2-remount PASS
+SELFTEST ext2-free-space PASS
+SELFTEST ext2-corruption PASS
+SELFTEST ext2-policy PASS
+[fs selftest] on-device: virtio-blk0 root has 4 entries
+SELFTEST ext2-on-device PASS
+SELFTEST ext2 summary: 11/11 passed
+[fs selftest] PMM hygiene: free frames 62513 -> 62513
+SELFTEST timer-ticks PASS
+SELFTEST timer-interrupts PASS
+SELFTEST uart-ring PASS
+SELFTEST plic-uart-line PASS
+SELFTEST SUMMARY (arch): 4/4 passed
+[selftest] task PMM free frames before: 62513 of 65536
+[selftest] task interleave: 2 threads x 64 iterations, 130 switch-outs, 4 live slots
+SELFTEST task-interleave PASS
+[selftest] task exit: free frames 62513 -> 62508 (alive) -> 62513 (reaped), stack costs 5 frames
+SELFTEST task-exit-returns-stack PASS
+[selftest] task stack: base 0x80da0000, top 0x80da5000, guard 0x1000 + usable 16384 B, fill untouched (0 B used)
+SELFTEST task-stack-layout PASS
+[task] STACK OVERFLOW: guard/canary at 0x80da5000 was overwritten; frames returned anyway
+[selftest] task canary: overflow detected on reap (violations 0 -> 1)
+SELFTEST task-canary PASS
+[selftest] task idle: entered 8 time(s) total, switched back to thread 0
+SELFTEST task-idle PASS
+SELFTEST SUMMARY (task): 5/5 passed
+[selftest] task PMM hygiene: free frames 62513 -> 62513
+[selftest] user PMM free frames before: 62513 of 65536
+argv: argc=3 argv[0]=argv.elf argv[1]=alpha argv[2]=beta env[0]=PWD=/
+SELFTEST user-abi-argv PASS
+abi: start
+abi: socket connected to 10.0.2.2:8000
+abi: socket send returned 34 bytes
+abi: socket recv got 138 bytes
+abi: socket shutdown/EOF ok
+abi: mutations ok
+abi: ok
+SELFTEST user-abi-syscalls PASS
+SELFTEST user-elf-accept PASS
+SELFTEST user-elf-reject PASS
+SELFTEST user-run-rejects-bad-elf PASS
+hello from user mode
+hello from user mode
+SELFTEST user-hello-roundtrip PASS
+[user] fault killed: load page fault (cause=13, stval=0x0, sepc=0x1000a)
+SELFTEST user-fault-isolated PASS
+hello from user mode
+SELFTEST user-after-fault PASS
+SELFTEST user-timer-preempts PASS
+hello from user mode
+SELFTEST user-run-large-file PASS
+SELFTEST SUMMARY (user): 10/10 passed
+[selftest] user PMM hygiene: free frames 62513 -> 62513
+SELFTEST net-checksum PASS
+SELFTEST net-ethernet PASS
+SELFTEST net-ipv4 PASS
+SELFTEST net-udp PASS
+SELFTEST net-icmp PASS
+SELFTEST net-arp PASS
+SELFTEST net-dhcp PASS
+SELFTEST net-dns PASS
+SELFTEST net-tcp PASS
+SELFTEST net-text PASS
+SELFTEST net-subnet PASS
+SELFTEST SUMMARY (net): 11/11 passed
+pagh:rv64>
+ run /mnt/http_get
+http_get: connecting to 10.0.2.2:8000
+http_get: connected, sending GET /
+http_get: 166 response bytes
+HTTP/1.0 200 OK
+Server: BaseHTTP/0.6 Python/3.14.7
+Date: Thu, 05 Nov 2026 10:17:26 GMT
+Content-Type: text/plain
+Content-Length: 28
+
+pagh sockets live: GET / ok
+
+http_get: done
+run: /mnt/http_get exited with code 0
+pagh:rv64>
+
+== host HTTP requests ==
+GET / from 127.0.0.1
+"GET / HTTP/1.0" 200 -
+GET / from 127.0.0.1
+"GET / HTTP/1.0" 200 -
+
+RESULT: PASS — selftest 10/10 with a live socket, http_get exit 0

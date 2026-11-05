@@ -555,6 +555,12 @@ User-страницы кладутся в **ту же** Sv39-карту с `U=1`
 | 276 | `renameat2` | `vfs::rename` после проверки источника и родителя назначения; одна транзакция ext2 |
 | 53 | `fchmodat` | `mode & 0o7777` в per-run таблицу по `fs_ino`; `fstat` её читает, inode не меняется; синтетика — `-ENOTSUP` |
 | 46 | `ftruncate` | `VfsNode::truncate`; 0/1/2 — `-EINVAL`, каталог — `-EISDIR`, read-only fd — `-EBADF` |
+| 198 | `socket` | `AF_INET`/`SOCK_STREAM`/0; fd в таблице как `FdEntry::Socket { id, connected }`; второе соединение при открытом первом — `-ENOSPC` |
+| 203 | `connect` | 16-байтный `sockaddr_in` через `copy_from_user`; family/port/addr проверяются, вызов идёт в `net::tcp::connect` и опрашивает NIC до handshake или дедлайна; ошибки — `-ENETUNREACH`/`-EHOSTUNREACH`/`-ECONNREFUSED`/`-ETIMEDOUT` |
+| 206 | `sendto` | `send` на connected-сокете; `write` на socket fd идёт сюда же; `tcp::send` синхронный (ждёт ACK), `-ENOTCONN`/`-EPIPE`/`-ECONNRESET`/`-ETIMEDOUT` |
+| 207 | `recvfrom` | `recv` на connected-сокете; `read` на socket fd идёт сюда же; `tcp::recv_nonblocking` опрашивает NIC один раз, `-EAGAIN` — повторить, 0 — EOF; опциональный `src` заполняется peer'ом |
+| 208/209 | `setsockopt`/`getsockopt` | типовые `SO_*`/`TCP_NODELAY` принимаются/отвечаются фиксированными значениями, остальное — `-ENOPROTOOPT` |
+| 210 | `shutdown` | `tcp::close()` (оба направления, без half-close), fd остаётся; последующий `read` — 0, `write` — `-EPIPE`; `close` освобождает слот |
 
 **Мутации путей** (`mkdirat`, `unlinkat`, `symlinkat`, `linkat`, `renameat2`,
 `fchmodat`) устроены одинаково: `read_user_path` → `read_path` (UTF-8 +
@@ -576,6 +582,21 @@ User-страницы кладутся в **ту же** Sv39-карту с `U=1`
 таблицы не держится через VFS/block-вызов: `Arc` и offset копируются, I/O идёт
 без лока, новый offset публикуется после.
 
+**Сокеты** — единственный сетевой API для userland, и он намеренно узкий.
+`FdEntry::Socket { id, connected }` живёт в той же per-run таблице; один
+статический TCP-клиент (`net::tcp`) допускает одно соединение, поэтому второй
+`socket()` — `-ENOSPC`, а `close`/`shutdown` освобождают слот. `connect`
+валидирует 16-байтный `sockaddr_in` (`copy_from_user`, family, port big-endian)
+и крутит `net::poll()` до handshake; `send` синхронный (ждёт ACK), `recv`
+неблокирующий и возвращает `-EAGAIN`. Оба пути идут через
+`with_network_interrupts`: syscall приходит с `SIE = 0`, и без временно
+разрешённых прерываний тики стояли бы, дедлайн не наступал бы, а планировщик не
+мог бы вытеснить программу, застрявшую в `connect`/`send`. Локов на это время не
+удерживается; `net::poll()` вызывается внутри каждого шага ожидания, поэтому NIC
+не остаётся без опроса, пока шелл не в idle-цикле. `read`/`write`/`close` на
+сокете маршрутизируются в те же функции; teardown прогона закрывает сокет,
+оставленный программой открытым, до следующего `run`.
+
 **User heap** — 1 MiB в `0x2000_0000` (выше максимального образа, ниже стека, вне
 окон устройств). `brk` мапит кадры PMM по требованию и обнуляет их; `RunState`
 хранит список кадров, раннер освобождает их до возврата из `run_source` — это и
@@ -591,8 +612,9 @@ User-страницы кладутся в **ту же** Sv39-карту с `U=1`
 `run <path>` читает файл **потоково** (заголовок, program headers, сегменты по
 ≤ 512 B) и не грузит его целиком в heap, поэтому работает и на 100 KiB, и на
 1 MiB — но одновременно исполняется один user-образ; нет `fork`/`exec`,
-сигналов, `mmap`, динамического ELF и per-process page table. 16 fd, heap ровно
-1 MiB, `getdents64` без записи в буфере отдаёт 0 (неотличимо от конца каталога —
+сигналов, `mmap`, динамического ELF и per-process page table. 16 fd (не более
+одного — сокет), ровно один TCP-клиент без `listen`/`accept`/UDP/DNS/TLS, heap
+ровно 1 MiB, `getdents64` без записи в буфере отдаёт 0 (неотличимо от конца каталога —
 буфер на 264 B покрывает имя ext2), `openat`/`mkdirat` игнорируют `mode`,
 `chmod` живёт только до конца прогона, `uname.release` намеренно `0.10.0` при
 `Cargo.toml` 0.10.1 (версию поднимет release-коммит).
@@ -795,6 +817,16 @@ split-очереди (RX = 0, TX = 1) и публикует `mac()/send()/recv()
 (A-запрос + разбор ответа с compression pointers) и `tcp.rs` (одно
 active-open-соединение, handshake/seq/ack/FIN — достаточно для HTTP/1.0).
 
+Поверх этого клиента `src/user/syscall.rs` даёт минимальный BSD-ABI
+(`socket`/`connect`/`sendto`/`recvfrom`/`setsockopt`/`getsockopt`/`shutdown`).
+Соединение одно: `FdEntry::Socket` в per-run fd-таблице, второй `socket()` —
+`-ENOSPC`; `connect` принимает IPv4-литерал в 16-байтном `sockaddr_in`, `recv`
+неблокирующий (`-EAGAIN`), `read`/`write` на сокете идут теми же путями. Пока
+user-программа работает, шелл не в idle-цикле, поэтому `connect`/`send`/
+`shutdown`/`close` сами вызывают `net::poll()` и на время ожидания включают
+прерывания (как `nanosleep`), чтобы тики и вытеснение продолжали работать.
+`listen`/`accept`, UDP-сокеты, DNS и TLS в этот ABI не входят.
+
 Инварианты, которые легко нарушить:
 
 1. **Парсеры не паникуют.** Любое чтение — `get(..)`, любая арифметика —
@@ -807,7 +839,7 @@ active-open-соединение, handshake/seq/ack/FIN — достаточно
    конфигурации нет, `handle_ipv4` принимает **только** limited broadcast, всё
    остальное отбрасывает.
 5. **Один интерфейс, один адрес, один шлюз, один DNS.** Нет IPv6, нет
-   пересылки (машина не роутер), нет нескольких сокетов; `tcp` — один клиент.
+   пересылки (машина не роутер), нет нескольких TCP-соединений; `tcp` — один клиент, и userland видит ровно его.
 6. **Ожидание — опрос до дедлайна в тиках**, а не блокирующий сон: иначе сеть
    зависела бы от планировщика и прерываний, которых у NIC нет.
 
@@ -824,12 +856,21 @@ active-open-соединение, handshake/seq/ack/FIN — достаточно
 * CI: `python3 .github/smoke.py <elf> --net` — загрузка + DHCP + `net` + ping
   шлюза + `halt`; QEMU slirp детерминирован и не зависит от интернета раннера.
 * Скриншот `docs/net.png` (снимается `tools/run.py --net`).
+* Живой сокетный прогон: `python3 tools/test_sockets.py` поднимает HTTP/1.0
+  сервер на хосте (`127.0.0.1:8000` = `10.0.2.2:8000` из QEMU user network),
+  кладёт libpagh `http_get` на диск через `debugfs`, прогоняет `selftest`
+  (ABI-фикстура реально подключается, шлёт GET, читает ответ, делает
+  `shutdown` и получает EOF/`-EPIPE` вместо SKIP) и `run /mnt/http_get`,
+  проверяя тело ответа и код выхода 0. Транскрипт — `docs/live-sockets.txt`;
+  в CI не входит, потому что нужен сервер на хосте.
 
 ### 13.4 Чего нет
 
 TLS/apt (следующий майлстоун), IPv6, фрагментации, UDP-сокетов как публичного
-API, прослушивания TCP, нескольких соединений и интерфейсов, обновления lease по
-таймеру (только команда `dhcp`), прерываний NIC. Подробно — `src/net/README.md`.
+API, `bind`/`listen`/`accept`, нескольких соединений и интерфейсов, DNS-вызова
+из userland (только `dns`-команда шелла), `sendmsg`/`recvmsg`, обновления lease
+по таймеру (только команда `dhcp`), прерываний NIC. Подробно —
+`src/net/README.md`.
 
 ## 14. Указатель, клавиатура и software-курсор (M8)
 

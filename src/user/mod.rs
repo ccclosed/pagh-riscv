@@ -87,8 +87,11 @@ pub const ARGV_ELF: &[u8] = include_bytes!("../../userland/argv.elf");
 
 /// Embedded native-ABI fixture: exercises `read`/`write`/`openat`/`close`/
 /// `lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/
-/// `readlinkat`. It exits 0 when everything passed, 77 when only the filesystem
-/// half was skipped (no `/mnt`), and a distinct non-zero code otherwise.
+/// `readlinkat`, the path mutations and the BSD-socket subset. It exits 0 when
+/// everything passed, 77 when only the filesystem half was skipped (no `/mnt`),
+/// and a distinct non-zero code otherwise. The socket probe to `10.0.2.2:8000`
+/// is a printed SKIP when no host server is listening; the bad-argument half
+/// always runs.
 pub const ABI_ELF: &[u8] = include_bytes!("../../userland/abi.elf");
 
 pub use elf::{ElfError, ImageSource, SourceError, USER_STACK_BASE, USER_STACK_PAGES, USER_TOP};
@@ -582,6 +585,11 @@ fn run_source<S: ImageSource + ?Sized>(
     // entry. Reap explicitly so the caller's ledger does not depend on when the
     // next unrelated tick happens.
     let _ = scheduler::reap();
+
+    // The program is gone, so its descriptors are too: a socket left open must
+    // not keep the kernel's one connection alive into the next run. This also
+    // drops the `Arc<dyn VfsNode>` handles a program may have left behind.
+    syscall::release_fds();
 
     // The trap frame is gone with the task, so the user pages can go too. Heap
     // frames are owned by `RunState`, not by `Loaded`, so they are released

@@ -58,6 +58,7 @@ use crate::arch::riscv64::csr;
 use crate::arch::riscv64::mmu::{PTE_R, PTE_U, PTE_W};
 use crate::arch::riscv64::traps::TrapFrame;
 use crate::memory::{paging, FRAME_SIZE};
+use crate::net::tcp;
 use crate::sync::Spinlock;
 use crate::vfs::{self, VfsError, VfsNode};
 
@@ -87,6 +88,18 @@ const SYS_LINKAT: usize = 37;
 const SYS_FCHMODAT: usize = 53;
 const SYS_FTRUNCATE: usize = 46;
 const SYS_RENAMEAT2: usize = 276;
+// The BSD-socket subset. Numbers are the generic RISC-V table: 198 socket,
+// 203 connect, 206 sendto, 207 recvfrom, 208/209 setsockopt/getsockopt, 210
+// shutdown. Linux's `send`/`recv` are libc wrappers around 206/207, so those
+// two carry the full `(fd, buf, len, flags, addr, addrlen)` signature and
+// ignore `addr` on a connected socket; `write`/`read` are routed to them.
+const SYS_SOCKET: usize = 198;
+const SYS_CONNECT: usize = 203;
+const SYS_SENDTO: usize = 206;
+const SYS_RECVFROM: usize = 207;
+const SYS_SETSOCKOPT: usize = 208;
+const SYS_GETSOCKOPT: usize = 209;
+const SYS_SHUTDOWN: usize = 210;
 
 // ─── errno values (negated in `a0`) ────────────────────────────────────────
 const ENOENT: isize = -2;
@@ -105,6 +118,17 @@ const EOVERFLOW: isize = -75;
 const ENOSYS: isize = -38;
 const ENOTEMPTY: isize = -39;
 const ENOTSUP: isize = -95;
+const EPIPE: isize = -32;
+const ENOTSOCK: isize = -88;
+const ENOPROTOOPT: isize = -92;
+const EAFNOSUPPORT: isize = -97;
+const ENETUNREACH: isize = -101;
+const ECONNRESET: isize = -104;
+const EISCONN: isize = -106;
+const ENOTCONN: isize = -107;
+const ETIMEDOUT: isize = -110;
+const ECONNREFUSED: isize = -111;
+const EHOSTUNREACH: isize = -113;
 
 // ─── `openat` flags (the ABI's own small set) ──────────────────────────────
 const O_ACCMODE: usize = 0x3;
@@ -180,6 +204,18 @@ pub struct Stats {
     pub chmods: u64,
     /// `ftruncate` calls that resized a file.
     pub truncates: u64,
+    /// `socket()` calls that returned a descriptor.
+    pub sockets: u64,
+    /// `connect` calls that completed the handshake.
+    pub connects: u64,
+    /// `send`/`sendto`/`write` calls on a socket that handed bytes to TCP.
+    pub socket_sends: u64,
+    /// `recv`/`recvfrom`/`read` calls on a socket that returned bytes.
+    pub socket_recvs: u64,
+    /// `shutdown` calls that closed the connection.
+    pub shutdowns: u64,
+    /// `setsockopt`/`getsockopt` calls that succeeded.
+    pub sockopts: u64,
     /// Unknown syscall numbers answered with `-ENOSYS`.
     pub unknown: u64,
     /// Bad user buffers answered with `-EFAULT`.
@@ -209,6 +245,12 @@ static LINKS: AtomicU64 = AtomicU64::new(0);
 static RENAMES: AtomicU64 = AtomicU64::new(0);
 static CHMODS: AtomicU64 = AtomicU64::new(0);
 static TRUNCATES: AtomicU64 = AtomicU64::new(0);
+static SOCKETS: AtomicU64 = AtomicU64::new(0);
+static CONNECTS: AtomicU64 = AtomicU64::new(0);
+static SOCKET_SENDS: AtomicU64 = AtomicU64::new(0);
+static SOCKET_RECVS: AtomicU64 = AtomicU64::new(0);
+static SHUTDOWNS: AtomicU64 = AtomicU64::new(0);
+static SOCKOPTS: AtomicU64 = AtomicU64::new(0);
 static UNKNOWN: AtomicU64 = AtomicU64::new(0);
 static FAULTS: AtomicU64 = AtomicU64::new(0);
 
@@ -239,6 +281,12 @@ pub fn stats() -> Stats {
         renames: RENAMES.load(Ordering::Relaxed),
         chmods: CHMODS.load(Ordering::Relaxed),
         truncates: TRUNCATES.load(Ordering::Relaxed),
+        sockets: SOCKETS.load(Ordering::Relaxed),
+        connects: CONNECTS.load(Ordering::Relaxed),
+        socket_sends: SOCKET_SENDS.load(Ordering::Relaxed),
+        socket_recvs: SOCKET_RECVS.load(Ordering::Relaxed),
+        shutdowns: SHUTDOWNS.load(Ordering::Relaxed),
+        sockopts: SOCKOPTS.load(Ordering::Relaxed),
         unknown: UNKNOWN.load(Ordering::Relaxed),
         faults: FAULTS.load(Ordering::Relaxed),
     }
@@ -281,6 +329,15 @@ enum FdEntry {
     /// fd 1/2: console output.
     Stdout,
     File(FileHandle),
+    /// A BSD-style socket descriptor. The kernel has exactly one TCP
+    /// connection, so at most one of these exists per run; `id` is the stack's
+    /// socket number (always 0 today) and `connected` records that a
+    /// `connect` succeeded, which is what separates "never connected"
+    /// (`-ENOTCONN`) from "shut down" (read returns 0, write `-EPIPE`).
+    Socket {
+        id: u8,
+        connected: bool,
+    },
 }
 
 struct FdTable {
@@ -368,20 +425,50 @@ fn mode_override(ino: u64) -> Option<u16> {
 /// Fill the table with the three console descriptors. Called by the runner
 /// before a task starts; a second call discards whatever a previous run left.
 /// The `fchmodat` overrides are per run too, so they are cleared here.
+///
+/// A socket descriptor left behind (only possible when a run ended without
+/// closing it) would keep the kernel's one TCP connection alive across runs, so
+/// the connection is closed here — after the table lock is released, because
+/// `tcp::close` builds and sends a segment and may poll the NIC.
 pub(crate) fn reset_fds() {
-    let mut table = FDS.lock();
-    *table = FdTable::empty();
-    table.slots[0] = Some(FdEntry::Stdin);
-    table.slots[1] = Some(FdEntry::Stdout);
-    table.slots[2] = Some(FdEntry::Stdout);
-    drop(table);
+    let had_socket = {
+        let mut table = FDS.lock();
+        let had = table
+            .slots
+            .iter()
+            .any(|slot| matches!(slot, Some(FdEntry::Socket { .. })));
+        *table = FdTable::empty();
+        table.slots[0] = Some(FdEntry::Stdin);
+        table.slots[1] = Some(FdEntry::Stdout);
+        table.slots[2] = Some(FdEntry::Stdout);
+        had
+    };
+    if had_socket {
+        crate::net::tcp::close();
+    }
     *MODES.lock() = ModeTable::empty();
 }
 
 /// Drop every open node. Called by the runner after the task is gone, before the
-/// image mappings are released; `Arc::drop` is the only side effect.
+/// image mappings are released; `Arc::drop` is the only side effect for a file.
+/// A socket close sends a FIN, so the table lock is released first.
 pub(crate) fn release_fds() {
-    *FDS.lock() = FdTable::empty();
+    let had_socket = {
+        let mut table = FDS.lock();
+        let mut had = false;
+        for slot in table.slots.iter_mut() {
+            if matches!(slot, Some(FdEntry::Socket { .. })) {
+                had = true;
+            }
+            // `take` drops the entry here, but a socket entry's only resource
+            // is the global connection handled below.
+            *slot = None;
+        }
+        had
+    };
+    if had_socket {
+        crate::net::tcp::close();
+    }
     *MODES.lock() = ModeTable::empty();
 }
 
@@ -396,6 +483,10 @@ enum OpenFd {
         offset: u64,
         flags: usize,
     },
+    Socket {
+        id: u8,
+        connected: bool,
+    },
 }
 
 fn lookup(fd: usize) -> Result<OpenFd, isize> {
@@ -407,6 +498,10 @@ fn lookup(fd: usize) -> Result<OpenFd, isize> {
             node: Arc::clone(&file.node),
             offset: file.offset,
             flags: file.flags,
+        }),
+        Some(FdEntry::Socket { id, connected }) => Ok(OpenFd::Socket {
+            id: *id,
+            connected: *connected,
         }),
         None => Err(EBADF),
     }
@@ -420,6 +515,44 @@ fn set_offset(fd: usize, offset: u64) {
     if let Some(Some(FdEntry::File(file))) = table.slots.get_mut(fd) {
         file.offset = offset;
     }
+}
+
+/// Install a socket descriptor. The kernel stack owns one connection, so a
+/// second `socket()` while one descriptor is open is refused instead of
+/// pretending there is another socket: `ENOSPC` (the ABI's fd-space error).
+fn install_socket() -> Result<usize, isize> {
+    let mut table = FDS.lock();
+    for slot in table.slots.iter() {
+        if let Some(FdEntry::Socket { id, .. }) = slot {
+            let _ = id; // the stack's single socket id, kept for the record
+            return Err(ENOSPC);
+        }
+    }
+    for fd in 3..MAX_FDS {
+        if table.slots[fd].is_none() {
+            table.slots[fd] = Some(FdEntry::Socket {
+                id: 0,
+                connected: false,
+            });
+            return Ok(fd);
+        }
+    }
+    Err(ENOSPC)
+}
+
+/// Record that the socket on `fd` completed its handshake.
+fn mark_socket_connected(fd: usize) {
+    let mut table = FDS.lock();
+    if let Some(Some(FdEntry::Socket { connected, .. })) = table.slots.get_mut(fd) {
+        *connected = true;
+    }
+}
+
+/// Remove a descriptor from the table and return it, so its resources (an
+/// `Arc`, a socket's connection) are handled without the table lock held.
+fn take_entry(fd: usize) -> Option<FdEntry> {
+    let mut table = FDS.lock();
+    table.slots.get_mut(fd).and_then(|slot| slot.take())
 }
 
 /// Install a node in the first free slot at or above 3.
@@ -468,6 +601,16 @@ pub fn dispatch(frame: &mut TrapFrame) {
         SYS_RENAMEAT2 => renameat2(frame.a0, frame.a1, frame.a2, frame.a3, frame.a4),
         SYS_FCHMODAT => fchmodat(frame.a0, frame.a1, frame.a2, frame.a3),
         SYS_FTRUNCATE => ftruncate(frame.a0, frame.a1),
+        SYS_SOCKET => socket(frame.a0, frame.a1, frame.a2),
+        SYS_CONNECT => connect(frame.a0, frame.a1, frame.a2),
+        // 206/207 carry the `sendto`/`recvfrom` shape; on a connected socket
+        // the destination/source address is optional and ignored (send) or
+        // filled in (recv).
+        SYS_SENDTO => send_socket(frame.a0, frame.a1, frame.a2, frame.a3, frame.a4, frame.a5),
+        SYS_RECVFROM => recv_socket(frame.a0, frame.a1, frame.a2, frame.a3, frame.a4, frame.a5),
+        SYS_SETSOCKOPT => setsockopt(frame.a0, frame.a1, frame.a2, frame.a3, frame.a4),
+        SYS_GETSOCKOPT => getsockopt(frame.a0, frame.a1, frame.a2, frame.a3, frame.a4),
+        SYS_SHUTDOWN => shutdown(frame.a0, frame.a1),
         SYS_CLOCK_GETTIME => clock_gettime(frame.a0, frame.a1),
         SYS_NANOSLEEP => nanosleep(frame.a0, frame.a1),
         SYS_UNAME => uname(frame.a0),
@@ -518,6 +661,10 @@ fn read(fd: usize, buf: usize, len: usize) -> isize {
     match lookup(fd) {
         Ok(OpenFd::ConsoleIn) => read_console(buf),
         Ok(OpenFd::ConsoleOut) => EBADF,
+        Ok(OpenFd::Socket { id, connected }) => {
+            let _ = id;
+            read_socket(buf, len, connected)
+        }
         Ok(OpenFd::File {
             node,
             offset,
@@ -597,6 +744,10 @@ fn write(fd: usize, buf: usize, len: usize) -> isize {
     match lookup(fd) {
         Ok(OpenFd::ConsoleIn) => EBADF,
         Ok(OpenFd::ConsoleOut) => write_console(buf, len),
+        Ok(OpenFd::Socket { id, connected }) => {
+            let _ = id;
+            write_socket(buf, len, connected)
+        }
         Ok(OpenFd::File {
             node,
             offset,
@@ -689,6 +840,444 @@ fn write_console(buf: usize, len: usize) -> isize {
     WRITES.fetch_add(1, Ordering::Relaxed);
     BYTES.fetch_add(len as u64, Ordering::Relaxed);
     len as isize
+}
+
+// ─── sockets (AF_INET / SOCK_STREAM only) ─────────────────────────────────
+
+/// The ABI's native `sockaddr_in`: `u16 family` (little-endian, `AF_INET = 2`),
+/// `u16 port` (network byte order), `[u8; 4] address`, then zero padding to 16.
+const SOCKADDR_IN_SIZE: usize = 16;
+const AF_INET: u16 = 2;
+const SOCK_STREAM: u32 = 1;
+
+/// Payload bytes copied between user memory and the TCP stack per step. One
+/// TCP MSS is 1000 bytes; a full segment per syscall step keeps `send` from
+/// waiting for an ACK per 256-byte console-sized chunk.
+const SOCKET_CHUNK: usize = 1000;
+
+// `setsockopt` / `getsockopt` names (the subset this kernel accepts).
+const SOL_SOCKET: usize = 1;
+const SO_REUSEADDR: usize = 2;
+const SO_TYPE: usize = 3;
+const SO_ERROR: usize = 4;
+const SO_KEEPALIVE: usize = 9;
+const SO_RCVTIMEO: usize = 20;
+const SO_SNDTIMEO: usize = 21;
+const IPPROTO_TCP: usize = 6;
+const TCP_NODELAY: usize = 1;
+
+/// Run `body` with supervisor interrupts enabled, then restore the exact entry
+/// value.
+///
+/// A syscall arrives with `sstatus.SIE = 0` (hardware cleared it), and this
+/// stack's waits are tick-bounded: with the clock frozen, `tcp::wait_for` would
+/// fall back to its iteration cap and the scheduler could not preempt a program
+/// parked in `connect`/`send`. Enabling interrupts for the duration is the same
+/// deliberate exception `nanosleep` makes, with no lock held: the TCP state lock
+/// is taken only for short sections inside the stack, and no other task touches
+/// the network while a user program runs (the shell is in `wait_for_exit`, idle
+/// is in `wfi`). The trap epilogue restores `sstatus` from the frame anyway, so
+/// this cannot leak into U-mode. A timer interrupt here may switch this task out
+/// and back; the syscall simply continues, exactly like `nanosleep`.
+fn with_network_interrupts<T>(body: impl FnOnce() -> T) -> T {
+    let was = csr::read_sstatus();
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    csr::write_sstatus(was | csr::SSTATUS_SIE);
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    let result = body();
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    csr::write_sstatus(was);
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    result
+}
+
+/// Read the 16-byte native `sockaddr_in` from user memory, returning the family
+/// and the parsed `(address, port)`. The caller validates the family.
+fn read_sockaddr_in(pointer: usize) -> Result<(u16, [u8; 4], u16), isize> {
+    let mut raw = [0u8; SOCKADDR_IN_SIZE];
+    copy_from_user(&mut raw, pointer)?;
+    let family = u16::from_le_bytes([raw[0], raw[1]]);
+    let port = u16::from_be_bytes([raw[2], raw[3]]);
+    Ok((family, [raw[4], raw[5], raw[6], raw[7]], port))
+}
+
+/// Write the native `sockaddr_in` to user memory (used to fill `recvfrom`'s
+/// source address). Padding is left zero.
+fn write_sockaddr_in(pointer: usize, address: [u8; 4], port: u16) -> Result<(), isize> {
+    let mut raw = [0u8; SOCKADDR_IN_SIZE];
+    raw[0..2].copy_from_slice(&AF_INET.to_le_bytes());
+    raw[2..4].copy_from_slice(&port.to_be_bytes());
+    raw[4..8].copy_from_slice(&address);
+    copy_to_user(pointer, &raw)
+}
+
+fn read_u32_user(pointer: usize) -> Result<u32, isize> {
+    let mut raw = [0u8; 4];
+    copy_from_user(&mut raw, pointer)?;
+    Ok(u32::from_le_bytes(raw))
+}
+
+fn write_u32_user(pointer: usize, value: u32) -> Result<(), isize> {
+    copy_to_user(pointer, &value.to_le_bytes())
+}
+
+/// `socket(domain, type, protocol)`.
+///
+/// Only the combination the stack has — `AF_INET`, `SOCK_STREAM`, protocol
+/// 0 — is accepted; everything else is `-EAFNOSUPPORT` (the ABI documents that
+/// one answer instead of inventing per-field errnos). The kernel owns one TCP
+/// connection, so a second `socket()` while a socket descriptor is open is
+/// `-ENOSPC`; [`close`] or [`shutdown`] the first one and open another.
+fn socket(domain: usize, kind: usize, protocol: usize) -> isize {
+    if domain != AF_INET as usize || kind != SOCK_STREAM as usize || protocol != 0 {
+        return EAFNOSUPPORT;
+    }
+    match install_socket() {
+        Ok(fd) => {
+            SOCKETS.fetch_add(1, Ordering::Relaxed);
+            fd as isize
+        }
+        Err(error) => error,
+    }
+}
+
+/// Map a connect failure to the ABI's errno. `Reset` is a peer RST during the
+/// handshake, which for a client means "connection refused"; a frame that could
+/// not be sent is "host unreachable" (no ARP answer or no lease route).
+fn connect_errno(error: tcp::Error) -> isize {
+    match error {
+        tcp::Error::NoLease => ENETUNREACH,
+        tcp::Error::Busy => EISCONN,
+        tcp::Error::Timeout => ETIMEDOUT,
+        tcp::Error::Reset | tcp::Error::Closed => ECONNREFUSED,
+        tcp::Error::Send => EHOSTUNREACH,
+        tcp::Error::WouldBlock => EAGAIN,
+    }
+}
+
+/// Map a `send`/`recv` failure. `Closed` after a peer FIN is `-EPIPE` for a
+/// write and 0 for a read (handled by the stack returning `Ok(0)`); a reset is
+/// `-ECONNRESET`. A would-block is only possible on the non-blocking receive.
+fn stream_errno(error: tcp::Error) -> isize {
+    match error {
+        tcp::Error::NoLease => ENETUNREACH,
+        tcp::Error::Busy => EAGAIN,
+        tcp::Error::Timeout => ETIMEDOUT,
+        tcp::Error::Reset => ECONNRESET,
+        tcp::Error::Closed => EPIPE,
+        tcp::Error::Send => EHOSTUNREACH,
+        tcp::Error::WouldBlock => EAGAIN,
+    }
+}
+
+/// `connect(fd, *sockaddr_in, addrlen)`.
+///
+/// The sockaddr is validated before anything touches the network: `addrlen`
+/// must be exactly 16, every byte must be in a user-readable page, the family
+/// must be `AF_INET`, and the port is read big-endian. IPv4 literals only —
+/// there is no DNS in this layer. The call polls the NIC until the three-way
+/// handshake completes or the TCP client's own deadline expires.
+fn connect(fd: usize, address: usize, length: usize) -> isize {
+    let connected = match lookup(fd) {
+        Ok(OpenFd::Socket { connected, .. }) => connected,
+        Ok(_) => return ENOTSOCK,
+        Err(error) => return error,
+    };
+    if connected {
+        return EISCONN;
+    }
+    if length != SOCKADDR_IN_SIZE || address == 0 {
+        return if address == 0 { fault() } else { EINVAL };
+    }
+    let (family, ip, port) = match read_sockaddr_in(address) {
+        Ok(parsed) => parsed,
+        Err(error) => return error,
+    };
+    if family != AF_INET {
+        return EAFNOSUPPORT;
+    }
+    match with_network_interrupts(|| tcp::connect(ip, port)) {
+        Ok(()) => {
+            mark_socket_connected(fd);
+            CONNECTS.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        Err(error) => connect_errno(error),
+    }
+}
+
+/// `sendto(fd, buf, len, flags, dest, addrlen)` and the `send` shape.
+///
+/// `flags` must be 0. On a connected stream socket `dest`/`addrlen` are
+/// optional; when present they are validated and then ignored, because the
+/// kernel's single connection is already bound to its peer. TCP's `send` is
+/// synchronous (it waits for the ACK with a bounded poll), so a completed call
+/// means the bytes left this machine.
+fn send_socket(
+    fd: usize,
+    buf: usize,
+    len: usize,
+    flags: usize,
+    dest: usize,
+    addrlen: usize,
+) -> isize {
+    if flags != 0 {
+        return EINVAL;
+    }
+    let connected = match lookup(fd) {
+        Ok(OpenFd::Socket { connected, .. }) => connected,
+        Ok(_) => return ENOTSOCK,
+        Err(error) => return error,
+    };
+    if !connected {
+        return ENOTCONN;
+    }
+    if dest != 0 {
+        if addrlen != SOCKADDR_IN_SIZE {
+            return EINVAL;
+        }
+        match read_sockaddr_in(dest) {
+            Ok((family, _, _)) if family == AF_INET => {}
+            Ok(_) => return EAFNOSUPPORT,
+            Err(error) => return error,
+        }
+    }
+    if len == 0 {
+        return 0;
+    }
+    write_socket(buf, len, connected)
+}
+
+/// `recvfrom(fd, buf, len, flags, src, addrlen)` and the `recv` shape.
+///
+/// `flags` must be 0. When `src` is non-null the peer address is written there
+/// (the caller's `addrlen` must be at least 16) and `addrlen` is set to 16.
+/// The receive itself is non-blocking: `-EAGAIN` means "poll again", and `0`
+/// means the peer closed — the same contract as `read(0)`.
+fn recv_socket(
+    fd: usize,
+    buf: usize,
+    len: usize,
+    flags: usize,
+    src: usize,
+    addrlen: usize,
+) -> isize {
+    if flags != 0 {
+        return EINVAL;
+    }
+    let connected = match lookup(fd) {
+        Ok(OpenFd::Socket { connected, .. }) => connected,
+        Ok(_) => return ENOTSOCK,
+        Err(error) => return error,
+    };
+    if !connected {
+        return ENOTCONN;
+    }
+    if src != 0 {
+        if addrlen == 0 {
+            return EINVAL;
+        }
+        let capacity = match read_u32_user(addrlen) {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        if capacity < SOCKADDR_IN_SIZE as u32 {
+            return EINVAL;
+        }
+        let Some((ip, port)) = tcp::peer() else {
+            return ENOTCONN;
+        };
+        if let Err(error) = write_sockaddr_in(src, ip, port) {
+            return error;
+        }
+        if let Err(error) = write_u32_user(addrlen, SOCKADDR_IN_SIZE as u32) {
+            return error;
+        }
+    }
+    if len == 0 {
+        return 0;
+    }
+    read_socket(buf, len, connected)
+}
+
+/// The body of `read`/`recv`/`recvfrom` on a socket: drain at most one buffer
+/// of payload, copying it page by page to the user.
+fn read_socket(buf: usize, len: usize, connected: bool) -> isize {
+    if !connected {
+        return ENOTCONN;
+    }
+    let mut chunk = [0u8; SOCKET_CHUNK];
+    let mut total = 0usize;
+    while total < len {
+        let want = (len - total).min(SOCKET_CHUNK);
+        let received = match tcp::recv_nonblocking(&mut chunk[..want]) {
+            Ok(0) => break,
+            Ok(received) if received <= want => received,
+            Ok(_) => return if total > 0 { total as isize } else { EIO },
+            Err(tcp::Error::WouldBlock) => {
+                return if total > 0 { total as isize } else { EAGAIN };
+            }
+            Err(error) => {
+                return if total > 0 {
+                    total as isize
+                } else {
+                    stream_errno(error)
+                };
+            }
+        };
+        if let Err(error) = copy_to_user(buf + total, &chunk[..received]) {
+            return if total > 0 { total as isize } else { error };
+        }
+        total += received;
+        if received < want {
+            break;
+        }
+    }
+    if total > 0 {
+        SOCKET_RECVS.fetch_add(1, Ordering::Relaxed);
+    }
+    total as isize
+}
+
+/// The body of `write`/`send`/`sendto` on a socket: copy user bytes in MSS-sized
+/// pieces and hand each to the synchronous TCP send. A failure after some bytes
+/// left returns the short count, never a false success.
+fn write_socket(buf: usize, len: usize, connected: bool) -> isize {
+    if !connected {
+        return ENOTCONN;
+    }
+    let mut chunk = [0u8; SOCKET_CHUNK];
+    let mut total = 0usize;
+    while total < len {
+        let want = (len - total).min(SOCKET_CHUNK);
+        if let Err(error) = copy_from_user(&mut chunk[..want], buf + total) {
+            return if total > 0 { total as isize } else { error };
+        }
+        match with_network_interrupts(|| tcp::send(&chunk[..want])) {
+            Ok(sent) if sent <= want => {
+                total += sent;
+                if sent < want {
+                    break;
+                }
+            }
+            Ok(_) => return if total > 0 { total as isize } else { EIO },
+            Err(error) => {
+                return if total > 0 {
+                    total as isize
+                } else {
+                    stream_errno(error)
+                };
+            }
+        }
+    }
+    if total > 0 {
+        SOCKET_SENDS.fetch_add(1, Ordering::Relaxed);
+    }
+    total as isize
+}
+
+/// `shutdown(fd, how)`.
+///
+/// The stack has no half-close: `how` (0 = read, 1 = write, 2 = both) is
+/// validated and then both directions are closed, exactly like `close` minus
+/// the descriptor. The fd stays open so the ABI stays BSD-shaped: a later `read`
+/// returns 0 (end of stream) and a later `write` is `-EPIPE`; `close` then
+/// releases the slot.
+fn shutdown(fd: usize, how: usize) -> isize {
+    if how > 2 {
+        return EINVAL;
+    }
+    let connected = match lookup(fd) {
+        Ok(OpenFd::Socket { connected, .. }) => connected,
+        Ok(_) => return ENOTSOCK,
+        Err(error) => return error,
+    };
+    if !connected {
+        return ENOTCONN;
+    }
+    with_network_interrupts(tcp::close);
+    SHUTDOWNS.fetch_add(1, Ordering::Relaxed);
+    0
+}
+
+/// `setsockopt(fd, level, optname, optval, optlen)`.
+///
+/// This kernel has nothing to tune: the options a BSD client commonly sets
+/// (`SO_REUSEADDR`, `SO_KEEPALIVE`, the two socket timeouts and
+/// `TCP_NODELAY`) are validated and ignored. Anything else is `-ENOPROTOOPT`,
+/// so a program can tell "accepted no-op" from "not implemented".
+fn setsockopt(fd: usize, level: usize, name: usize, value: usize, length: usize) -> isize {
+    match lookup(fd) {
+        Ok(OpenFd::Socket { .. }) => {}
+        Ok(_) => return ENOTSOCK,
+        Err(error) => return error,
+    }
+    match (level, name) {
+        (SOL_SOCKET, SO_REUSEADDR)
+        | (SOL_SOCKET, SO_KEEPALIVE)
+        | (SOL_SOCKET, SO_RCVTIMEO)
+        | (SOL_SOCKET, SO_SNDTIMEO)
+        | (IPPROTO_TCP, TCP_NODELAY) => {}
+        _ => return ENOPROTOOPT,
+    }
+    if length > 0 {
+        if value == 0 {
+            return fault();
+        }
+        // Validate the option buffer even though it is ignored: a bad pointer
+        // is the caller's bug, not a silent no-op.
+        let mut scratch = [0u8; 16];
+        let take = length.min(scratch.len());
+        if let Err(error) = copy_from_user(&mut scratch[..take], value) {
+            return error;
+        }
+    }
+    SOCKOPTS.fetch_add(1, Ordering::Relaxed);
+    0
+}
+
+/// `getsockopt(fd, level, optname, optval, *optlen)`.
+///
+/// Answers the small fixed set with the values this stack actually has:
+/// `SO_TYPE` is `SOCK_STREAM`, `SO_ERROR` is 0 (connect reports its error
+/// directly), and the two timeouts read back as zero (the kernel's bounds are
+/// fixed). The caller's `optlen` is read first and the reply is truncated to
+/// it, then `optlen` is updated to the bytes written.
+fn getsockopt(fd: usize, level: usize, name: usize, value: usize, length: usize) -> isize {
+    match lookup(fd) {
+        Ok(OpenFd::Socket { .. }) => {}
+        Ok(_) => return ENOTSOCK,
+        Err(error) => return error,
+    }
+    if value == 0 || length == 0 {
+        return fault();
+    }
+    let capacity = match read_u32_user(length) {
+        Ok(value) => value as usize,
+        Err(error) => return error,
+    };
+    let mut reply = [0u8; 16];
+    let size = match (level, name) {
+        (SOL_SOCKET, SO_TYPE) => {
+            reply[..4].copy_from_slice(&SOCK_STREAM.to_le_bytes());
+            4
+        }
+        (SOL_SOCKET, SO_ERROR) => 4,
+        (SOL_SOCKET, SO_RCVTIMEO) | (SOL_SOCKET, SO_SNDTIMEO) => 16,
+        (IPPROTO_TCP, TCP_NODELAY) => 4,
+        _ => return ENOPROTOOPT,
+    };
+    let take = capacity.min(size);
+    if take > 0 {
+        if let Err(error) = copy_to_user(value, &reply[..take]) {
+            return error;
+        }
+    }
+    if let Err(error) = write_u32_user(length, take as u32) {
+        return error;
+    }
+    SOCKOPTS.fetch_add(1, Ordering::Relaxed);
+    0
 }
 
 // ─── open / close ──────────────────────────────────────────────────────────
@@ -807,22 +1396,32 @@ fn openat(dirfd: usize, path_ptr: usize, flags: usize, mode: usize) -> isize {
 /// Remove a descriptor without counting a `close`; used by [`openat`] to roll
 /// back a descriptor whose truncation failed. `false` means the slot was empty.
 fn release_slot(fd: usize) -> bool {
-    let mut table = FDS.lock();
-    match table.slots.get_mut(fd) {
-        Some(slot) => slot.take().is_some(),
-        None => false,
-    }
+    take_entry(fd).is_some()
 }
 
 /// `close(fd)`: release the descriptor. Closing 0/1/2 is allowed and permanent
 /// for this run (a later read/write is `-EBADF`); the runner resets the table
 /// for the next program.
+///
+/// A socket descriptor also closes the kernel's TCP connection (FIN when the
+/// handshake completed, otherwise a plain reset of the stack's state). The entry
+/// is removed before the network call so the fd table lock is never held across
+/// a segment send or a NIC poll.
 fn close(fd: usize) -> isize {
-    if release_slot(fd) {
-        CLOSES.fetch_add(1, Ordering::Relaxed);
-        0
-    } else {
-        EBADF
+    let entry = take_entry(fd);
+    match entry {
+        None => EBADF,
+        Some(FdEntry::Socket { connected, .. }) => {
+            if connected {
+                with_network_interrupts(crate::net::tcp::close);
+            }
+            CLOSES.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        Some(_) => {
+            CLOSES.fetch_add(1, Ordering::Relaxed);
+            0
+        }
     }
 }
 
@@ -837,7 +1436,7 @@ fn close(fd: usize) -> isize {
 fn lseek(fd: usize, offset: usize, whence: usize) -> isize {
     let delta = offset as isize as i128;
     match lookup(fd) {
-        Ok(OpenFd::ConsoleIn) | Ok(OpenFd::ConsoleOut) => EINVAL,
+        Ok(OpenFd::ConsoleIn) | Ok(OpenFd::ConsoleOut) | Ok(OpenFd::Socket { .. }) => EINVAL,
         Ok(OpenFd::File { node, offset, .. }) => {
             if node.is_directory() {
                 return EINVAL;
@@ -880,7 +1479,9 @@ const KIND_OTHER: u32 = 3;
 /// descriptors answer `kind = OTHER`, size 0, ino 0, mode 0o644.
 fn fstat(fd: usize, pointer: usize) -> isize {
     let (kind, mode, size, ino) = match lookup(fd) {
-        Ok(OpenFd::ConsoleIn) | Ok(OpenFd::ConsoleOut) => (KIND_OTHER, 0o644u32, 0u64, 0u64),
+        Ok(OpenFd::ConsoleIn) | Ok(OpenFd::ConsoleOut) | Ok(OpenFd::Socket { .. }) => {
+            (KIND_OTHER, 0o644u32, 0u64, 0u64)
+        }
         Ok(OpenFd::File { node, .. }) => {
             let is_dir = node.is_directory();
             let is_link = node.is_symlink();
@@ -1316,7 +1917,7 @@ fn ftruncate(fd: usize, length: usize) -> isize {
         return EINVAL;
     }
     match lookup(fd) {
-        Ok(OpenFd::ConsoleIn) | Ok(OpenFd::ConsoleOut) => EINVAL,
+        Ok(OpenFd::ConsoleIn) | Ok(OpenFd::ConsoleOut) | Ok(OpenFd::Socket { .. }) => EINVAL,
         Ok(OpenFd::File { node, flags, .. }) => {
             if node.is_directory() {
                 return EISDIR;
