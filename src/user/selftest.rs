@@ -6,7 +6,10 @@
 //! property — a started program, a refused image and a killed process all leave
 //! the PMM exactly as they found it — plus the two acceptance runs the milestone
 //! names: `hello` exits 42 through `write`/`sched_yield`/`exit`, and `fault` dies
-//! from a U-mode page fault without taking the machine with it.
+//! from a U-mode page fault without taking the machine with it. The ABI fixture
+//! also carries the native-thread section (`clone`/gettid/futex/`exit`/
+//! `exit_group`); the kernel side requires its counters to move and the futex
+//! queue to be empty after the run.
 //!
 //! The reject matrix is built by mutating a copy of the very ELF the accept case
 //! loads. The bytes under test therefore stay the shipped fixture, each mutation
@@ -500,6 +503,9 @@ fn user_abi_syscalls(_buf: &mut Vec<u8>) -> Outcome {
         || stats.polls <= stats_before.polls
         || stats.sockets <= stats_before.sockets
         || stats.sockopts <= stats_before.sockopts
+        || stats.clones <= stats_before.clones
+        || stats.futex_waits <= stats_before.futex_waits
+        || stats.futex_wakes <= stats_before.futex_wakes
     {
         crate::kprintln!(
             "[selftest] user: ABI counters did not move as expected (before {:?}, after {:?})",
@@ -509,7 +515,8 @@ fn user_abi_syscalls(_buf: &mut Vec<u8>) -> Outcome {
         ok = false;
     }
     if dir.is_some()
-        && (stats.reads <= stats_before.reads
+        && (stats.exit_groups <= stats_before.exit_groups
+            || stats.reads <= stats_before.reads
             || stats.seeks <= stats_before.seeks
             || stats.dirents <= stats_before.dirents
             || stats.readlinks <= stats_before.readlinks
@@ -536,6 +543,13 @@ fn user_abi_syscalls(_buf: &mut Vec<u8>) -> Outcome {
         crate::kprintln!(
             "[selftest] user: the ABI run left {} pipe(s) allocated",
             crate::user::syscall::live_pipes()
+        );
+        ok = false;
+    }
+    if crate::user::futex::live_waiters() != 0 {
+        crate::kprintln!(
+            "[selftest] user: the ABI run left {} futex waiter(s) registered",
+            crate::user::futex::live_waiters()
         );
         ok = false;
     }

@@ -13,15 +13,20 @@
 //!    segment at a time and never allocates a whole-image buffer.
 //! 2. The 64 KiB user stack (`USER_STACK_BASE..USER_TOP`) is mapped from a
 //!    contiguous PMM run.
-//! 3. A normal scheduler task is spawned; its kernel-thread body calls
-//!    [`enter_user`], which builds the return-to-U-mode state and executes
-//!    `sret` (`sstatus.SPP = 0`, `SPIE = 1`, `sepc = entry`, `sp = stack_top`).
-//! 4. The shell task waits in [`wait_for_exit`], yielding the CPU until the user
-//!    task is `Exited`. While it waits, timer preemption and `sched_yield` work
-//!    exactly as for any other task — U-mode is just the task's register state.
-//! 5. The runner reaps the task's kernel stack and releases the image and user
-//!    stack frames. The PMM ledger is back where it started; the `selftest`
-//!    user suite measures that, not the function's promise.
+//! 3. A normal scheduler task is spawned for the main thread; its kernel-thread
+//!    body calls [`enter_user`], which builds the return-to-U-mode state and
+//!    executes `sret` (`sstatus.SPP = 0`, `SPIE = 1`, `sepc = entry`,
+//!    `sp = stack_top`). A `clone` child starts instead at the exported trap-return
+//!    epilogue with a hand-built `TrapFrame`, the same layout a trap restores.
+//! 4. The shell task waits in [`wait_for_run_end`], yielding the CPU until the
+//!    last thread of the run is gone (`RunState::threads == 0`). While it waits,
+//!    timer preemption and `sched_yield` work exactly as for any other task —
+//!    U-mode is just a thread's register state, and a blocked thread is not
+//!    runnable.
+//! 5. The runner reaps every thread's kernel stack and releases the image, user
+//!    stack, fd table, heap/mmap regions and futex queue. The PMM ledger is back
+//!    where it started; the `selftest` user suite measures that, not the
+//!    function's promise.
 //!
 //! # Kernel stack, user stack, and `sscratch`
 //!
@@ -44,17 +49,20 @@
 //!
 //! # Faults
 //!
-//! An exception whose saved `sstatus.SPP` is 0 ends the *task*, never the
-//! machine ([`on_fault`]). It prints one diagnostic line and calls
-//! `scheduler::exit`; the runner then does the cleanup below. S-mode exceptions
-//! keep the older print-and-park contract in `arch::riscv64::traps`.
+//! An exception whose saved `sstatus.SPP` is 0 ends the *run*, never the machine
+//! ([`on_fault`]). It prints one diagnostic line, retires the other threads with
+//! `scheduler::kill_group` and ends the caller; the runner then does the cleanup
+//! below. A fault is process-fatal because a thread that died holding a
+//! userspace lock would otherwise leave its siblings waiting forever. S-mode
+//! exceptions keep the older print-and-park contract in `arch::riscv64::traps`.
 
 pub mod elf;
+pub mod futex;
 pub mod selftest;
 pub mod syscall;
 
 use core::fmt;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use alloc::sync::Arc;
 
@@ -63,8 +71,7 @@ use crate::memory::paging;
 use crate::memory::pmm;
 use crate::memory::FRAME_SIZE;
 use crate::sync::Spinlock;
-use crate::task::scheduler::{self, State};
-use crate::task::{self, TaskInfo, MAX_TASKS};
+use crate::task::scheduler;
 use crate::vfs::{self, VfsError, VfsNode};
 
 /// Embedded hello fixture: `write(1, "hello from user mode\n")`, `sched_yield`,
@@ -312,6 +319,10 @@ impl RunName {
 /// the runner owns the mappings itself and does the cleanup after the task is
 /// gone, which keeps page-table teardown out of trap context.
 struct RunState {
+    /// Monotonic run id: the key that scopes futex waiters to one program. It is
+    /// never reused, so a stale queue entry from a killed run can never wake a
+    /// thread of the next one.
+    id: u64,
     name: RunName,
     entry: usize,
     /// Initial user `sp`: 16-byte aligned, points at `argc`.
@@ -320,6 +331,17 @@ struct RunState {
     argc: usize,
     argv: usize,
     exit: Option<Exit>,
+    /// Scheduler id of the thread that started the program (`gettid` of the
+    /// main thread; `getpid` reports it for the whole run).
+    main_tid: u64,
+    /// Exit code the main thread passed to `exit`, recorded even when other
+    /// threads outlive it. The run returns this code, not the last thread's.
+    main_code: Option<u32>,
+    /// Threads of this run that have not exited yet, main included. The runner
+    /// waits for this to reach 0; `exit_group` and a fault set it to 0 after
+    /// retiring the survivors. Only this counter, not a task-state scan, defines
+    /// "the run is over".
+    threads: usize,
     /// Page-aligned current `brk` (starts at [`USER_HEAP_BASE`]).
     heap_end: usize,
     /// Physical frames backing `USER_HEAP_BASE..heap_end`, in mapping order.
@@ -335,6 +357,11 @@ struct RunState {
 }
 
 static RUN: Spinlock<Option<RunState>> = Spinlock::new(None);
+
+/// Next [`RunState::id`]. Monotonic for the whole boot; a new run never reuses
+/// the key of a previous one, which is what makes stale futex waiters harmless
+/// even if a teardown path ever missed one.
+static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
 
 // ─── console capture for the ABI selftest ─────────────────────────────────
 //
@@ -550,18 +577,23 @@ fn run_source<S: ImageSource + ?Sized>(
         return Err(UserError::ArgumentsTooLong);
     }
 
+    let run_id = NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed);
     {
         let mut slot = RUN.lock();
         if slot.is_some() {
             return Err(UserError::Busy);
         }
         *slot = Some(RunState {
+            id: run_id,
             name: RunName::new(argv0),
             entry: 0,
             sp: USER_TOP,
             argc,
             argv: USER_TOP,
             exit: None,
+            main_tid: 0,
+            main_code: None,
+            threads: 1,
             heap_end: USER_HEAP_BASE,
             heap_frames: [0; USER_HEAP_PAGES],
             heap_count: 0,
@@ -634,7 +666,20 @@ fn run_source<S: ImageSource + ?Sized>(
     // The descriptor table is per run: three console descriptors, no files.
     // Reset after the frame is built and before the task can issue an `ecall`.
     syscall::reset_fds();
-    let Some(id) = task::spawn(user_task) else {
+    // The main thread's id must be in `RunState` before the thread can run:
+    // `exit` of the main thread records its code there. `spawn_in_group` does
+    // not switch, but a timer tick between the spawn and the store would let
+    // the new thread run, so the pair is one interrupts-off region.
+    let spawned = crate::arch::riscv64::csr::without_interrupts(|| {
+        let id = scheduler::spawn_in_group(user_task, run_id);
+        if let Some(id) = id {
+            if let Some(run) = RUN.lock().as_mut() {
+                run.main_tid = id;
+            }
+        }
+        id
+    });
+    let Some(_) = spawned else {
         syscall::release_fds();
         release_stack(stack_base);
         loaded.release();
@@ -642,10 +687,10 @@ fn run_source<S: ImageSource + ?Sized>(
         return Err(UserError::TaskSlot);
     };
 
-    wait_for_exit(id);
-    // The task is `Exited`; its own PMM stack is reaped on this next scheduler
-    // entry. Reap explicitly so the caller's ledger does not depend on when the
-    // next unrelated tick happens.
+    wait_for_run_end();
+    // Every thread is `Exited`; each kernel stack is reaped on the next
+    // scheduler entry. Reap explicitly so the caller's ledger does not depend on
+    // when the next unrelated tick happens.
     let _ = scheduler::reap();
 
     // The program is gone, so its descriptors are too: a socket left open must
@@ -660,6 +705,10 @@ fn run_source<S: ImageSource + ?Sized>(
     loaded.release();
     let mut run = RUN.lock().take();
     if let Some(run) = run.as_mut() {
+        // `exit_group` and faults retire threads without them returning through
+        // `futex_wait`'s removal path; dropping the run's queue entries here is
+        // what keeps the next program from inheriting them.
+        futex::clear_run(run.id);
         release_mmap(run);
         release_heap(run);
     }
@@ -690,7 +739,7 @@ struct EntryStack {
 /// string lengths, so `sp` is computed up front and each string's pointer is
 /// written into the table as the string itself is copied. That is deliberate:
 /// an intermediate `[usize; N]` of addresses cost 512 bytes of the shell's
-/// 64 KiB boot stack, and the stack is already the deepest part of a
+/// 128 KiB boot stack, and the stack is already the deepest part of a
 /// file-backed `run` (the loader's page buffer lives there too). The table start
 /// is aligned down to 16 bytes, which is the entry `sp` alignment RISC-V
 /// requires.
@@ -1175,29 +1224,30 @@ fn release_stack(base: usize) {
     pmm::free_frames_contiguous(base, USER_STACK_PAGES);
 }
 
-/// Block the calling (shell) task until `id` is `Exited`.
+/// Block the calling (shell) task until the run's last thread has exited.
 ///
-/// `yield_now` is the whole wait primitive: the user task is the only runnable
-/// work, so the shell comes back as soon as that task leaves the scheduler. A
-/// user program that loops forever keeps the shell here, which is what running a
-/// program means; it is not a scheduler hang.
-fn wait_for_exit(id: u64) {
+/// The predicate is [`RunState::threads`], decremented by [`exit_thread`] and
+/// zeroed by [`exit_group`]/[`on_fault`] after they retire the survivors — not
+/// "the main task is Exited". A program is over only when every thread is gone;
+/// the runner must not release the shared address space while a `clone` child
+/// still runs on it.
+///
+/// `yield_now` is the whole wait primitive. A program that loops forever keeps
+/// the shell here, which is what running a program means; a thread blocked on a
+/// futex is not runnable, and the shell simply keeps yielding until the last
+/// thread leaves. The shell is still in the ready queue, so the scheduler always
+/// has something to run and the futex wait can safely switch to idle when it is
+/// the only other task.
+fn wait_for_run_end() {
     loop {
-        let mut infos = [TaskInfo::zeroed(); MAX_TASKS];
-        let count = task::snapshot(&mut infos);
-        let mut found = false;
-        for info in &infos[..count] {
-            if info.id == id {
-                found = true;
-                if info.state == State::Exited {
-                    return;
-                }
-            }
-        }
-        if !found {
-            // The table has no such thread: it has already been reaped and its
-            // slot reused, or a failed spawn was cleaned up elsewhere. Either way
-            // there is no task left to wait for.
+        let done = match RUN.lock().as_ref() {
+            Some(run) => run.threads == 0,
+            // The runner is the only taker of `RUN`, and it does not take it
+            // while waiting. `None` therefore means the run never started; do
+            // not spin on a state that cannot change.
+            None => true,
+        };
+        if done {
             return;
         }
         scheduler::yield_now();
@@ -1229,8 +1279,11 @@ fn user_task() {
 
 /// Leave S-mode for `entry` at user `sp`, with `a0 = argc` and `a1 = argv`.
 ///
-/// This is the only `sret` that enters user code. It runs on the task's own
-/// kernel stack and stores that stack pointer in `sscratch` first, so the first
+/// For the run's main thread this is the first `sret` into user code; a `clone`
+/// child instead starts through the exported trap-return epilogue with a
+/// hand-built [`TrapFrame`](crate::arch::riscv64::traps::TrapFrame), which is
+/// the same frame layout and the same `sret`. Both paths run on the task's own
+/// kernel stack and put that stack pointer in `sscratch` first, so the first
 /// trap from U-mode has somewhere safe to land (see the module docs). Interrupts
 /// are masked across the `sscratch`/`sstatus` setup and the `sret` itself: a
 /// timer tick in that window would otherwise look like a trap *from* U-mode and
@@ -1263,11 +1316,7 @@ unsafe fn enter_user(entry: usize, sp: usize, argc: usize, argv: usize) -> ! {
     // `argc`/`argv` before the sequence starts and never allocates `entry`,
     // `sp` or `status` to them. `mv sp` comes after `csrw sscratch, sp`, which
     // is the kernel stack pointer the first trap will switch to.
-    let mut status = crate::arch::riscv64::csr::read_sstatus();
-    status &= !(crate::arch::riscv64::csr::SSTATUS_SIE
-        | crate::arch::riscv64::csr::SSTATUS_SPP
-        | crate::arch::riscv64::csr::SSTATUS_SUM);
-    status |= crate::arch::riscv64::csr::SSTATUS_SPIE;
+    let status = crate::arch::riscv64::csr::user_entry_status();
     unsafe {
         core::arch::asm!(
             "csrci sstatus, 2",   // SIE = 0: no trap between arming and `sret`
@@ -1286,16 +1335,112 @@ unsafe fn enter_user(entry: usize, sp: usize, argc: usize, argv: usize) -> ! {
     }
 }
 
-/// End the current user task with `code` (syscall 93). Never returns to U-mode.
-pub(crate) fn exit_current(code: u32) -> ! {
+/// The id of the current thread, as `gettid` reports it.
+pub(crate) fn thread_id() -> u64 {
+    scheduler::current_id()
+}
+
+/// The id of the run the current thread belongs to, if a program is running.
+///
+/// The syscall layer uses it as the futex key and as the group tag for `clone`;
+/// a stale `ecall` after teardown has no run and gets `None`.
+pub(crate) fn current_run_id() -> Option<u64> {
+    RUN.lock().as_ref().map(|run| run.id)
+}
+
+/// Count one more live thread of the current run before `clone` spawns it.
+/// Returns false when no run exists.
+///
+/// The syscall trap runs with interrupts masked, so the child cannot run (and
+/// exit) between this charge and the spawn that publishes it; a failed spawn
+/// calls [`uncharge_thread`], keeping `threads` exactly equal to the number of
+/// scheduler tasks tagged with the run.
+pub(crate) fn charge_thread() -> bool {
+    let mut slot = RUN.lock();
+    match slot.as_mut() {
+        Some(run) => {
+            run.threads += 1;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Roll back [`charge_thread`] when the spawn it guarded failed.
+pub(crate) fn uncharge_thread() {
     if let Some(run) = RUN.lock().as_mut() {
-        run.exit = Some(Exit::Code(code));
+        run.threads = run.threads.saturating_sub(1);
+    }
+}
+
+/// `getpid`: the main thread's id for the whole run.
+///
+/// Threads of one program must see one process id; `gettid` is the per-thread
+/// answer. Falls back to the caller's id if a stale call arrives with no run.
+pub(crate) fn process_id() -> u64 {
+    // Drop the RUN guard before asking the scheduler: the two locks are never
+    // nested here, and the fallback only matters for a stale call with no run.
+    let pid = RUN.lock().as_ref().map(|run| run.main_tid);
+    pid.unwrap_or_else(scheduler::current_id)
+}
+
+/// End the calling thread with `code` (syscall 93). Never returns to U-mode.
+///
+/// This is a *thread* exit: the run continues while other threads remain. The
+/// main thread's code is recorded even if it exits first, because the run's
+/// result is the main thread's code by contract (a non-main thread's code is
+/// discarded). The last thread to leave finishes the run: it stores the exit
+/// status the runner will return after reaping.
+pub(crate) fn exit_thread(code: u32) -> ! {
+    let id = scheduler::current_id();
+    {
+        let mut slot = RUN.lock();
+        if let Some(run) = slot.as_mut() {
+            if run.main_tid == id {
+                run.main_code = Some(code);
+            }
+            run.threads = run.threads.saturating_sub(1);
+            if run.threads == 0 {
+                run.exit = Some(Exit::Code(run.main_code.unwrap_or(code)));
+            }
+        }
+    }
+    scheduler::exit()
+}
+
+/// End every thread of the run with `code` (syscall 94). Never returns.
+///
+/// The code is the main thread's if it already exited; otherwise it is the
+/// caller's. Survivors — runnable or blocked in a futex — are retired by
+/// [`scheduler::kill_group`] and never run again; their kernel stacks are
+/// reaped by the runner after the wait, and their fds/pages are the run's, so
+/// they are released once, by the runner, not here.
+pub(crate) fn exit_group(code: u32) -> ! {
+    let (run_id, final_code) = {
+        let mut slot = RUN.lock();
+        match slot.as_mut() {
+            Some(run) => (run.id, run.main_code.unwrap_or(code)),
+            None => (0, code),
+        }
+    };
+    if run_id != 0 {
+        let _ = scheduler::kill_group(run_id);
+    }
+    if let Some(run) = RUN.lock().as_mut() {
+        run.threads = 0;
+        run.exit = Some(Exit::Code(final_code));
     }
     scheduler::exit()
 }
 
 /// A U-mode exception: print one diagnostic line, record it as the run's result
-/// and end the task. Never returns to U-mode.
+/// and end *every* thread of the run. Never returns to U-mode.
+///
+/// A fault is process-fatal, as it is in POSIX: leaving the other threads alive
+/// could let a program whose invariant was violated — often while holding a
+/// userspace lock — continue and deadlock the run. Survivors are retired with
+/// [`scheduler::kill_group`], the same mechanism as `exit_group`, and the
+/// runner returns [`Exit::Fault`].
 ///
 /// The mapping cleanup is the runner's job (it knows the stack allocation and
 /// the `Loaded` value); this path only has to leave the scheduler, which is what
@@ -1303,10 +1448,12 @@ pub(crate) fn exit_current(code: u32) -> ! {
 pub fn on_fault(scause: usize, sepc: usize, stval: usize) -> ! {
     let reason = crate::arch::riscv64::traps::cause_name(scause);
     let mut name = RunName::new("user");
+    let mut run_id = 0u64;
     {
         let mut slot = RUN.lock();
         if let Some(run) = slot.as_mut() {
             name = run.name;
+            run_id = run.id;
             run.exit = Some(Exit::Fault {
                 reason,
                 cause: scause,
@@ -1322,5 +1469,11 @@ pub fn on_fault(scause: usize, sepc: usize, stval: usize) -> ! {
         stval,
         sepc
     );
+    if run_id != 0 {
+        let _ = scheduler::kill_group(run_id);
+    }
+    if let Some(run) = RUN.lock().as_mut() {
+        run.threads = 0;
+    }
     scheduler::exit()
 }

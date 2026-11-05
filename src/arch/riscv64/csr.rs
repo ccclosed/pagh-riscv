@@ -89,6 +89,23 @@ pub fn without_interrupts<R>(f: impl FnOnce() -> R) -> R {
     out
 }
 
+/// The `sstatus` value `sret` must consume to enter U-mode.
+///
+/// Built in Rust rather than with `csrci`/`csrsi`: SPP is bit 8 and SPIE is bit
+/// 5, and neither fits the 5-bit CSR-immediate field. The contract is
+/// `SIE = 0` (no trap between the caller's setup and `sret`), `SPP = 0` (the
+/// return goes to U-mode), `SPIE = 1` (U-mode runs with interrupts on) and
+/// `SUM = 0` (the supervisor may not touch user pages without opting in). Every
+/// other bit is preserved from the current CSR. Both `enter_user` and the
+/// start-of-thread frame builder use this one function, so the two entries
+/// cannot drift.
+#[inline]
+pub fn user_entry_status() -> usize {
+    let mut status = read_sstatus();
+    status &= !(SSTATUS_SIE | SSTATUS_SPP | SSTATUS_SUM);
+    status | SSTATUS_SPIE
+}
+
 #[inline]
 pub fn disable_interrupts() {
     // SAFETY: `csrci` clears a bit in `sstatus`; no memory effects.

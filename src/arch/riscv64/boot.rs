@@ -44,15 +44,17 @@ _start:
 
 // The boot stack is defined here, in the same file that loads it: `_start` sets
 // `sp` to `__stack_top`, so the size and the symbol have to be stated next to
-// each other or one of them drifts. 64 KiB is generous for a boot path that
-// allocates nothing, and the `.align 4` (16 bytes) keeps the ABI's requirement.
+// each other or one of them drifts. 128 KiB keeps the deepest normal-context
+// chain (a file-backed `run`, whose 4 KiB padding write and loader frames used
+// to leave under 1 KiB below this stack) from reaching the timer statics just
+// below `__stack_bottom`; the `.align 4` (16 bytes) keeps the ABI's requirement.
 global_asm!(
     r#"
     .section .bss
     .align 4
     .globl __stack_bottom
 __stack_bottom:
-    .space 65536
+    .space 131072
     .globl __stack_top
 __stack_top:
 "#

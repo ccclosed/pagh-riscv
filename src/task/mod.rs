@@ -1,11 +1,11 @@
 //! Kernel threads: the scheduler, the context switch it drives, and the tests
 //! that keep both honest.
 //!
-//! This is the M6a half of the milestone: threads *inside* the kernel, a
-//! round-robin ready queue and a preemption hook. There is no user mode, no
-//! system call and no address space per thread yet — those are M6b, and the
-//! interfaces here are the ones it builds on (`spawn` a thread whose body will
-//! become a user-program trampoline, `yield`/`tick` to switch, `exit` to end).
+//! Threads *inside* the kernel plus the scheduling primitives user threads use:
+//! a round-robin ready queue, a preemption hook, `block_current`/`wake_task` with
+//! tick deadlines, and `kill_group` for `exit_group`/fault. There is no address
+//! space per thread and no `sscratch` handling here — a user thread is a task
+//! whose context starts at the U-mode trap-return path (see `src/user/`).
 //!
 //! The architecture split follows the rest of the tree: [`crate::arch::riscv64::switch`]
 //! owns the register contract (which registers a switch must preserve and the

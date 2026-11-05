@@ -1,9 +1,12 @@
 //! The round-robin scheduler: kernel threads, their stacks and the switch.
 //!
-//! Scope of this milestone: *kernel* threads only. There is no user mode, no
-//! address-space switch, no `sscratch` stack and no `Blocked` state yet (M6b);
-//! a thread owns a PMM stack plus a saved [`TaskContext`](super::super::arch::riscv64::switch::TaskContext)
-//! and runs until it yields, is preempted by a tick, or returns from its entry.
+//! Scope: kernel threads *and* the scheduling half of native user threads. There
+//! is no address-space switch (one Sv39 map) and no `sscratch` handling here — a
+//! user thread is a task whose saved context starts at `traps::trap_return` or
+//! whose body calls `enter_user`; see `src/user/`. A thread owns a PMM stack plus
+//! a saved [`TaskContext`](super::super::arch::riscv64::switch::TaskContext) and
+//! runs until it yields, blocks, is preempted, exits or is retired by
+//! [`kill_group`].
 //!
 //! # What is in the table
 //!
@@ -17,10 +20,13 @@
 //! # States and the ready queue
 //!
 //! [`State`] is `Free` (slot unused), `Ready` (queued), `Running` (the current
-//! thread) and `Exited` (returned from its entry; its stack is reaped next time
-//! a scheduler entry runs). The ready queue is a ring of slot indices:
+//! thread), `Blocked` (waiting for [`wake_task`] or a tick deadline) and `Exited`
+//! (returned from its entry or retired by [`kill_group`]; its stack is reaped next
+//! time a scheduler entry runs). The ready queue is a ring of slot indices:
 //! push-back on switch-out, pop-front on switch-in. No allocation, no intrusive
 //! list, and the queue holds no pointer that could dangle when a slot is reused.
+//! [`kill_group`] retires slots behind the queue's back and rebuilds it from the
+//! slot states.
 //!
 //! # Lock discipline (single hart)
 //!
@@ -32,10 +38,13 @@
 //! interrupt source. That is stronger than the kernel's `csr::without_interrupts`
 //! closure, which only covers the closure body — and a lock guard outlives it.
 //!
-//! Lock order: scheduler → PMM. A spawn takes the thread's frames between two
-//! lock sections, a reap gives frames back after releasing the lock, and `init`
-//! takes idle's five frames under the lock exactly once; nothing takes the
-//! scheduler lock while holding the PMM or the heap lock.
+//! Lock order: scheduler → PMM, and futex queue → scheduler for the user-facing
+//! block/wake pair (that lock lives in `user::futex`, not here: `wake_task` is
+//! called under it, and nothing in this module calls into the futex table). A
+//! spawn takes the thread's frames between two lock sections, a reap gives frames
+//! back after releasing the lock, and `init` takes idle's five frames under the
+//! lock exactly once; nothing takes the scheduler lock while holding the PMM or
+//! the heap lock.
 //!
 //! # Preemption
 //!
@@ -53,7 +62,8 @@
 //! # Stacks
 //!
 //! A spawned thread's stack is [`STACK_ALLOC_FRAMES`] consecutive PMM frames:
-//! one guard frame, then [`STACK_SIZE`] usable bytes. The guard frame is filled
+//! one guard frame, then [`STACK_SIZE`] usable bytes. A user thread gets the same
+//! allocation; its user stack is the caller's and is never freed here. The guard frame is filled
 //! with [`GUARD_FILL`] except its last word, which holds [`CANARY`]; the usable
 //! area is filled with [`STACK_FILL`] so that a reaped stack reports a
 //! high-water mark ([`check_stack`]). An overflow past the bottom of the stack
@@ -68,11 +78,18 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::arch::riscv64::csr;
 use crate::arch::riscv64::switch::{self, TaskContext};
+use crate::arch::riscv64::traps::TrapFrame;
 use crate::memory::{pmm, FRAME_SIZE};
 use crate::sync::Spinlock;
 
-/// Task-table slots: the shell, the idle thread and six spawnable threads.
-pub const MAX_TASKS: usize = 8;
+/// Task-table slots: the shell, the idle thread and fourteen spawnable threads.
+///
+/// A user run owns at most [`MAX_TASKS`] - 2 of them (the shell and idle hold
+/// the other two), so this is also the hard cap on threads per program: the
+/// main thread plus thirteen `clone` children. The table is static, so raising
+/// it costs only address space; each live thread still costs its own PMM kernel
+/// stack.
+pub const MAX_TASKS: usize = 16;
 
 /// Ticks a thread runs before the scheduler switches away from it.
 pub const QUANTUM_TICKS: u32 = 8;
@@ -126,6 +143,9 @@ enum Reason {
     Yield,
     /// The thread returned from its entry: it leaves the queue for good.
     Exit,
+    /// `block_current`: the thread leaves the queue until `wake_task` or its
+    /// tick deadline makes it ready again.
+    Block,
     /// The selftest asks to run the idle thread once (it steps back on its own).
     ProbeIdle,
     /// Idle has nothing to wait for yet: give the CPU back without queueing.
@@ -141,6 +161,10 @@ pub enum State {
     Ready,
     /// The thread the CPU is executing right now.
     Running,
+    /// Waiting for a wakeup: not in the ready queue, and its stack is held
+    /// until it is either woken or the run is torn down. A blocked thread does
+    /// not consume CPU time; a tick can wake it at a deadline.
+    Blocked,
     /// Returned from its entry point; waiting for the next reap to give its
     /// stack frames back to the PMM.
     Exited,
@@ -153,6 +177,7 @@ impl State {
             State::Free => "free",
             State::Ready => "ready",
             State::Running => "running",
+            State::Blocked => "blocked",
             State::Exited => "exited",
         }
     }
@@ -228,6 +253,26 @@ impl TaskName {
     }
 }
 
+/// Why a [`block_current`] call returned.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BlockOutcome {
+    /// A wakeup (or a scheduler-level kill) made the thread runnable again.
+    Woken,
+    /// The tick deadline passed before any wakeup arrived.
+    TimedOut,
+}
+
+/// The reason recorded on a blocked task when it becomes runnable again.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WakeReason {
+    /// Not blocked (or just woke, before [`block_current`] read the field).
+    None,
+    /// [`wake_task`] found the thread and queued it.
+    Woken,
+    /// The tick scan found its deadline reached.
+    TimedOut,
+}
+
 /// One task-table entry.
 ///
 /// Public fields are deliberately not used by callers outside this module; the
@@ -241,7 +286,8 @@ struct Task {
     name: TaskName,
     state: State,
     /// Kernel-thread body; `None` only for the boot thread, which is already
-    /// running when the scheduler is built.
+    /// running when the scheduler is built, and for a user thread that starts
+    /// directly through the trap-return frame.
     entry: Option<fn()>,
     /// First frame of the stack allocation (guard frame), `0` for the boot
     /// thread's stack (the linker's `__stack_*`, not the scheduler's to free).
@@ -250,6 +296,15 @@ struct Task {
     stack_top: usize,
     /// Demo cohort this thread belongs to, compared against [`DEMO_EPOCH`].
     epoch: u64,
+    /// Run this thread belongs to (`0` for kernel threads). `kill_group` uses
+    /// it to retire every thread of a user program for `exit_group`/a fault;
+    /// it is not a scheduling priority.
+    group: u64,
+    /// Absolute scheduler tick at which a blocked thread times out (`0` = no
+    /// deadline). Only [`block_current`] writes it while the task is blocked.
+    wake_at: u64,
+    /// Why the thread left `Blocked`; read by [`block_current`] on resume.
+    wake_reason: WakeReason,
     /// Work counter, bumped by the demo body and by the selftest's worker. Atomic
     /// because the shell reads it between scheduler entries, from another context.
     counter: AtomicU64,
@@ -270,6 +325,9 @@ impl Task {
             stack_base: 0,
             stack_top: 0,
             epoch: 0,
+            group: 0,
+            wake_at: 0,
+            wake_reason: WakeReason::None,
             counter: AtomicU64::new(0),
             switches: 0,
         }
@@ -497,6 +555,9 @@ pub fn init() {
         (*shell).stack_base = 0;
         (*shell).stack_top = 0;
         (*shell).epoch = 0;
+        (*shell).group = 0;
+        (*shell).wake_at = 0;
+        (*shell).wake_reason = WakeReason::None;
         (*shell).counter.store(0, Ordering::Relaxed);
         (*shell).switches = 0;
 
@@ -504,6 +565,9 @@ pub fn init() {
         (*idle).name.set("idle");
         (*idle).entry = Some(idle_main);
         (*idle).epoch = 0;
+        (*idle).group = 0;
+        (*idle).wake_at = 0;
+        (*idle).wake_reason = WakeReason::None;
         (*idle).counter.store(0, Ordering::Relaxed);
         (*idle).switches = 0;
     }
@@ -541,16 +605,96 @@ pub fn init() {
 /// the frame allocator has no run of [`STACK_ALLOC_FRAMES`] frames. The thread
 /// starts queued (`Ready`) and runs after the next tick/yield of the caller.
 pub fn spawn(entry: fn()) -> Option<u64> {
-    spawn_thread(entry, 0)
+    spawn_thread(entry, 0, 0)
+}
+
+/// [`spawn`] tagging the thread as a member of a user run.
+///
+/// The tag is what [`kill_group`] retires on `exit_group` and what the runner
+/// uses (through `RunState::threads`, not the tag itself) to know a program is
+/// over. Kernel threads carry `0`.
+pub fn spawn_in_group(entry: fn(), group: u64) -> Option<u64> {
+    spawn_thread(entry, 0, group)
+}
+
+/// Create a *user* thread that starts directly in U-mode.
+///
+/// Unlike [`spawn`], no kernel body runs in the new thread: its context points
+/// at [`trap_return_address`](super::super::arch::riscv64::traps::trap_return_address)
+/// and its stack holds a hand-built [`TrapFrame`](super::super::arch::riscv64::traps::TrapFrame)
+/// that the ordinary trap epilogue consumes. That is the same frame layout and
+/// the same `sret` path a trap from U-mode returns through, and the same
+/// `sscratch` re-arm — there is no second user-entry implementation.
+///
+/// `entry` is the user PC, `stack` the initial user `sp` (16-byte aligned),
+/// `arg` is delivered in `a0`; `gp`/`tp` are inherited from the calling thread
+/// so a cloned thread sees the same small-data pointer and TLS register as its
+/// parent (the kernel itself has no TLS). All other registers start at zero.
+pub fn spawn_user_thread(
+    entry: usize,
+    stack: usize,
+    arg: usize,
+    gp: usize,
+    tp: usize,
+    group: u64,
+) -> Option<u64> {
+    let _mask = InterruptsOff::new();
+    let (slot, base, stack_top) = reserve_stack()?;
+
+    // The frame lives at the top of the new kernel stack, exactly where a
+    // `trap_entry` from U-mode would build it (`sscratch = stack_top`, then
+    // `sp -= sizeof(TrapFrame)`). The epilogue restores `sepc`, `sstatus`, the
+    // user `sp` and every GPR, then `sret`s.
+    let frame_base = stack_top - core::mem::size_of::<TrapFrame>();
+    // SAFETY: `frame_base` is inside this thread's freshly allocated, writable
+    // kernel stack (`STACK_SIZE` is far larger than one frame), and nothing else
+    // owns it yet. Zeroing the whole frame is deliberate: a register not named
+    // below starts as 0, not as leftover kernel state that U-mode could read.
+    unsafe {
+        core::ptr::write_bytes(frame_base as *mut u8, 0, core::mem::size_of::<TrapFrame>());
+        let frame = frame_base as *mut TrapFrame;
+        (*frame).sp = stack;
+        (*frame).gp = gp;
+        (*frame).tp = tp;
+        (*frame).a0 = arg;
+        (*frame).sepc = entry;
+        (*frame).sstatus = csr::user_entry_status();
+    }
+    let context = TaskContext {
+        ra: crate::arch::riscv64::traps::trap_return_address(),
+        sp: frame_base,
+        ..TaskContext::zeroed()
+    };
+    Some(commit_task(
+        slot, base, stack_top, None, context, 0, group, "thread-",
+    ))
 }
 
 /// `spawn` with a demo cohort tag; the tag is only read by [`demo_main`].
-fn spawn_thread(entry: fn(), epoch: u64) -> Option<u64> {
+fn spawn_thread(entry: fn(), epoch: u64, group: u64) -> Option<u64> {
     let _mask = InterruptsOff::new();
+    let (slot, base, stack_top) = reserve_stack()?;
+    let context = switch::initial_context(task_entry, stack_top);
+    Some(commit_task(
+        slot,
+        base,
+        stack_top,
+        Some(entry),
+        context,
+        epoch,
+        group,
+        "task-",
+    ))
+}
 
-    // Two phases so that no frame allocation happens under the scheduler lock:
-    // (1) find a slot, (2) take frames, (3) commit. Nothing can steal the slot in
-    // between because interrupts are masked and this is the only hart.
+/// Find a slot and take its stack frames.
+///
+/// The caller holds interrupts masked (both `spawn` paths start with
+/// [`InterruptsOff`]), so the slot cannot be stolen between the search, the PMM
+/// allocation and [`commit_task`]. No frame allocation happens under the
+/// scheduler lock: the slot is chosen, the lock is dropped, the frames are
+/// taken, and only then is the task committed.
+fn reserve_stack() -> Option<(usize, usize, usize)> {
     let slot = {
         let sched = SCHED.lock();
         if !sched.initialized {
@@ -558,16 +702,27 @@ fn spawn_thread(entry: fn(), epoch: u64) -> Option<u64> {
         }
         find_free_slot()
     }?;
-
-    // `?` above deliberately runs with the mask still on: a failed spawn must not
-    // leak frames, and it does not take any until after the slot is known.
-    let base = match pmm::alloc_frames_contiguous(STACK_ALLOC_FRAMES) {
-        Some(base) => base,
-        None => return None,
-    };
+    let base = pmm::alloc_frames_contiguous(STACK_ALLOC_FRAMES)?;
     prepare_stack(base);
     let stack_top = base + GUARD_SIZE + STACK_SIZE;
+    Some((slot, base, stack_top))
+}
 
+/// Publish a fully prepared task in `slot` and queue it.
+///
+/// The caller holds interrupts masked and has just filled the stack; the
+/// scheduler lock covers the id, the fields and the ready-queue push.
+#[allow(clippy::too_many_arguments)]
+fn commit_task(
+    slot: usize,
+    base: usize,
+    stack_top: usize,
+    entry: Option<fn()>,
+    context: TaskContext,
+    epoch: u64,
+    group: u64,
+    name_prefix: &str,
+) -> u64 {
     let mut sched = SCHED.lock();
     let t = task(slot);
     let id = sched.next_id;
@@ -577,18 +732,21 @@ fn spawn_thread(entry: fn(), epoch: u64) -> Option<u64> {
     // belongs to this thread until it exits and is reaped.
     unsafe {
         (*t).id = id;
-        (*t).name.set_numbered("task-", id);
+        (*t).name.set_numbered(name_prefix, id);
         (*t).state = State::Ready;
-        (*t).entry = Some(entry);
+        (*t).entry = entry;
         (*t).stack_base = base;
         (*t).stack_top = stack_top;
         (*t).epoch = epoch;
+        (*t).group = group;
+        (*t).wake_at = 0;
+        (*t).wake_reason = WakeReason::None;
         (*t).counter.store(0, Ordering::Relaxed);
         (*t).switches = 0;
-        (*t).context = switch::initial_context(task_entry, stack_top);
+        (*t).context = context;
     }
     push_ready(&mut sched, slot);
-    Some(id)
+    id
 }
 
 /// Find a slot for `spawn`: a never-used one first (so a freshly exited thread's
@@ -737,7 +895,7 @@ fn idle_main() {
             // with the timer attached, its interrupt is what makes it return.
             unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
         } else {
-            schedule(Reason::IdleStep);
+            schedule(Reason::IdleStep, None);
         }
     }
 }
@@ -768,7 +926,7 @@ extern "C" fn task_entry() -> ! {
 /// Let the next runnable thread run; the caller continues when it is scheduled
 /// again. This is the only voluntary switch.
 pub fn yield_now() {
-    schedule(Reason::Yield);
+    schedule(Reason::Yield, None);
 }
 
 /// End the calling thread. Never returns.
@@ -777,12 +935,153 @@ pub fn yield_now() {
 /// switch completes — but the slot is `Exited` before the switch, so the next
 /// scheduler entry from any other context reaps the frames.
 pub fn exit() -> ! {
-    schedule(Reason::Exit);
+    schedule(Reason::Exit, None);
     // A thread that exited is never made runnable again; if it ever were, its
     // stack may already belong to the frame allocator and parking is the only
     // safe answer. This line is unreachable by construction.
     crate::kprintln!("[task] an exited thread was scheduled again; parking");
     crate::arch::riscv64::park_forever()
+}
+
+/// Block the calling thread until [`wake_task`] names its id or
+/// `timeout_ticks` scheduler ticks pass.
+///
+/// The switch is a normal scheduler switch: interrupts are masked for the
+/// decision and the context switch, other threads run in between, and this
+/// function returns on the thread's own kernel stack when it is scheduled
+/// again. Nothing is held across the switch — a caller with a wait-queue lock
+/// must release it first and re-acquire it on return (this kernel's futex code
+/// does exactly that, and the queue is keyed so a lost wakeup cannot happen).
+///
+/// `timeout_ticks` is measured from the current tick; `None` waits forever and
+/// `Some(0)` is the caller's "already expired" case (it returns
+/// [`BlockOutcome::TimedOut`] without switching, so a syscall can answer
+/// `-ETIMEDOUT` before touching the queue). Deadlines are scanned by the timer
+/// tick; without a hardware clock a timed wait needs a caller that pumps
+/// [`tick`], which is the same rule the rest of the software clock follows.
+pub fn block_current(timeout_ticks: Option<u64>) -> BlockOutcome {
+    if timeout_ticks == Some(0) {
+        return BlockOutcome::TimedOut;
+    }
+    schedule(Reason::Block, timeout_ticks);
+    let slot = CURRENT_SLOT.load(Ordering::Relaxed);
+    // SAFETY: we are the running thread, so this slot is ours; `wake_reason`
+    // was set by `wake_task` or the tick scan before the scheduler made us
+    // runnable, and only this thread writes it again at the next block.
+    let reason = unsafe { (*task(slot)).wake_reason };
+    match reason {
+        WakeReason::TimedOut => BlockOutcome::TimedOut,
+        WakeReason::Woken | WakeReason::None => BlockOutcome::Woken,
+    }
+}
+
+/// Make the blocked thread `id` runnable again. Returns whether it was blocked.
+///
+/// This is the wake half of [`block_current`]. It only queues the task; the
+/// wakee runs when the caller yields, blocks, or the next tick expires the
+/// caller's quantum — a wakeup never switches contexts by itself. The caller
+/// must not hold a lock the wakee will need without releasing it first (the
+/// futex queue calls this with its own lock held only because the woken thread
+/// never takes that lock before it is scheduled; see `user::futex`).
+pub fn wake_task(id: u64) -> bool {
+    let _mask = InterruptsOff::new();
+    let mut sched = SCHED.lock();
+    for slot in 0..MAX_TASKS {
+        let t = task(slot);
+        // SAFETY: slot is in range and the scheduler lock is held, so the
+        // fields cannot change under us.
+        unsafe {
+            if (*t).id == id && (*t).state == State::Blocked {
+                (*t).wake_reason = WakeReason::Woken;
+                (*t).wake_at = 0;
+                (*t).state = State::Ready;
+                push_ready(&mut sched, slot);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Retire every non-current thread of `group`: mark it `Exited`, drop it from
+/// the ready queue and forget any timeout.
+///
+/// This is how `exit_group` and a fault end a whole program on one hart: no
+/// other thread is executing while this runs (interrupts are masked), so
+/// marking its slot is enough to guarantee it is never scheduled again; the
+/// next reap returns its kernel stack. Returns how many threads were retired.
+pub fn kill_group(group: u64) -> usize {
+    if group == 0 {
+        return 0;
+    }
+    let _mask = InterruptsOff::new();
+    let mut sched = SCHED.lock();
+    let current = CURRENT_SLOT.load(Ordering::Relaxed);
+    let mut killed = 0usize;
+    for slot in 0..MAX_TASKS {
+        if slot == current {
+            continue;
+        }
+        let t = task(slot);
+        // SAFETY: slot is in range and the scheduler lock is held with
+        // interrupts masked; no thread can be running somewhere else on a
+        // single hart, so `Ready`/`Blocked` are the only live states here.
+        unsafe {
+            if (*t).group == group && matches!((*t).state, State::Ready | State::Blocked) {
+                (*t).state = State::Exited;
+                (*t).wake_at = 0;
+                (*t).wake_reason = WakeReason::None;
+                killed += 1;
+            }
+        }
+    }
+    compact_ready(&mut sched);
+    killed
+}
+
+/// Run the tick deadline scan and queue every blocked thread whose time is up.
+///
+/// Called from [`pick_next`] for a clock tick, under the scheduler lock. It is
+/// a bounded scan of the static table (no allocation, no printing) because a
+/// tick handler may run it.
+fn wake_expired(sched: &mut Sched) {
+    let now = sched.ticks;
+    for slot in 0..MAX_TASKS {
+        let t = task(slot);
+        // SAFETY: slot is in range and the caller holds the scheduler lock with
+        // interrupts masked.
+        unsafe {
+            if (*t).state == State::Blocked && (*t).wake_at != 0 && (*t).wake_at <= now {
+                (*t).wake_at = 0;
+                (*t).wake_reason = WakeReason::TimedOut;
+                (*t).state = State::Ready;
+                push_ready(sched, slot);
+            }
+        }
+    }
+}
+
+/// Drop every ready-queue entry whose slot is no longer `Ready`.
+///
+/// [`kill_group`] retires slots behind the queue's back; rebuilding from the
+/// slot states is simpler and safer than searching for each index, and the
+/// queue is at most [`MAX_TASKS`] entries.
+fn compact_ready(sched: &mut Sched) {
+    let old = sched.ready;
+    let head = sched.ready_head;
+    let len = sched.ready_len;
+    let mut kept = 0usize;
+    for index in 0..len {
+        let slot = old[(head + index) % MAX_TASKS] as usize;
+        let t = task(slot);
+        // SAFETY: the queue only ever stores in-range slots, and the caller
+        // holds the scheduler lock.
+        if unsafe { (*t).state == State::Ready } {
+            sched.ready[(head + kept) % MAX_TASKS] = slot as u8;
+            kept += 1;
+        }
+    }
+    sched.ready_len = kept;
 }
 
 /// One clock tick: run the current thread's quantum down and switch when it
@@ -792,7 +1091,7 @@ pub fn exit() -> ! {
 /// through [`pump`]. Once M3 merges, the timer interrupt calls it (through
 /// [`tick_from_timer`]) and those software call sites become no-ops.
 pub fn tick() {
-    schedule(Reason::Quantum);
+    schedule(Reason::Quantum, None);
 }
 
 /// The M3 seam: the timer interrupt's handler.
@@ -816,7 +1115,7 @@ pub fn tick() {
 #[allow(dead_code)] // wired by the one line above once `riscv64/timer.rs` merges (M3)
 pub fn tick_from_timer() {
     HARDWARE_CLOCK.store(true, Ordering::Relaxed);
-    schedule(Reason::Quantum);
+    schedule(Reason::Quantum, None);
 }
 
 /// Whether a real timer is driving the clock (set by [`tick_from_timer`]).
@@ -829,7 +1128,7 @@ pub fn timer_clock_attached() -> bool {
 /// the two places a timer interrupt will preempt once M3 lands.
 pub fn pump() {
     if !HARDWARE_CLOCK.load(Ordering::Relaxed) {
-        schedule(Reason::Quantum);
+        schedule(Reason::Quantum, None);
     }
 }
 
@@ -841,7 +1140,7 @@ pub fn pump() {
 /// wait will be), but it is the same switch.
 pub fn run_idle_once() -> bool {
     let before = IDLE_WAKES.load(Ordering::Relaxed);
-    schedule(Reason::ProbeIdle);
+    schedule(Reason::ProbeIdle, None);
     IDLE_WAKES.load(Ordering::Relaxed) > before
 }
 
@@ -855,7 +1154,7 @@ pub fn spawn_demo(count: usize) -> usize {
     let count = count.min(MAX_TASKS - FIRST_SPAWNABLE_SLOT);
     let mut started = 0usize;
     for _ in 0..count {
-        if spawn_thread(demo_main, epoch).is_some() {
+        if spawn_thread(demo_main, epoch, 0).is_some() {
             started += 1;
         }
     }
@@ -872,7 +1171,7 @@ pub fn cancel_demo() -> usize {
     DEMO_EPOCH.fetch_add(1, Ordering::Relaxed);
     let mut pumped = 0usize;
     while foreign_tasks() > 0 && pumped < QUIESCE_LIMIT {
-        schedule(Reason::Quantum);
+        schedule(Reason::Quantum, None);
         pumped += 1;
     }
     reap()
@@ -894,7 +1193,7 @@ pub fn foreign_tasks() -> usize {
         let t = task(slot);
         // SAFETY: slot is in range and the scheduler lock is held.
         unsafe {
-            if matches!((*t).state, State::Ready | State::Running) {
+            if matches!((*t).state, State::Ready | State::Running | State::Blocked) {
                 live += 1;
             }
         }
@@ -908,7 +1207,7 @@ pub fn foreign_tasks() -> usize {
 /// pointer and the switch must be atomic with respect to a timer tick. No
 /// allocation happens here — the only work besides state changes is giving
 /// already-reaped stacks back to the PMM, whose lock nests inside this mask.
-fn schedule(reason: Reason) {
+fn schedule(reason: Reason, timeout_ticks: Option<u64>) {
     let _mask = InterruptsOff::new();
     let mut bases = [0usize; MAX_TASKS];
     let (pair, reap_count) = {
@@ -916,7 +1215,7 @@ fn schedule(reason: Reason) {
         if !sched.initialized {
             return;
         }
-        let pair = pick_next(&mut sched, reason);
+        let pair = pick_next(&mut sched, reason, timeout_ticks);
         let reap_count = collect_reaps(&mut bases);
         (pair, reap_count)
     };
@@ -945,7 +1244,11 @@ fn schedule(reason: Reason) {
 ///
 /// The caller holds the scheduler lock with interrupts masked. Returns
 /// `(from_slot, to_slot)` when a switch is due, `None` to keep running.
-fn pick_next(sched: &mut Sched, reason: Reason) -> Option<(usize, usize)> {
+fn pick_next(
+    sched: &mut Sched,
+    reason: Reason,
+    timeout_ticks: Option<u64>,
+) -> Option<(usize, usize)> {
     let current = CURRENT_SLOT.load(Ordering::Relaxed);
 
     // The quantum is only run down when there is somebody else to run; otherwise
@@ -954,6 +1257,9 @@ fn pick_next(sched: &mut Sched, reason: Reason) -> Option<(usize, usize)> {
     match reason {
         Reason::Quantum => {
             sched.ticks += 1;
+            // Deadlines are a tick feature: a blocked thread is not on the ready
+            // queue, so this scan is the only thing that can notice one expired.
+            wake_expired(sched);
             if sched.ready_len == 0 {
                 sched.quantum_left = QUANTUM_TICKS;
                 return None;
@@ -969,7 +1275,7 @@ fn pick_next(sched: &mut Sched, reason: Reason) -> Option<(usize, usize)> {
                 return None;
             }
         }
-        Reason::Exit | Reason::ProbeIdle | Reason::IdleStep => {}
+        Reason::Exit | Reason::Block | Reason::ProbeIdle | Reason::IdleStep => {}
     }
 
     // Retire or requeue the outgoing thread.
@@ -991,6 +1297,19 @@ fn pick_next(sched: &mut Sched, reason: Reason) -> Option<(usize, usize)> {
         Reason::Exit => {
             // SAFETY: as above; the thread has returned from its entry.
             unsafe { (*outgoing).state = State::Exited };
+        }
+        Reason::Block => {
+            // SAFETY: as above. `wake_at` is an absolute scheduler tick; `0`
+            // means "no deadline", so a zero duration never reaches here
+            // (`block_current` answers it before the switch).
+            unsafe {
+                (*outgoing).state = State::Blocked;
+                (*outgoing).wake_reason = WakeReason::None;
+                (*outgoing).wake_at = match timeout_ticks {
+                    Some(ticks) => sched.ticks.saturating_add(ticks),
+                    None => 0,
+                };
+            }
         }
         Reason::ProbeIdle => {
             // SAFETY: as above. The boot thread (or whoever probes) waits in the
@@ -1014,18 +1333,25 @@ fn pick_next(sched: &mut Sched, reason: Reason) -> Option<(usize, usize)> {
         _ => match pop_ready(sched) {
             Some(slot) => slot,
             None => {
-                // Idle stepping back with nothing queued means the probe was
-                // called from idle itself; just stay there.
-                if reason == Reason::IdleStep {
-                    // SAFETY: as above; restore the running state we changed.
-                    unsafe { (*outgoing).state = State::Running };
-                    return None;
+                // A blocked thread with nothing else runnable hands the CPU to
+                // idle; the timer (or a wakeup, which queues the wakee) makes
+                // the next switch.
+                if reason == Reason::Block && current != IDLE_SLOT {
+                    IDLE_SLOT
+                } else {
+                    // Idle stepping back with nothing queued means the probe was
+                    // called from idle itself; just stay there.
+                    if reason == Reason::IdleStep {
+                        // SAFETY: as above; restore the running state we changed.
+                        unsafe { (*outgoing).state = State::Running };
+                        return None;
+                    }
+                    // The boot thread is always queued while a spawned thread
+                    // runs, so this is unreachable by construction. Report and
+                    // park rather than switch into a thread that is not there.
+                    crate::kprintln!("[task] no runnable thread after exit; parking");
+                    crate::arch::riscv64::park_forever();
                 }
-                // The boot thread is always queued while a spawned thread runs,
-                // so this is unreachable by construction. Report and park rather
-                // than switch into a thread that is not there.
-                crate::kprintln!("[task] no runnable thread after exit; parking");
-                crate::arch::riscv64::park_forever();
             }
         },
     };
@@ -1130,7 +1456,7 @@ pub fn stats() -> Stats {
                     live += 1;
                     ready += 1;
                 }
-                State::Running | State::Exited => live += 1,
+                State::Running | State::Blocked | State::Exited => live += 1,
             }
         }
     }

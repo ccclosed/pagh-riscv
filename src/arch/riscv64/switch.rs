@@ -175,10 +175,12 @@ extern "C" {
 /// * Interrupts must be disabled around the pair of stores/loads: a trap that
 ///   re-entered the scheduler between the two halves would switch the same
 ///   thread twice. The scheduler's critical section provides that mask.
-/// * `to` must describe a context that is runnable: either a saved context of a
-///   live thread or one built by [`initial_context`]. A `sp` that is not the
-///   thread's own 16-byte-aligned stack top is memory corruption as far as this
-///   function can tell.
+/// * `to` must describe a context that is runnable: a saved context of a live
+///   thread, one built by [`initial_context`], or (for a user thread) a context
+///   whose `ra` is the trap-return epilogue and whose `sp` is the frame base at
+///   the top of the thread's kernel stack. Either way `sp` must belong to that
+///   thread's own stack allocation; a fresh kernel thread's `sp` is its aligned
+///   stack top, while a user thread's is `top - size_of::<TrapFrame>()`.
 #[inline]
 pub unsafe fn switch(from: *mut TaskContext, to: *const TaskContext) {
     // SAFETY: the caller upheld the contract above; `task_switch` is the

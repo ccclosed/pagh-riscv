@@ -580,7 +580,7 @@ pub fn load<S: ImageSource + ?Sized>(source: &S, bias: usize) -> Result<Loaded, 
     // One small stack buffer serves every segment: each read is bounded by the
     // page it lands in and by `SEGMENT_CHUNK`, so the loader's own footprint does
     // not grow with the image. 512 bytes (not a whole page) is deliberate: the
-    // shell runs on the 64 KiB boot stack, `run_file` is its deepest call chain,
+    // shell runs on the 128 KiB boot stack, `run_file` is its deepest call chain,
     // and a 4 KiB buffer here left barely any headroom below the stack on a
     // file-backed image. The cost is a handful of extra VFS reads.
     const SEGMENT_CHUNK: usize = 512;

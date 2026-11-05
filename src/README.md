@@ -46,12 +46,13 @@
 | `shell.rs` | цикл консоли, редактор строки, команды |
 | `arch/riscv64/switch.rs` | второй ABI ядра: `TaskContext` (ra/sp/s0–s11) и `task_switch` |
 | `task/mod.rs` | фасад планировщика |
-| `task/scheduler.rs` | таблица потоков, ready-queue, квант, стеки из PMM, `tick`/`yield`/`exit`/`reap`, вытеснение таймером |
+| `task/scheduler.rs` | таблица потоков, ready-queue, квант, стеки из PMM, `tick`/`yield`/`exit`/`reap`, `block_current`/`wake_task`/`kill_group`/`spawn_user_thread`, вытеснение таймером |
 | `task/selftest.rs` | пять проверок планировщика для `selftest` |
-| `user/mod.rs` | `run_image`/`run_file`: ELF → user-стек → SysV-кадр `argc/argv/envp` → задача → `sret` в U-mode → reap; `brk`-heap, `on_fault`, capture для ABI-теста; встроенные hello/fault/spin/argv/abi |
+| `user/mod.rs` | `run_image`/`run_file`: ELF → user-стек → SysV-кадр `argc/argv/envp` → главный поток группы → `sret` в U-mode → ожидание `threads == 0` → reap; `brk`-heap, `on_fault` (убивает группу), `exit_thread`/`exit_group`, capture для ABI-теста; встроенные hello/fault/spin/argv/abi |
+| `user/futex.rs` | статическая futex-очередь: 32 ожидающих на 16 адресов, ключ `(run, uaddr)`, `wait`/`wake`/`clear_run` поверх `block_current`/`wake_task` |
 | `user/elf.rs` | ELF64-загрузчик: валидация до первого кадра, `PT_LOAD` с `U=1`, потоковые сегменты кусками ≤ 512 B, откат кадров, `Loaded`/`ElfError` |
-| `user/syscall.rs` | native ABI: `read`/`write`/`openat`/`close`/`lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/`readlinkat`/`exit`/`sched_yield`/`getpid` + мутации `mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`/`ftruncate` + сокеты `socket`/`connect`/`sendto`/`recvfrom`/`setsockopt`/`getsockopt`/`shutdown`; fd-таблица (включая `FdEntry::Socket`) и таблица режимов на прогон, `copy_from_user`/`copy_to_user`, `sepc+4` |
-| `user/selftest.rs` | десять проверок user-mode для `selftest` (argv-строка, все syscall'ы ABI, ELF-матрица, fault, таймер, 100 KiB) |
+| `user/syscall.rs` | native ABI: `read`/`write`/`openat`/`close`/`lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/`readlinkat`/`exit`/`exit_group`/`set_tid_address`/`futex`/`sched_yield`/`getpid`/`gettid`/`clone` + мутации `mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`/`ftruncate` + сокеты `socket`/`connect`/`sendto`/`recvfrom`/`setsockopt`/`getsockopt`/`shutdown`; fd-таблица (включая `FdEntry::Socket`) и таблица режимов на прогон, `copy_from_user`/`copy_to_user`, `sepc+4` |
+| `user/selftest.rs` | десять проверок user-mode для `selftest` (argv-строка, все syscall'ы ABI + потоки/futex, ELF-матрица, fault, таймер, 100 KiB) |
 | `net/mod.rs` | сетевой стек: состояние, ARP-кэш, `poll()`, диспетчер ARP/IPv4/ICMP/UDP/TCP, `ping`, DHCP-конфигурация |
 | `net/wire.rs` | чистые форматы Ethernet/ARP/IPv4/ICMP/UDP/TCP/DHCP/DNS и контрольные суммы (без устройства и часов) |
 | `net/dhcp.rs` | DHCP-клиент DISCOVER/OFFER/REQUEST/ACK |
@@ -76,7 +77,7 @@
 | # | Фаза | Код | Почему здесь |
 |---|---|---|---|
 | 1 | `_start`: OpenSBI запускает ровно один hart (id может быть не 0) | `arch/riscv64/boot.rs` | нельзя предполагать hart 0 |
-| 2 | стек `sp = __stack_top`, 64 KiB в `.bss`, выравнивание 16 | `arch/riscv64/boot.rs:18-21, 44-54` | на входе `sp` произвольный |
+| 2 | стек `sp = __stack_top`, 128 KiB в `.bss`, выравнивание 16 | `arch/riscv64/boot.rs:18-21, 44-56` | на входе `sp` произвольный; ниже стека статики таймера, переполнение — тихая порча |
 | 3 | hart id → `BOOT_HART_ID` | `arch/riscv64/boot.rs:23-28` | `mhartid` из S-mode недоступен, а `a0` ещё цел |
 | 4 | `call kmain(a0, a1)` | `arch/riscv64/boot.rs:30-31` | аргументы уже в нужных регистрах |
 | 5 | `console::init()`: UART, затем попытка поднять экран (`framebuffer::init`) | `main.rs:53`, `console.rs:44-48` | без UART не видно, почему нет экрана; отсутствие экрана — не ошибка |

@@ -103,7 +103,7 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
   (+ `src/drivers/README.md`), `fs/{ext2,format_policy,selftest}.rs`
   (+ `src/fs/README.md`), `vfs/mod.rs` (+ `src/vfs/README.md`),
   `task/{mod,scheduler,selftest}.rs` (+ `src/task/README.md`),
-  `user/{mod,elf,syscall,selftest}.rs` (+ `src/user/README.md`),
+  `user/{mod,elf,syscall,selftest,futex}.rs` (+ `src/user/README.md`),
   `net/{mod,wire,dhcp,dns,tcp,selftest}.rs` (+ `src/net/README.md`),
   `pkg/{mod,sha256}.rs` (+ `src/pkg/README.md`), `console.rs`, `shell.rs`,
   `sync.rs`.
@@ -241,37 +241,48 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
     that fails to mount must never become permission to erase what is on the disk.
 18. **Formatting is a gate.** Run `cargo fmt --all` before committing; CI checks it.
 19. **`ecall` returns at `sepc + 4`.** `user::syscall::dispatch` bumps the saved
-    `sepc` after every returning syscall; `exit` never returns (it calls
-    `scheduler::exit`). `sret` resumes exactly at `sepc`, so without the bump a
+    `sepc` after every returning syscall; `exit`/`exit_group` never return (they
+    call `scheduler::exit` after accounting the run). `sret` resumes exactly at `sepc`, so without the bump a
     program loops on the same `ecall` forever — this actually happened to `hello`
     and `fault` before the fix. The trap frame's `sepc` field is part of the
     contract; change the bump and the ABI together.
 20. **`sscratch` is a two-state invariant.** While S-mode runs, `sscratch == 0`
-    (`traps::init` writes it); before `sret` into U-mode, `enter_user` stores the
-    task's kernel stack pointer there. `trap_entry` starts with
+    (`traps::init` writes it); before `sret` into U-mode, `enter_user` (main
+    thread) or the `trap_return` epilogue (a `clone` child's first entry) stores
+    the task's kernel stack pointer there. `trap_entry` starts with
     `csrrw sp, sscratch, sp`: a nonzero `sp` means "came from U-mode", the user
     `sp` goes to frame slot 8 and `sscratch` is cleared; zero is an ordinary
     S-mode trap. The epilogue splits on the **saved** `sstatus.SPP` and, for
     U-mode, re-arms `sscratch` with `frame_base + 264` before restoring the user
     `sp`. Do not read/write `sscratch` outside `traps.rs`/`user/mod.rs`; there is
-    exactly one `sret` into U-mode.
-21. **`enter_user` builds `sstatus` in Rust.** `SIE=0, SPP=0, SPIE=1, SUM=0` via
-    `csrw sstatus`, not `csrci`/`csrsi`: SPIE (bit 5) and SPP (bit 8) do not fit
-    the 5-bit CSR immediate, and the earlier `csrci 8`/`csrsi 5` silently left
-    them wrong (the machine still booted, which is how it hid). `sret` then enters
-    U-mode with interrupts on and supervisor access to user pages off.
-22. **U-mode faults kill the task, never the hart.** Any synchronous exception
+    exactly one epilogue that `sret`s into U-mode (`enter_user` is a one-shot
+    setup of that same state for the main thread, not a second layout).
+21. **User entry builds `sstatus` in Rust, once.** `enter_user` and the
+    `clone`-child frame builder both call `csr::user_entry_status()`:
+    `SIE=0, SPP=0, SPIE=1, SUM=0`. It is written with `csrw sstatus`, not
+    `csrci`/`csrsi`: SPIE (bit 5) and SPP (bit 8) do not fit the 5-bit CSR
+    immediate, and the earlier `csrci 8`/`csrsi 5` silently left them wrong (the
+    machine still booted, which is how it hid). A child's frame reaches `sret`
+    through `trap_return`, the same epilogue a preempted U-mode thread uses; do
+    not add a second entry layout.
+22. **U-mode faults kill the run, never the hart.** Any synchronous exception
     with saved `SPP == 0` (`ecall` excepted) goes to `user::on_fault`, which
-    prints one `[user] <name> killed: …` line and calls `scheduler::exit`; the
-    runner releases pages and frames afterwards. S-mode exceptions keep the
-    print-and-park contract. A user program's bad pointer must be `-EFAULT` via
-    PTE validation (`U=1` and `R=1` for every page, `SUM` only around the copy),
-    not an exception.
-23. **`RUN` is not held across blocking work.** `run_image`/`run_file` claim the
-    one user program (`Busy` otherwise) and release it after the pages are gone; the
-    wait loop (`yield_now`) and the trap paths only read/update short sections.
-    One address space, one ASID, one program at a time: there is no per-process
-    `satp` and no isolation between two user programs.
+    prints one `[user] <name> killed: …` line, records `Exit::Fault`, retires the
+    run's other threads with `scheduler::kill_group` and calls `scheduler::exit`;
+    the runner releases pages and frames afterwards. A fault is process-fatal on
+    purpose: a thread that died holding a userspace lock would leave the others
+    waiting forever. S-mode exceptions keep the print-and-park contract. A user
+    program's bad pointer must be `-EFAULT` via PTE validation (`U=1` and `R=1`
+    for every page, `SUM` only around the copy), not an exception.
+23. **`RUN` is not held across blocking work, and outlives every thread.** The
+    runner claims the one user program (`Busy` otherwise) and releases `RUN` only
+    after `RunState::threads == 0` and the pages are gone; the wait loop
+    (`wait_for_run_end`, `yield_now`) and the trap paths only read/update short
+    sections. A `clone` child may outlive the main thread, so "the task is
+    Exited" is not "the run is over": releasing the address space, fd table or
+    heap while a child still runs is use-after-free. One address space, one ASID,
+    one program at a time: there is no per-process `satp` and no isolation
+    between two user programs.
 24. **virtio-net's header is a contract, not a guess.** The driver negotiates
     `VIRTIO_F_VERSION_1` + `VIRTIO_NET_F_MRG_RXBUF`, so every buffer starts with
     a **12-byte** `virtio_net_hdr` (the 10-byte base plus `num_buffers`). A
@@ -281,12 +292,15 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
     is one descriptor with header+frame contiguous and a bounded used-ring poll;
     `NO_INTERRUPT` means the device never raises an IRQ. Device addresses are
     Rust pointers because RAM is identity-mapped (`memory::paging`).
-25. **The boot stack is 64 KiB; big state belongs on the heap.** `VirtioNet`
-    initially held a 12 KiB frame ring inline. Building and moving it on the boot
-    stack in a debug build overflowed into `.bss` and corrupted the allocator's
-    state — the symptom was a heap panic (`chunk_count = 16384`), not a stack
-    message. Box large buffers in device/stack structs, and keep `probe`-style
-    builders returning small values.
+25. **The boot stack is 128 KiB; big state belongs on the heap.** It was 64 KiB
+    and the deepest normal-context chain (a file-backed `run` with its 4 KiB
+    padding write plus loader/heap frames) came within tails of `__stack_bottom`;
+    the native-thread work pushed it over and the timer tick handler called a
+    value written into `timer::TICK_HANDLER` by the overflow. `VirtioNet`
+    initially held a 12 KiB frame ring inline and building it on the boot stack
+    overflowed into `.bss` too (`chunk_count = 16384`). Box large buffers in
+    device/stack structs, keep `probe`-style builders returning small values, and
+    do not spend the remaining ~64 KiB on a stack local.
 26. **Network parsing never panics and never trusts a frame.** `src/net/wire.rs`
     is the only place that reads packet bytes: bounds-checked reads, checked
     arithmetic, checksum validation, fragments dropped. Before a DHCP lease
@@ -304,8 +318,9 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
 ## Testing philosophy
 
 What exists: the in-QEMU suites (shell `selftest`: 7 memory + 4 block/pointer + 11 ext2/VFS
-+ 4 interrupt/timer + 5 scheduler + 10 user-mode + 11 network checks, idempotent,
-each group prints a free-frame ledger), the headless QEMU smoke driver in six
++ 4 interrupt/timer + 5 scheduler + 10 user-mode (including the native
+thread/futex section) + 11 network checks, idempotent, each group prints a
+free-frame ledger), the headless QEMU smoke driver in six
 modes (serial, ramfb, disk-fresh, disk-existing, `--net`, `--keyboard`) — every mode attaches a
 virtio-tablet and the boot log must carry `virtio-input: tablet at 0x…` — including the M5
 format/mount/persist acceptance and the M7 DHCP/ping acceptance, and the pixel
@@ -417,6 +432,7 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
 | No S-mode page-fault recovery | a kernel bad access halts (`[EXC] … halting`); a *user* fault ends that task instead (`user::on_fault`) |
 | Screenshot pixels are not gated in CI yet (`--check-font` returns a non-zero code) | wiring it into the smoke job is an open task, not a reason to trust a shot by eye |
 | No host tests; state coverage is `selftest` only | you own the verification: extend the smoke driver or add a `SELFTEST` routine (the M6b suite is `src/user/selftest.rs`) |
+| Threads are a native MVP: `clone` with explicit entry, no TLS/`CLONE_SETTLS`, no join/waitid, no priorities or PI futexes, max 14 live threads per run | libc's `clone` wrapper cannot be mapped one-to-one; document the native signature and keep the futex table static (32 waiters / 16 addresses) rather than growing it silently |
 | 19 compiler warnings remain (unused diagnostic helpers, `trap_entry as usize`, …) | do not add more; warning-cleanup PRs are welcome |
 | No `LICENSE` file although `Cargo.toml` says MIT | do not add a license your work does not own |
 | `src/memory/paging.rs` owns the only page table; `src/arch/riscv64/mmu.rs` is encoding only | do not map over the kernel image or drop the identity map while a device holds a physical address |
@@ -501,7 +517,7 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
     table and `read`/`write`/`close` route to `tcp::recv_nonblocking`/
     `tcp::send`/`tcp::close`; `shutdown` closes the connection but keeps the
     descriptor (`read` then returns 0, `write` is `-EPIPE`). A user program runs
-    while the shell sits in `wait_for_exit`, so **nothing else polls the NIC**:
+    while the shell sits in `wait_for_run_end`, so **nothing else polls the NIC**:
     `connect` and `send` run with interrupts enabled for the wait (the same
     deliberate exception `nanosleep` makes, with no lock held) so ticks and
     preemption still work, and the TCP wait loop calls `net::poll()` every
@@ -512,3 +528,34 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
     and no TLS. The live evidence is `tools/test_sockets.py` /
     `docs/live-sockets.txt`; the CI-safe evidence is the always-running bad-arg
     half of `userland/abi.elf` plus its `SKIP` when `10.0.2.2:8000` is closed.
+37. **The run, not the thread, owns the address space.** `RunState` is created by
+    `run_source`, holds the shared address space, fd table, heap/mmap tracking and
+    the futex run id, and is released only after the last thread is `Exited` and
+    reaped. A thread's exit only decrements `RunState::threads` (and records the
+    main thread's code); it never tears down fd/heap/mmap. `exit_group` and
+    `on_fault` retire survivors with `scheduler::kill_group` and zero the counter;
+    the runner then does the one teardown. A new field that a thread may touch
+    while another runs belongs in `RUN`, not in `Task`.
+38. **Every thread owns a kernel stack; the user stack is not yours.** A `clone`
+    child gets the scheduler's 16 KiB + 4 KiB guard PMM stack like any task, and
+    starts through the one trap-return path: a zeroed `TrapFrame` at the top of
+    that stack (`sepc=entry`, `sp=user stack`, `a0=arg`, `sstatus =
+    user_entry_status()`) and `TaskContext { ra = trap_return, sp = frame_base }`.
+    Never invent a second frame layout or a second `sret`. The user stack address
+    is caller-provided: validate it (16-byte aligned, 16 bytes below it in a
+    mapped `U|R|W` page) and never free or zero it at thread exit; its `mmap`
+    region is released by the runner with the run.
+39. **Futex lock order is queue → scheduler, and the queue is never held across
+    a block.** `user::futex` registers a waiter, drops its lock, calls
+    `scheduler::block_current`, and removes the entry on return. Do not call
+    `wake_task` from the timer/trap path, do not take the futex lock under the
+    scheduler lock, and do not hold either across a context switch. The wait
+    value check is done by the syscall layer before registration; a syscall trap
+    runs with `SIE = 0`, which is what makes check + insert + block atomic on one
+    hart. Limits are static and documented: 32 waiters, 16 addresses.
+40. **`exit` is a thread exit; `exit_group` is a run exit.** `exit` decrements
+    `threads`, keeps the main thread's code and discards a non-main code; the
+    last thread stores the result. `exit_group` retires every thread and uses the
+    main thread's code if it already exited, otherwise the caller's. A fault is
+    an `Exit::Fault` for the whole run. Do not make `exit` call
+    `kill_group`, and do not let a thread return to U-mode after either call.

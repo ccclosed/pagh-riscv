@@ -89,8 +89,15 @@ const SYS_READLINKAT: usize = 78;
 const SYS_UNAME: usize = 160;
 const SYS_BRK: usize = 214;
 const SYS_EXIT: usize = 93;
+const SYS_EXIT_GROUP: usize = 94;
+const SYS_SET_TID_ADDRESS: usize = 96;
+const SYS_FUTEX: usize = 98;
 const SYS_SCHED_YIELD: usize = 124;
 const SYS_GETPID: usize = 172;
+const SYS_GETTID: usize = 178;
+// Native threads (pagh's own signature, not Linux's raw `clone`):
+// `clone(flags, stack, entry, arg)`. See `clone` for the accepted bits.
+const SYS_CLONE: usize = 220;
 // The directory mutators (path family). Numbers follow the generic RISC-V table
 // like the rest of this layer; the semantics are pagh's own and are frozen in
 // `pagh-api/docs/abi.md`.
@@ -271,6 +278,14 @@ pub struct Stats {
     pub shutdowns: u64,
     /// `setsockopt`/`getsockopt` calls that succeeded.
     pub sockopts: u64,
+    /// `clone` calls that returned a child tid.
+    pub clones: u64,
+    /// `futex` `WAIT` calls that reached the block (including timeouts).
+    pub futex_waits: u64,
+    /// `futex` `WAKE` calls that returned.
+    pub futex_wakes: u64,
+    /// `exit_group` calls (each ends one run).
+    pub exit_groups: u64,
     /// Unknown syscall numbers answered with `-ENOSYS`.
     pub unknown: u64,
     /// Bad user buffers answered with `-EFAULT`.
@@ -312,6 +327,10 @@ static SOCKET_SENDS: AtomicU64 = AtomicU64::new(0);
 static SOCKET_RECVS: AtomicU64 = AtomicU64::new(0);
 static SHUTDOWNS: AtomicU64 = AtomicU64::new(0);
 static SOCKOPTS: AtomicU64 = AtomicU64::new(0);
+static CLONES: AtomicU64 = AtomicU64::new(0);
+static FUTEX_WAITS: AtomicU64 = AtomicU64::new(0);
+static FUTEX_WAKES: AtomicU64 = AtomicU64::new(0);
+static EXIT_GROUPS: AtomicU64 = AtomicU64::new(0);
 static UNKNOWN: AtomicU64 = AtomicU64::new(0);
 static FAULTS: AtomicU64 = AtomicU64::new(0);
 
@@ -354,6 +373,10 @@ pub fn stats() -> Stats {
         socket_recvs: SOCKET_RECVS.load(Ordering::Relaxed),
         shutdowns: SHUTDOWNS.load(Ordering::Relaxed),
         sockopts: SOCKOPTS.load(Ordering::Relaxed),
+        clones: CLONES.load(Ordering::Relaxed),
+        futex_waits: FUTEX_WAITS.load(Ordering::Relaxed),
+        futex_wakes: FUTEX_WAKES.load(Ordering::Relaxed),
+        exit_groups: EXIT_GROUPS.load(Ordering::Relaxed),
         unknown: UNKNOWN.load(Ordering::Relaxed),
         faults: FAULTS.load(Ordering::Relaxed),
     }
@@ -913,7 +936,14 @@ pub fn dispatch(frame: &mut TrapFrame) {
             }
             Err(()) => ENOMEM,
         },
-        SYS_EXIT => crate::user::exit_current(frame.a0 as u32),
+        SYS_EXIT => crate::user::exit_thread(frame.a0 as u32),
+        SYS_EXIT_GROUP => {
+            EXIT_GROUPS.fetch_add(1, Ordering::Relaxed);
+            crate::user::exit_group(frame.a0 as u32)
+        }
+        SYS_SET_TID_ADDRESS => crate::user::thread_id() as isize,
+        SYS_FUTEX => futex(frame.a0, frame.a1, frame.a2, frame.a3),
+        SYS_CLONE => clone(frame.a0, frame.a1, frame.a2, frame.a3, frame.gp, frame.tp),
         SYS_SCHED_YIELD => {
             crate::task::scheduler::yield_now();
             YIELDS.fetch_add(1, Ordering::Relaxed);
@@ -921,8 +951,9 @@ pub fn dispatch(frame: &mut TrapFrame) {
         }
         SYS_GETPID => {
             GETPIDS.fetch_add(1, Ordering::Relaxed);
-            crate::task::scheduler::current_id() as isize
+            crate::user::process_id() as isize
         }
+        SYS_GETTID => crate::user::thread_id() as isize,
         _ => {
             UNKNOWN.fetch_add(1, Ordering::Relaxed);
             ENOSYS
@@ -934,6 +965,199 @@ pub fn dispatch(frame: &mut TrapFrame) {
     // `exit` never reaches this line (it ends the task), so one increment
     // serves every call that returns.
     frame.sepc = frame.sepc.wrapping_add(4);
+}
+
+// ─── threads and futex ─────────────────────────────────────────────────────
+
+/// `CLONE_VM`: share the address space (required).
+const CLONE_VM: usize = 0x0000_0100;
+/// `CLONE_FS`: share filesystem state. pagh has one run-wide cwd-less VFS view,
+/// so this flag is accepted and changes nothing.
+const CLONE_FS: usize = 0x0000_0200;
+/// `CLONE_FILES`: share the descriptor table (required by the implementation,
+/// though the native contract only demands `VM|THREAD`).
+const CLONE_FILES: usize = 0x0000_0400;
+/// `CLONE_SIGHAND`: share signal handlers. pagh has no signals; accepted for
+/// source compatibility and documented as a no-op.
+const CLONE_SIGHAND: usize = 0x0000_0800;
+/// `CLONE_THREAD`: put the new task in the caller's thread group (required).
+const CLONE_THREAD: usize = 0x0001_0000;
+/// `CLONE_SETTLS`: Linux TLS setup. Not implemented in this MVP.
+const CLONE_SETTLS: usize = 0x0008_0000;
+
+/// `futex` command bits (the low seven bits of the op word).
+const FUTEX_CMD_MASK: usize = 0x7f;
+/// `FUTEX_PRIVATE_FLAG`: the wait queue is process-private. The only flag this
+/// kernel accepts, and it changes nothing: there is no shared/global queue.
+const FUTEX_PRIVATE_FLAG: usize = 128;
+/// `FUTEX_CLOCK_REALTIME`: timed waits against the realtime clock. Rejected.
+const FUTEX_CLOCK_REALTIME: usize = 256;
+const FUTEX_WAIT: usize = 0;
+const FUTEX_WAKE: usize = 1;
+
+/// Native `clone(flags, stack, entry, arg)`.
+///
+/// The child is a full scheduler task: a PMM kernel stack of its own, a saved
+/// context that enters U-mode through the ordinary trap-return path, and the
+/// caller's run as its address space. It starts at `entry` with `a0 = arg` and
+/// `sp = stack`, and never returns from this syscall — the parent's return value
+/// is the child's tid. (The "child returns 0" convention of a libc `clone`
+/// wrapper belongs to the wrapper; with an explicit entry there is no syscall
+/// return in the child.) `entry` must not return either: the kernel sets no
+/// U-mode return trampoline, so a returned `ra` (zero) faults and ends the run.
+/// A thread finishes with `exit`/`exit_group`, which is what libpagh's wrapper
+/// will call after its closure returns.
+///
+/// `gp`/`tp` are inherited from the caller's saved trap frame, so the child sees
+/// the same small-data anchor and TLS register as its parent. pagh itself has no
+/// TLS: `CLONE_SETTLS` is `-ENOTSUP` rather than silently ignored.
+///
+/// Validation happens before the PMM allocation: unknown flag bits `-EINVAL`,
+/// missing `CLONE_VM|CLONE_THREAD` `-EINVAL`, a stack that is not 16-byte
+/// aligned or whose first 16 bytes are not in a mapped user read/write page
+/// `-EINVAL`, an entry outside a user read/execute page `-EINVAL`. A full task
+/// table or frame pool is `-EAGAIN` (the clone-family resource error). The child
+/// is charged to the run before the parent returns, and rolled back if the
+/// scheduler cannot spawn it, so the runner's `threads` count can never drift.
+fn clone(flags: usize, stack: usize, entry: usize, arg: usize, gp: usize, tp: usize) -> isize {
+    const SUPPORTED: usize = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+    if flags & !(SUPPORTED | CLONE_SETTLS) != 0 {
+        return EINVAL;
+    }
+    if flags & CLONE_SETTLS != 0 {
+        return ENOTSUP;
+    }
+    if flags & (CLONE_VM | CLONE_THREAD) != CLONE_VM | CLONE_THREAD {
+        return EINVAL;
+    }
+    if stack == 0 || stack % 16 != 0 || entry == 0 || entry % 2 != 0 {
+        return EINVAL;
+    }
+    // `sp` points one past the first byte the child may use; the 16 bytes below
+    // it are what a prologue touches before it adjusts the stack. Requiring that
+    // page to be a mapped user read/write page is the whole stack contract: the
+    // stack is caller-provided and never freed by the kernel.
+    let Some(stack_probe) = stack.checked_sub(16) else {
+        return EINVAL;
+    };
+    let Some(stack_flags) = paging::flags(stack_probe & !(FRAME_SIZE - 1)) else {
+        return EINVAL;
+    };
+    if stack_flags.bits() & (PTE_U | PTE_R | PTE_W) != PTE_U | PTE_R | PTE_W {
+        return EINVAL;
+    }
+    let Some(entry_flags) = paging::flags(entry & !(FRAME_SIZE - 1)) else {
+        return EINVAL;
+    };
+    if entry_flags.bits() & (PTE_U | PTE_X) != PTE_U | PTE_X {
+        return EINVAL;
+    }
+
+    let Some(run_id) = crate::user::current_run_id() else {
+        return EINVAL;
+    };
+    // Charge the thread to the run before spawning. The syscall trap has
+    // interrupts masked, so the child cannot run (and exit) between the charge
+    // and the spawn; a failed spawn rolls the charge back.
+    if !crate::user::charge_thread() {
+        return EINVAL;
+    }
+    match crate::task::scheduler::spawn_user_thread(entry, stack, arg, gp, tp, run_id) {
+        Some(tid) => {
+            CLONES.fetch_add(1, Ordering::Relaxed);
+            tid as isize
+        }
+        None => {
+            crate::user::uncharge_thread();
+            EAGAIN
+        }
+    }
+}
+
+/// Extra ticks a `futex` timeout waits, from the ABI's `Timespec`.
+///
+/// `pointer == 0` means "no deadline". The duration is rounded *up* to the next
+/// 10 ms tick, like [`nanosleep`]; a zero duration is `Some(0)` and the caller
+/// answers `-ETIMEDOUT` without blocking. Negative or out-of-range fields are
+/// `-EINVAL`. `FUTEX_CLOCK_REALTIME` is not accepted, so a timeout is always
+/// measured on the kernel's monotonic tick clock.
+fn futex_timeout_ticks(pointer: usize) -> Result<Option<u64>, isize> {
+    if pointer == 0 {
+        return Ok(None);
+    }
+    let mut raw = [0u8; TIMESPEC_SIZE];
+    copy_from_user(&mut raw, pointer)?;
+    let seconds = i64::from_le_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
+    let nanos = i64::from_le_bytes(raw[8..16].try_into().unwrap_or([0; 8]));
+    if seconds < 0 || nanos < 0 || nanos >= NANOS_PER_SEC as i64 {
+        return Err(EINVAL);
+    }
+    let total = (seconds as u128)
+        .saturating_mul(NANOS_PER_SEC)
+        .saturating_add(nanos as u128);
+    let ticks = total
+        .saturating_mul(crate::arch::riscv64::timer::TICK_HZ as u128)
+        .div_ceil(NANOS_PER_SEC)
+        .min(u64::MAX as u128) as u64;
+    Ok(Some(ticks))
+}
+
+/// `futex(uaddr, op, val, timeout, uaddr2, val3)`.
+///
+/// Only `FUTEX_WAIT` and `FUTEX_WAKE` exist, plus the private-flag bit every
+/// pthread implementation sets. `WAKE_OP`, `REQUEUE`, `CMP_REQUEUE` and the
+/// priority-inheritance family are `-ENOSYS`: a program that needs them gets a
+/// clear answer instead of a partial operation. `uaddr2`/`val3` are unused by
+/// the two implemented operations.
+fn futex(uaddr: usize, op: usize, val: usize, timeout: usize) -> isize {
+    if op & !(FUTEX_CMD_MASK | FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME) != 0
+        || op & FUTEX_CLOCK_REALTIME != 0
+    {
+        return ENOSYS;
+    }
+    if uaddr == 0 || uaddr % 4 != 0 {
+        return EINVAL;
+    }
+    let Some(run_id) = crate::user::current_run_id() else {
+        return EINVAL;
+    };
+    match op & FUTEX_CMD_MASK {
+        FUTEX_WAIT => {
+            let actual = match read_u32_user(uaddr) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            // The ABI's `val` is an `int`; only the low 32 bits are compared.
+            if actual != val as u32 {
+                return EAGAIN;
+            }
+            let deadline = match futex_timeout_ticks(timeout) {
+                Ok(deadline) => deadline,
+                Err(error) => return error,
+            };
+            if deadline == Some(0) {
+                return ETIMEDOUT;
+            }
+            FUTEX_WAITS.fetch_add(1, Ordering::Relaxed);
+            // A timed block is woken by the tick scan; without the hardware clock
+            // no scan can ever run, so answering immediately is the only honest
+            // choice (and matches the `-ETIMEDOUT` an expired deadline returns).
+            if deadline.is_some() && !crate::arch::riscv64::timer::running() {
+                return ETIMEDOUT;
+            }
+            match crate::user::futex::wait(run_id, uaddr, deadline) {
+                Ok(crate::user::futex::WaitOutcome::Woken) => 0,
+                Ok(crate::user::futex::WaitOutcome::TimedOut) => ETIMEDOUT,
+                Err(crate::user::futex::WaitError::Full) => EAGAIN,
+                Err(crate::user::futex::WaitError::NoMemory) => ENOMEM,
+            }
+        }
+        FUTEX_WAKE => {
+            FUTEX_WAKES.fetch_add(1, Ordering::Relaxed);
+            crate::user::futex::wake(run_id, uaddr, val) as isize
+        }
+        _ => ENOSYS,
+    }
 }
 
 // ─── read / write ──────────────────────────────────────────────────────────
@@ -1728,7 +1952,7 @@ const TCP_NODELAY: usize = 1;
 /// parked in `connect`/`send`. Enabling interrupts for the duration is the same
 /// deliberate exception `nanosleep` makes, with no lock held: the TCP state lock
 /// is taken only for short sections inside the stack, and no other task touches
-/// the network while a user program runs (the shell is in `wait_for_exit`, idle
+/// the network while a user program runs (the shell is in `wait_for_run_end`, idle
 /// is in `wfi`). The trap epilogue restores `sstatus` from the frame anyway, so
 /// this cannot leak into U-mode. A timer interrupt here may switch this task out
 /// and back; the syscall simply continues, exactly like `nanosleep`.

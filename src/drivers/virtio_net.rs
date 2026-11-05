@@ -393,7 +393,7 @@ struct Rx {
     ///
     /// Heap storage, not an inline array: `VirtioNet` is built on the boot stack
     /// and moved into its `Arc`, and a 12 KiB inline frame ring made that path
-    /// deep enough to overflow the 64 KiB boot stack (the failure looked like a
+    /// deep enough to overflow the boot stack (the failure looked like a
     /// corrupted heap: the overflow landed on the allocator's state below it).
     frames: Box<[u8]>,
     lens: [u16; FRAME_SLOTS],

@@ -9,8 +9,8 @@ M6a — это потоки *внутри* S-mode: контекстный switch
 
 | Файл | Роль |
 |---|---|
-| `mod.rs` | фасад: `init`, `spawn`, `tick`, `stats`, `snapshot`, `spawn_demo` (его использует `src/user/`) |
-| `scheduler.rs` | таблица задач, ready-queue, квант, стеки из PMM, switch, idle, счётчики |
+| `mod.rs` | фасад: `init`, `spawn`, `tick`, `stats`, `snapshot`, `spawn_demo` (его использует `src/user/`); user-потоки идут через `scheduler` напрямую |
+| `scheduler.rs` | таблица задач, ready-queue, квант, стеки из PMM, switch, idle, `block_current`/`wake_task`/`kill_group`/`spawn_user_thread`, счётчики |
 | `selftest.rs` | пять проверок для `selftest` (плюс `user/selftest.rs` для M6b) |
 
 Регистровый контракт switch — `src/arch/riscv64/switch.rs`; там же `TaskContext`
@@ -18,19 +18,25 @@ M6a — это потоки *внутри* S-mode: контекстный switch
 
 ## Модель
 
-* **Слоты.** `MAX_TASKS = 8`. Слот 0 — поток, который вызвал `init`, то есть
+* **Слоты.** `MAX_TASKS = 16`. Слот 0 — поток, который вызвал `init`, то есть
   шелл на загрузочном стеке (`stack_base = 0` — маркер «стек не наш»). Слот 1 —
   `idle`, его стек выделен из PMM один раз и живёт весь boot. Слоты 2.. — потоки
-  `spawn`, поэтому `spawn` принимает не больше шести за раз.
+  `spawn`/`spawn_in_group`/`spawn_user_thread`, поэтому `spawn` демо-когорты
+  принимает не больше 14 за раз, а user-прогон — не больше 14 живых потоков
+  (главный + 13 `clone`); `shell` и `idle` занимают два слота.
 * **Стек.** 16 KiB usable + 4 KiB guard (5 кадров `alloc_frames_contiguous`).
   Guard внизу, канарейка в начале стека; `reap` проверяет её и сообщает
   `[task] STACK OVERFLOW`, после чего всё равно возвращает кадры. Выход потока
   обязан вернуть стек: `SELFTEST task-exit-returns-stack` проверяет
   «N → N−5 (поток жив) → N (reap)».
-* **Состояния.** `Free -> Ready -> Running -> Exited -> Free`. `schedule(reason)`
+* **Состояния.** `Free -> Ready -> Running -> Exited -> Free`, плюс
+  `Blocked` для futex: `block_current(timeout)` снимает поток с очереди и
+  ставит `wake_at` (абсолютный тик); `wake_task(id)` возвращает его в `Ready`, а
+  тиковый скан `wake_expired` делает то же по дедлайну. `schedule(reason)`
   выбирает следующий `Ready` FIFO-порядком, квант — `QUANTUM_TICKS = 8` тиков;
-  `Reason` (`Quantum`, `Yield`, `Exit`, `ProbeIdle`, …) существует для отладки и
-  счётчиков, а не для политики.
+  `Reason` (`Quantum`, `Yield`, `Exit`, `Block`, `ProbeIdle`, …) существует для
+  отладки и счётчиков, а не для политики. Блокировка — настоящий switch: лок
+  очереди не держится, другие потоки (включая шелл и idle) работают.
 * **idle.** Отдельный поток держит hart в `wfi`, пока нет готовых; его пробуждает
   прерывание. `run_idle_once` — проба для selftest: доказать, что switch в
   свежий контекст и обратно работает.
@@ -48,6 +54,10 @@ M6a — это потоки *внутри* S-mode: контекстный switch
   `task_switch`: switch никогда не выполняется с удержанным локом. В тике и
   switch нет аллокаций и печати — печать из trap-контекста запрещена (AGENTS,
   инвариант 13), поэтому счётчики читает обычный контекст (`tasks`, `selftest`).
+  **Порядок для user-потоков:** futex-очередь → scheduler (`wake_task` берёт
+  scheduler-лок под futex-локом; обратного пути нет — futex не берётся из
+  планировщика/тика). `kill_group` снимает `Ready`/`Blocked` и чистит ready-ring
+  (`compact_ready`), не трогая текущий слот; стеки снимает следующий `reap`.
 
 ## Как это проверяется
 
@@ -77,9 +87,15 @@ stack-layout/guard, canary (переполнение ловится на reap), 
 4. `ecall` обслуживается диспетчером в trap-контексте; таймерное прерывание в
    U-mode вытесняет задачу так же, как kernel-поток (это доказано счётчиком
    `traps::user_timer_ticks()` и фикстурой `run spin`);
-5. `exit`/fault переводят задачу в `Exited`; `run_image` ждёт это состояние
-   циклом `yield_now` (состояния `Blocked` пока нет), затем `reap` возвращает
-   5 кадров стека, а раннер снимает user-маппинги.
+5. `clone`-поток стартует не через `enter_user`, а через контекст
+   `{ ra = traps::trap_return, sp = верх kernel-стека − sizeof(TrapFrame) }`:
+   на стеке лежит обычный `TrapFrame` (`sepc=entry`, `sp=user stack`,
+   `a0=arg`, `sstatus` как у `enter_user`), и эпилог трапа сам делает `sret`.
+   Второго frame layout'а нет — см. `src/user/README.md`;
+6. `exit` завершает поток (`threads -= 1`), `exit_group`/fault снимают группу
+   `kill_group`; `run_image` ждёт `RunState::threads == 0` циклом `yield_now`,
+   затем `reap` возвращает по 5 кадров каждого kernel-стека, а раннер снимает
+   user-маппинги и fd.
 
 Что планировщик при этом **не** делает: не переключает `satp` (адресное
 пространство одно), не знает о U-бите и user-указателях (это `src/user/`), не
@@ -88,7 +104,8 @@ trap-обработчик, а кадр U-mode лежит на kernel-стеке 
 
 ## Чего нет
 
-Приоритетов, sleep/wakeup-очередей, `Blocked`-состояния и блокирующего I/O,
-SMP-планирования, изоляции адресных пространств (одна Sv39-карта, один ASID;
-user mode/syscall/ELF уже есть — см. [`../user/README.md`](../user/README.md)).
-`panic = "abort"`: паника в потоке убивает машину, как и везде.
+Приоритетов, sleep/wakeup-очередей (есть только futex-`Blocked` с тиковым
+дедлайном), блокирующего I/O/SMP, изоляции адресных пространств (одна
+Sv39-карта, один ASID; user mode/syscall/ELF/потоки — см.
+[`../user/README.md`](../user/README.md)). `panic = "abort"`: паника в потоке
+убивает машину, как и везде.

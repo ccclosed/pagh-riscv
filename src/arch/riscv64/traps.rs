@@ -55,6 +55,10 @@ pub struct TrapFrame {
     pub sstatus: usize,
 }
 
+// The assembly hard-codes the 264-byte size (`addi sp, sp, -264`); a field added
+// on one side only would make the epilogue restore from the wrong offsets.
+const _: () = assert!(core::mem::size_of::<TrapFrame>() == 264);
+
 global_asm!(
     r#"
     .section .text
@@ -123,6 +127,12 @@ trap_entry:
     mv      a0, sp
     call    trap_dispatch
 
+    /* A freshly created user thread is switched to with `ra` at this label and
+       `sp` at a hand-built frame; the code below is the one and only return
+       path into U-mode (`sstatus.SPP = 0` selects it). Exporting it means a
+       thread start does not need a second frame layout or a second `sret`. */
+    .globl trap_return
+trap_return:
     ld      t0, 248(sp)
     csrw    sepc, t0
     ld      t0, 256(sp)
@@ -243,6 +253,20 @@ pub fn init() {
 
 extern "C" {
     fn trap_entry();
+    fn trap_return();
+}
+
+/// Address of the trap epilogue, the only code that `sret`s into U-mode.
+///
+/// A user thread is started by building a [`TrapFrame`] on its own kernel stack
+/// and giving it a [`TaskContext`](super::switch::TaskContext) whose `ra` is
+/// this address and whose `sp` is the frame base: the first switch "returns"
+/// into the ordinary return path, which restores every register (including
+/// `sepc`, the user `sp` and `sstatus`) and executes `sret`. There is exactly
+/// one return-to-U implementation, and an interrupted thread and a brand-new
+/// thread reach it the same way.
+pub fn trap_return_address() -> usize {
+    trap_return as *const () as usize
 }
 
 /// Called from `trap_entry` with the saved register file.

@@ -9,11 +9,20 @@
 //! `getdents64("/")`. Any real failure returns a distinct non-zero code (and
 //! prints a diagnostic), which the selftest maps to FAIL.
 //!
+//! The thread section (`abi: threads ok`) runs before the filesystem split, so
+//! both the disk and the serial-only boot exercise `clone`/`gettid`/futex and
+//! thread exit. With `/mnt` the fixture ends with `exit_group(0)` while a thread
+//! is blocked in `FUTEX_WAIT`; without it, main exits 77 first and a tail thread
+//! with a 30 ms futex deadline must keep the run alive — the run still returns
+//! 77, main's code.
+//!
 //! No allocator, no `core::fmt`, no libc: syscall wrappers over `ecall` and
 //! fixed stack buffers. Build with `userland/build.sh`.
 
 #![no_std]
 #![no_main]
+
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 core::arch::global_asm!(
     r#"
@@ -125,6 +134,31 @@ const SYS_RECVFROM: usize = 207;
 const SYS_SETSOCKOPT: usize = 208;
 const SYS_GETSOCKOPT: usize = 209;
 const SYS_SHUTDOWN: usize = 210;
+const SYS_EXIT: usize = 93;
+const SYS_EXIT_GROUP: usize = 94;
+const SYS_SET_TID_ADDRESS: usize = 96;
+const SYS_FUTEX: usize = 98;
+const SYS_SCHED_YIELD: usize = 124;
+const SYS_GETTID: usize = 178;
+const SYS_CLONE: usize = 220;
+
+const CLONE_VM: usize = 0x100;
+const CLONE_FS: usize = 0x200;
+const CLONE_FILES: usize = 0x400;
+const CLONE_SIGHAND: usize = 0x800;
+const CLONE_THREAD: usize = 0x10000;
+const CLONE_SETTLS: usize = 0x80000;
+const THREAD_FLAGS: usize = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+
+const FUTEX_WAIT: usize = 0;
+const FUTEX_WAKE: usize = 1;
+const FUTEX_PRIVATE_FLAG: usize = 128;
+const FUTEX_WAKE_OP: usize = 5;
+const FUTEX_REQUEUE: usize = 3;
+
+/// Tag in the low 16 bits of a thread's `arg`, so the entry can prove it got
+/// exactly the value the parent passed.
+const THREAD_MAGIC: usize = 0x7a11;
 
 const AF_INET: usize = 2;
 const SOCK_STREAM: usize = 1;
@@ -364,6 +398,368 @@ fn directory_lacks(buffer: &[u8], length: usize, expected: &[u8]) -> bool {
         offset += record;
     }
     offset == length
+}
+
+// ─── threads and futexes ───────────────────────────────────────────────────
+
+// Shared state below is in `.bss` (zeroed by the ELF loader), not on a stack:
+// every thread of the run sees the same addresses, which is exactly what the
+// CLONE_VM test needs.
+
+static COUNTER: AtomicUsize = AtomicUsize::new(0);
+static READY: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+static TIDS: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+static FINISHED: AtomicUsize = AtomicUsize::new(0);
+static GATE_SEEN: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+static ARG_BAD: AtomicUsize = AtomicUsize::new(0);
+static GATE: AtomicU32 = AtomicU32::new(0);
+
+/// Tail-thread state for the "main exits first" case.
+static TAIL_GATE: AtomicU32 = AtomicU32::new(0);
+
+/// `exit_group` state: a thread blocks here forever and must be retired by the
+/// group exit.
+static GROUP_GATE: AtomicU32 = AtomicU32::new(0);
+static GROUP_READY: AtomicUsize = AtomicUsize::new(0);
+static GROUP_UNEXPECTED: AtomicUsize = AtomicUsize::new(0);
+
+fn futex_wait_word(address: usize, value: u32, timeout: usize) -> isize {
+    syscall6(
+        SYS_FUTEX,
+        address,
+        FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
+        value as usize,
+        timeout,
+        0,
+        0,
+    )
+}
+
+fn futex_wake_word(address: usize, count: usize) -> isize {
+    syscall6(
+        SYS_FUTEX,
+        address,
+        FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
+        count,
+        0,
+        0,
+        0,
+    )
+}
+
+fn spawn_thread(flags: usize, stack: usize, entry: usize, arg: usize) -> isize {
+    syscall4(SYS_CLONE, flags, stack, entry, arg)
+}
+
+/// Yield until `condition` holds; `fail` (which ends the whole fixture) after a
+/// bounded number of turns, so a scheduler or futex bug reports a code instead
+/// of hanging the boot.
+fn wait_until(mut condition: impl FnMut() -> bool, code: i32, what: &str) {
+    let mut turns = 0usize;
+    while turns < 50_000 {
+        if condition() {
+            return;
+        }
+        let _ = syscall1(SYS_SCHED_YIELD, 0);
+        turns += 1;
+    }
+    fail(code, what);
+}
+
+/// A child thread. It must be an `extern "C"` function that never returns: the
+/// kernel enters it with `a0 = arg` and `sp` at the caller-provided stack.
+extern "C" fn thread_entry(arg: usize) -> ! {
+    let raw_index = (arg >> 16) & 0xffff;
+    let index = if raw_index < 2 { raw_index } else { 0 };
+    if raw_index >= 2 || (arg & 0xffff) != THREAD_MAGIC {
+        ARG_BAD.fetch_add(1, Ordering::SeqCst);
+    }
+
+    // `gettid` must name this thread, not the process and not its sibling.
+    let tid = syscall1(SYS_GETTID, 0) as usize;
+    TIDS[index].store(tid, Ordering::SeqCst);
+
+    // Shared counter: only correct if CLONE_VM really shares the address space
+    // and both threads run.
+    COUNTER.fetch_add(1, Ordering::SeqCst);
+    READY[index].store(1, Ordering::SeqCst);
+
+    // The rendezvous: wait until the parent sets GATE. A 2 s deadline turns a
+    // lost wakeup into a failed check instead of a hung boot.
+    let timeout = Timespec {
+        seconds: 2,
+        nanos: 0,
+    };
+    let result = futex_wait_word(
+        GATE.as_ptr() as usize,
+        0,
+        &timeout as *const Timespec as usize,
+    );
+    if result == 0 || result == EAGAIN {
+        GATE_SEEN[index].store(1, Ordering::SeqCst);
+    } else {
+        ARG_BAD.fetch_add(1, Ordering::SeqCst);
+    }
+    FINISHED.fetch_add(1, Ordering::SeqCst);
+
+    // Thread exit, not process exit: the sibling and main keep running. The
+    // distinct codes prove a non-main code is not the run's result.
+    let code = if index == 1 { 42 } else { 0 };
+    let _ = syscall1(SYS_EXIT, code);
+    loop {}
+}
+
+/// The thread section. Returns a mapped stack address the caller may reuse for
+/// the later one-thread tests (the mapping itself is run-owned).
+fn thread_section() -> usize {
+    // ── gettid / set_tid_address ──
+    let main_tid = syscall1(SYS_GETTID, 0);
+    check(main_tid > 0, 170, "gettid main");
+    let mut tid_word: u32 = 0;
+    check(
+        syscall2(SYS_SET_TID_ADDRESS, &mut tid_word as *mut u32 as usize, 0) == main_tid,
+        171,
+        "set_tid_address",
+    );
+
+    // ── clone argument validation (before any mapping exists) ──
+    let entry = thread_entry as *const () as usize;
+    check(
+        spawn_thread(CLONE_VM | CLONE_THREAD, 0, entry, 0) == EINVAL,
+        172,
+        "clone without stack",
+    );
+    check(
+        spawn_thread(CLONE_VM, 0, entry, 0) == EINVAL,
+        173,
+        "clone without CLONE_THREAD",
+    );
+    check(
+        spawn_thread(CLONE_VM | CLONE_THREAD | CLONE_SETTLS, 0, entry, 0) == ENOTSUP,
+        174,
+        "clone CLONE_SETTLS",
+    );
+    check(
+        spawn_thread(CLONE_VM | CLONE_THREAD | 0x40000, 0, entry, 0) == EINVAL,
+        175,
+        "clone unknown flag",
+    );
+
+    // ── a private stack for two threads (one 32 KiB mapping, split in two) ──
+    let region = syscall6(
+        SYS_MMAP,
+        0,
+        0x8000,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        usize::MAX,
+        0,
+    );
+    check(region > 0, 176, "mmap thread stacks");
+    let stack0 = region as usize + 0x4000;
+    let stack1 = region as usize + 0x8000;
+    check(stack0 % 16 == 0 && stack1 % 16 == 0, 177, "stack alignment");
+
+    // ── clone validation with real mappings ──
+    check(
+        spawn_thread(THREAD_FLAGS, stack0, 0, 0) == EINVAL,
+        178,
+        "clone entry 0",
+    );
+    check(
+        spawn_thread(THREAD_FLAGS, stack0 + 8, entry, 0) == EINVAL,
+        179,
+        "clone unaligned stack",
+    );
+    check(
+        spawn_thread(THREAD_FLAGS, 0x1000, entry, 0) == EINVAL,
+        180,
+        "clone unmapped stack",
+    );
+    check(
+        spawn_thread(THREAD_FLAGS, stack0, stack0, 0) == EINVAL,
+        181,
+        "clone non-executable entry",
+    );
+
+    // ── futex argument/op paths before any waiter exists ──
+    check(
+        futex_wait_word(GATE.as_ptr() as usize, 1, 0) == EAGAIN,
+        182,
+        "futex wait value mismatch",
+    );
+    check(
+        syscall6(
+            SYS_FUTEX,
+            GATE.as_ptr() as usize,
+            FUTEX_REQUEUE | FUTEX_PRIVATE_FLAG,
+            0,
+            0,
+            0,
+            0,
+        ) == ENOSYS,
+        183,
+        "futex requeue is ENOSYS",
+    );
+    check(
+        syscall6(
+            SYS_FUTEX,
+            GATE.as_ptr() as usize,
+            FUTEX_WAKE_OP | FUTEX_PRIVATE_FLAG,
+            0,
+            0,
+            0,
+            0,
+        ) == ENOSYS,
+        184,
+        "futex wake_op is ENOSYS",
+    );
+    check(
+        futex_wake_word(GATE.as_ptr() as usize, 2) == 0,
+        185,
+        "futex wake nobody",
+    );
+
+    // A timed wait on a word that still holds the expected value must block and
+    // then time out; 10 ms is one tick. This is the deterministic proof that
+    // FUTEX_WAIT reaches the scheduler instead of spinning or returning EAGAIN.
+    let timeout = Timespec {
+        seconds: 0,
+        nanos: 10_000_000,
+    };
+    check(
+        futex_wait_word(
+            GATE.as_ptr() as usize,
+            0,
+            &timeout as *const Timespec as usize,
+        ) == ETIMEDOUT,
+        186,
+        "futex wait timeout",
+    );
+
+    // ── two native threads ──
+    let t0 = spawn_thread(THREAD_FLAGS, stack0, entry, (0 << 16) | THREAD_MAGIC);
+    check(t0 > 0, 187, "clone thread 0");
+    let t1 = spawn_thread(THREAD_FLAGS, stack1, entry, (1 << 16) | THREAD_MAGIC);
+    check(t1 > 0, 188, "clone thread 1");
+    check(
+        t0 != t1 && t0 != main_tid && t1 != main_tid,
+        189,
+        "thread ids distinct",
+    );
+
+    wait_until(
+        || COUNTER.load(Ordering::SeqCst) == 2,
+        190,
+        "threads increment shared counter",
+    );
+    check(
+        TIDS[0].load(Ordering::SeqCst) == t0 as usize
+            && TIDS[1].load(Ordering::SeqCst) == t1 as usize,
+        191,
+        "gettid in child matches clone tid",
+    );
+
+    // Both children are at (or about to reach) their futex wait. A few turns
+    // let them block; the gate is set before the wake, so a child that has not
+    // blocked yet sees the new value and returns EAGAIN — no lost wakeup either
+    // way, which is the invariant the userspace ordering provides.
+    for _ in 0..8 {
+        let _ = syscall1(SYS_SCHED_YIELD, 0);
+    }
+    GATE.store(1, Ordering::SeqCst);
+    let woken = futex_wake_word(GATE.as_ptr() as usize, 2);
+    check((0..=2).contains(&woken), 192, "futex wake count");
+
+    wait_until(
+        || FINISHED.load(Ordering::SeqCst) == 2,
+        193,
+        "threads finish after wake",
+    );
+    check(
+        GATE_SEEN[0].load(Ordering::SeqCst) == 1 && GATE_SEEN[1].load(Ordering::SeqCst) == 1,
+        194,
+        "futex rendezvous gate seen",
+    );
+    check(
+        ARG_BAD.load(Ordering::SeqCst) == 0,
+        195,
+        "thread arguments/gettid",
+    );
+    check(
+        futex_wake_word(GATE.as_ptr() as usize, 2) == 0,
+        196,
+        "futex wake after exit",
+    );
+
+    print("abi: threads ok\n");
+    stack1
+}
+
+/// The tail thread for the "main exits first" case: it blocks on a timeout,
+/// prints when it returns, and exits with a code *different* from main's. The
+/// run must stay alive until it is gone and must still return main's code.
+extern "C" fn tail_entry(arg: usize) -> ! {
+    let _ = arg;
+    let timeout = Timespec {
+        seconds: 0,
+        nanos: 30_000_000,
+    };
+    let result = futex_wait_word(
+        TAIL_GATE.as_ptr() as usize,
+        0,
+        &timeout as *const Timespec as usize,
+    );
+    if result == ETIMEDOUT {
+        print("abi: tail thread timed out, main code wins\n");
+    } else {
+        print("abi: tail thread FAIL\n");
+    }
+    let _ = syscall1(SYS_EXIT, 99);
+    loop {}
+}
+
+/// Spawn the tail thread that outlives main. Returns whether it started.
+fn spawn_tail(stack: usize) -> bool {
+    spawn_thread(THREAD_FLAGS, stack, tail_entry as *const () as usize, 0) > 0
+}
+
+/// The `exit_group` thread: announces itself, then blocks on a word nobody will
+/// ever set. `exit_group` must retire it without another wakeup.
+extern "C" fn group_entry(_arg: usize) -> ! {
+    GROUP_READY.store(1, Ordering::SeqCst);
+    let _ = futex_wait_word(GROUP_GATE.as_ptr() as usize, 0, 0);
+    // A blocked thread must never get here: the only exit from the wait is the
+    // group kill, and a killed task does not resume.
+    GROUP_UNEXPECTED.store(1, Ordering::SeqCst);
+    let _ = syscall1(SYS_EXIT, 1);
+    loop {}
+}
+
+/// End the fixture with `exit_group(0)` while one thread is blocked: the run
+/// returns 0 (the caller's code), the survivor is retired, and its kernel stack
+/// and mappings are the runner's to release.
+fn exit_group_case(stack: usize) {
+    let tid = spawn_thread(THREAD_FLAGS, stack, group_entry as *const () as usize, 0);
+    check(tid > 0, 197, "clone exit_group thread");
+    wait_until(
+        || GROUP_READY.load(Ordering::SeqCst) == 1,
+        198,
+        "exit_group thread ready",
+    );
+    // Let it reach the blocking wait; exit_group must handle Ready and Blocked
+    // alike, so this is a best-effort staging, not a correctness requirement.
+    for _ in 0..8 {
+        let _ = syscall1(SYS_SCHED_YIELD, 0);
+    }
+    check(
+        GROUP_UNEXPECTED.load(Ordering::SeqCst) == 0,
+        199,
+        "group thread stayed blocked",
+    );
+    print("abi: exit_group ok\n");
+    let _ = syscall1(SYS_EXIT_GROUP, 0);
+    loop {}
 }
 
 // ─── the fixture ───────────────────────────────────────────────────────────
@@ -1359,12 +1755,19 @@ pub extern "C" fn abi_main() -> i32 {
         "close second socket",
     );
 
+    // ── native threads: clone/gettid/futex/thread exit (runs with or without /mnt) ──
+    let thread_stack = thread_section();
+
     // ── the filesystem half: skip when the selftest could not provide /mnt ──
     let path = b"/mnt/abi-syscalls.txt\0";
     let fd = syscall4(SYS_OPENAT, 0, path.as_ptr() as usize, O_RDONLY, 0);
     if fd == ENOENT {
         print("abi: no /mnt, no filesystem half\n");
-        let _ = syscall1(93, 77);
+        // Main exits first; this thread is still blocked in FUTEX_WAIT with a
+        // 30 ms deadline. The run must stay alive until it has exited and must
+        // return main's 77, not the tail's 99.
+        check(spawn_tail(thread_stack), 200, "spawn tail thread");
+        let _ = syscall1(SYS_EXIT, 77);
         loop {}
     }
     check(fd >= 3, 32, "openat fixture");
@@ -2009,6 +2412,7 @@ pub extern "C" fn abi_main() -> i32 {
 
     print("abi: mutations ok\n");
     print("abi: ok\n");
+    exit_group_case(thread_stack);
     0
 }
 

@@ -205,12 +205,12 @@ SELFTEST SUMMARY: 7/7 passed
 | Блочное устройство | готово | virtio-mmio (modern virtio 1.x, version 2), polled: окна транспорта находятся через DTB, read/write/flush, опрос завершения с ограничением и FAILED после таймаута; `-global virtio-mmio.force-legacy=false` обязателен (иначе QEMU даёт legacy-транспорт) | `src/drivers/block.rs`, `src/drivers/virtio_mmio.rs` |
 | Файловая система (ext2) | готово | чтение/запись файлов (direct + single/double indirect), truncate, каталоги, create/unlink/mkdir/rmdir/rename, симлинки; совместимо с образом хостового `mkfs.ext2 -t ext2`; форматируется только пустое устройство (MBR/GPT/чужие данные — отказ с причиной); журнала/WAL нет | `src/fs/ext2/`, `src/fs/format_policy.rs` |
 | VFS | готово | `VfsNode`, синтетический корень, монтирование в `/mnt`, два примитива разрешения путей (`lookup_path` без последней симлинки / `walk` с переходом и бюджетом) | `src/vfs/mod.rs` |
-| Планировщик, потоки ядра (M6a) | готово | контекстный switch (callee-saved ABI), до 8 потоков, round-robin, квант 8 тиков, стек 16 KiB + guard из PMM, вытеснение тиком таймера из trap-контекста (включая вытеснение U-mode), `tasks`/`spawn`/`yield`; exit возвращает кадры | `src/arch/riscv64/switch.rs`, `src/task/` |
-| User mode, syscalls, ELF, native ABI (M6b) | готово | `sret` в U-mode (`SPP=0`, `SPIE=1`, `SUM=0`, `sscratch`-контракт); вход `a0=argc`, `a1=argv`, SysV-кадр `argc/argv/envp` с `argv[0]` как набран и `PWD=<cwd>`; `ecall`-диспетчер: `read`/`write`/`openat`/`close`/`lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/`readlinkat`/`exit`/`sched_yield`/`getpid` + `mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`/`ftruncate` (мутации через `parent_and_leaf` + `walk(parent, true)`, per-run режим для `fstat`), `sepc+4`, таблица 16 fd на прогон, `copy_from_user`/`copy_to_user` с проверкой `U/R/W` и `SUM` вокруг копии, heap-окно 1 MiB с возвратом кадров; ELF64-загрузчик с откатом кадров и **потоковым чтением** `ImageSource` (сегменты кусками ≤ 512 B, без буфера размером с файл), `run <path> [args...]` до 1 MiB и фикстуры `demo`/`fault`/`spin`/`argv`/`abi`; BSD-сокеты `socket`/`connect`/`sendto`/`recvfrom`/`setsockopt`/`getsockopt`/`shutdown` (один TCP-клиент, IPv4-литералы) и маршрутизация `read`/`write`/`close` на сокет; fault из U убивает только задачу; таймер вытесняет U-mode | `src/user/`, `userland/` |
+| Планировщик, потоки ядра (M6a) | готово | контекстный switch (callee-saved ABI), до 16 слотов (14 user-потоков на прогон), round-robin, квант 8 тиков, стек 16 KiB + guard из PMM, состояния `Ready/Running/Blocked/Exited`, `block_current`/`wake_task` с тиковым дедлайном, вытеснение тиком таймера из trap-контекста (включая вытеснение U-mode), `tasks`/`spawn`/`yield`; exit возвращает кадры | `src/arch/riscv64/switch.rs`, `src/task/` |
+| User mode, syscalls, ELF, native ABI (M6b) | готово | `sret` в U-mode (`SPP=0`, `SPIE=1`, `SUM=0`, `sscratch`-контракт); нативные потоки `clone`/`gettid`/`set_tid_address`/`exit`/`exit_group`/`futex` (общие RunState, файловая таблица, heap и mmap; своё ядро-стек и user-стек вызывающего), фьютексы `WAIT`/`WAKE`; вход `a0=argc`, `a1=argv`, SysV-кадр `argc/argv/envp` с `argv[0]` как набран и `PWD=<cwd>`; `ecall`-диспетчер: `read`/`write`/`openat`/`close`/`lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/`readlinkat`/`exit`/`sched_yield`/`getpid` + `mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`/`ftruncate` (мутации через `parent_and_leaf` + `walk(parent, true)`, per-run режим для `fstat`), `sepc+4`, таблица 16 fd на прогон, `copy_from_user`/`copy_to_user` с проверкой `U/R/W` и `SUM` вокруг копии, heap-окно 1 MiB с возвратом кадров; ELF64-загрузчик с откатом кадров и **потоковым чтением** `ImageSource` (сегменты кусками ≤ 512 B, без буфера размером с файл), `run <path> [args...]` до 1 MiB и фикстуры `demo`/`fault`/`spin`/`argv`/`abi`; BSD-сокеты `socket`/`connect`/`sendto`/`recvfrom`/`setsockopt`/`getsockopt`/`shutdown` (один TCP-клиент, IPv4-литералы) и маршрутизация `read`/`write`/`close` на сокет; fault из U убивает только задачу; таймер вытесняет U-mode | `src/user/`, `userland/` |
 | Сеть (M7) | готово | virtio-net (modern, polled) + свой стек: Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP-клиент, DNS-резолвер, `net`/`dhcp`/`ping`/`dns`/`http`; без smoltcp и внешних крейтов. Для userland — один active-open TCP-сокет (`AF_INET`/`SOCK_STREAM`, IPv4-литерал), syscall'ы которого сами опрашивают NIC; `read`/`write` работают на сокете | `src/net/`, `src/drivers/virtio_net.rs`, `src/user/syscall.rs` |
 | Пакеты (`pkg`) | MVP | нативный установщик (не apt): плоский `index` и `.ppkg` с репозитория по **plain HTTP** (`http://IP:port/`, в QEMU хост — `10.0.2.2`), потоковая загрузка в `/mnt/pkg` кусками 4 KiB, шлюз «размер + SHA-256 из индекса» **до** разбора `PPKG0001`; `kind=app` → `/mnt/bin/<name>`, `applet-bundle` → `/mnt/bin/paghbox` + симлинки; манифест в `/mnt/pkg/<name>.manifest`; TLS/OpenPGP/apt по-прежнему нет | `src/pkg/` |
 | apt / TLS / OpenPGP | **нет** | apt намеренно не подключён, пока нет vendored TLS + проверки подписей Debian; `pkg` — отдельный нативный путь для портов | — |
-| Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 4 блока/указателя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 10 user-mode (ABI-фикстуры `argv`/`abi`, 10/10 с диском, 8/10 + 2 SKIP без `/mnt`) + 11 сети (идемпотентность по ledger'у), QEMU-smoke в шести режимах (serial, ramfb, диск-fresh, диск-existing, net, keyboard), установка пакета проверяется отдельным тестом `pkg`, живой сокетный прогон — `tools/test_sockets.py` (не в CI); проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/net/selftest.rs`, `src/pkg/`, `.github/smoke.py`, `tools/` |
+| Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 4 блока/указателя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 10 user-mode (ABI-фикстуры `argv`/`abi` с секцией потоков и фьютексов; 10/10 с диском, 8/10 + 2 SKIP без `/mnt`) + 11 сети (идемпотентность по ledger'у), QEMU-smoke в шести режимах (serial, ramfb, диск-fresh, диск-existing, net, keyboard), установка пакета проверяется отдельным тестом `pkg`, живой сокетный прогон — `tools/test_sockets.py` (не в CI); проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/net/selftest.rs`, `src/pkg/`, `.github/smoke.py`, `tools/` |
 | CI | готово | `fmt`, debug/release build, QEMU-smoke в шести режимах: serial, ramfb, диск-fresh (формат/монтирование/запись), диск-existing (повторная загрузка читает файл), net (DHCP + ping шлюза), keyboard (virtio-keyboard печатает `help`/`halt` через монитор QEMU); во всех приложен virtio-tablet, в keyboard — ещё и virtio-keyboard | `.github/workflows/ci.yml` |
 
 ---
@@ -309,9 +309,14 @@ selftest        # + SELFTEST user-*: 10/10 с /mnt (без диска 8/10 + 2 S
 | 101 | `nanosleep` | `Timespec` проверяется и округляется **вверх** до тика; `rem` игнорируется; ждёт в `wfi` с разрешёнными прерываниями |
 | 160 | `uname` | 5×16 байт: `pagh`, `pagh-riscv`, `0.10.0`, версия пакета, `riscv64` |
 | 78 | `readlinkat` | цель символической ссылки без NUL; не ссылка — `-EINVAL` |
-| 172 | `getpid` | id текущей задачи |
+| 172 | `getpid` | id главного потока прогона (один pid на программу) |
+| 178 | `gettid` | id вызывающего потока (уникален в прогоне) |
+| 96 | `set_tid_address` | принимается и игнорируется; возвращает tid вызывающего |
 | 124 | `sched_yield` | добровольное переключение |
-| 93 | `exit` | `Exit::Code(a0)`, не возвращается |
+| 93 | `exit` | завершает **вызывающий поток**; если он последний — прогон кончается, `run_source` возвращает код главного потока (код не-главного отбрасывается); не возвращается |
+| 94 | `exit_group` | завершает все потоки прогона (готовые и заблокированные) и возвращает код главного, если он уже вышел, иначе код вызывающего; не возвращается |
+| 220 | `clone` | нативный `clone(flags, stack, entry, arg)`: `CLONE_VM|CLONE_THREAD` обязательны, `CLONE_FS/FILES/SIGHAND` принимаются (общие и так), `CLONE_SETTLS` — `-ENOTSUP`, неизвестный бит — `-EINVAL`; дочерний поток стартует в U-mode на `entry(arg)` со `sp=stack` и не возвращается из syscall (и `entry` не должен возвращаться — трамплина нет); родитель получает tid (>0) |
+| 98 | `futex` | `uaddr, op, val, timeout, uaddr2, val3`: `FUTEX_WAIT` (0) проверяет `*uaddr == val` и блокирует до `FUTEX_WAKE`/тикового дедлайна; `FUTEX_WAKE` (1) будит не больше `val`; `FUTEX_PRIVATE_FLAG` принимается; `WAKE_OP`/requeue/PI — `-ENOSYS`; `-EAGAIN`/`-ETIMEDOUT`/`-ENOMEM`, как в POSIX |
 | 34 | `mkdirat` | создать каталог; `dirfd` игнорируется, `mode` принимается и **игнорируется** (в VFS нет `set_mode`, ext2 даёт 0o755) |
 | 35 | `unlinkat` | `flags = 0` — удалить файл или ссылку (каталог — `-EISDIR`); `0x200` (`AT_REMOVEDIR`) — пустой каталог (не пустой — `-ENOTEMPTY`, файл — `-ENOTDIR`) |
 | 36 | `symlinkat` | создать ссылку: `a0` — цель (сырая строка, **не** резолвится), `a1` — `dirfd` (игнорируется), `a2` — путь |
@@ -330,7 +335,11 @@ selftest        # + SELFTEST user-*: 10/10 с /mnt (без диска 8/10 + 2 S
 Пределы и отличия, которые важно знать userland'у: 16 дескрипторов включая
 0/1/2 (кончились — `-ENOSPC`); путь ≤ 256 байт с NUL; `argv`+`env` ≤ 64 строк и
 ≤ 16 KiB; heap — ровно 1 MiB в `0x2000_0000..0x2010_0000`, кадры под него
-возвращаются в PMM после прогона (включая fault); `mmap`/`fork`/`exec` нет.
+возвращаются в PMM после прогона (включая fault). Потоков — до 14 на прогон
+(главный + 13 `clone`; 16 слотов планировщика минус `shell` и `idle`); у каждого
+свой kernel-стек 16 KiB + guard из PMM, user-стек передаёт вызывающий и ядро его
+не освобождает; futex-таблица — 32 ожидающих на 16 адресов; TLS/PI/requeue и
+`fork`/`exec`/сигналов нет.
 Мутации каталога (`mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`)
 идут через `parent_and_leaf` + `walk(parent, true)` и одну VFS-транзакцию:
 ошибка не оставляет полусостояния, а неудачный `openat(O_CREAT)` (кончились fd)
@@ -360,7 +369,7 @@ backspace работает, всё остальное — команды:
 |---|---|
 | `help` | список команд |
 | `mem` | память из device tree **и** статистика PMM и кучи (свободно/всего кадров, диапазон пула, байты кучи) |
-| `selftest` | in-QEMU self-tests: 7 памяти, 4 блока/указателя, 11 ext2/VFS, 4 таймера/PLIC, 5 планировщика, 10 user-mode (включая мутационную половину ABI-фикстуры и сокетную секцию: с живым сервером на `10.0.2.2:8000` — connect/send/recv/shutdown/EOF, без него — `SKIP`; без `/mnt` два SKIP — `user-run-large-file` и `user-abi-syscalls`, итог 8/10); печатает ledger свободных кадров до и после каждого блока |
+| `selftest` | in-QEMU self-tests: 7 памяти, 4 блока/указателя, 11 ext2/VFS, 4 таймера/PLIC, 5 планировщика, 10 user-mode (включая мутационную половину ABI-фикстуры, сокетную секцию и секцию потоков: `clone`/`gettid`/futex/`exit`/`exit_group`; с живым сервером на `10.0.2.2:8000` — connect/send/recv/shutdown/EOF, без него — `SKIP`; без `/mnt` два SKIP — `user-run-large-file` и `user-abi-syscalls`, итог 8/10); печатает ledger свободных кадров до и после каждого блока |
 | `disk` | блочное устройство: имя, ёмкость, живая проверка чтения сектора 0 |
 | `ls [path]` | листинг каталога (каталоги с `/`) |
 | `cat <path>` | содержимое файла |
@@ -537,6 +546,12 @@ IPv4, ICMP и UDP, а `dhcp`/`dns`/`tcp` — маленькие клиенты. 
   его в user-окно; предел образа — 1 MiB (`MAX_IMAGE_BYTES`), одновременно
   исполняется один user-образ, отдельного адресного пространства процесса и
   отображения `/mnt` в него нет.
+* **Потоки — MVP, не POSIX threads.** `clone` создаёт поток только с явным
+  `entry(arg)` и `CLONE_VM|CLONE_THREAD`; TLS (`CLONE_SETTLS` — `-ENOTSUP`),
+  `fork`/`exec`, сигналы, `join`/`waitid`, приоритеты и priority-inheritance
+  фьютексы отсутствуют. Максимум — 14 живых потоков на прогон; user-стек
+  выделяет и освобождает вызывающий; код не-главного потока при `exit`
+  отбрасывается. Планировщик по-прежнему round-robin без приоритетов.
 * **Нет журнала/WAL в ext2.** Сбой между двумя записями может оставить операцию
   недоделанной; crash-consistency не заявляется.
 * **Один блочный слот, нет разделов/hot-plug.** Второй диск — изменение дизайна.
@@ -583,7 +598,8 @@ src/memory/heap.rs             куча: free-list поверх чанков п�
 src/memory/selftest.rs         in-QEMU self-tests памяти (selftest)
 src/user/mod.rs                run_image: ELF -> user-стек -> задача -> sret в U-mode
 src/user/elf.rs                ELF64-загрузчик: валидация, PT_LOAD с U=1, откат кадров
-src/user/syscall.rs            ecall-диспетчер: read/write/openat/close/lseek/fstat/getdents64/brk/time/uname/readlinkat + mkdirat/unlinkat/symlinkat/linkat/renameat2/fchmodat/ftruncate + socket/connect/sendto/recvfrom/setsockopt/getsockopt/shutdown
+src/user/syscall.rs            ecall-диспетчер: read/write/openat/close/lseek/fstat/getdents64/brk/time/uname/readlinkat + mkdirat/unlinkat/symlinkat/linkat/renameat2/fchmodat/ftruncate + socket/connect/sendto/recvfrom/setsockopt/getsockopt/shutdown + clone/gettid/set_tid_address/exit/exit_group/futex
+src/user/futex.rs              статическая futex-очередь (32 ожидающих / 16 адресов) поверх block_current/wake_task
 src/user/selftest.rs           in-QEMU self-tests user mode (10 проверок)
 src/net/mod.rs                 сетевой стек: poll, ARP-кэш, диспетчер кадров, ping
 src/net/wire.rs                чистые форматы Ethernet/ARP/IPv4/ICMP/UDP/TCP/DHCP/DNS

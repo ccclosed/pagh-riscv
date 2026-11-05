@@ -11,7 +11,7 @@ checkout собирается **без** кросс-компилятора.
 | `fault.rs` / `fault.elf` | `getpid`, затем `ld` с адреса 0 | fault из U убивает задачу, а не машину; `run_image` возвращает `Exit::Fault` |
 | `spin.rs` / `spin.elf` | `rdtime`-цикл на 0.2 s (~20 тиков), `getpid`, `exit(7)` | таймерное прерывание, взятое в U-mode, обрабатывается и возвращается в U |
 | `argv.rs` / `argv.elf` | проверяет `a0=argc`, `a1=argv`, `sp`, `envp = argv+argc+1`, NULL-терминаторы и выравнивание; печатает `argv: argc=3 argv[0]=argv.elf argv[1]=alpha argv[2]=beta env[0]=PWD=/` | SysV-кадр входа и точную строку, которую selftest сравнивает побайтно |
-| `abi.rs` / `abi.elf` | `write`, `openat` (существующий файл, создание, `O_APPEND`, `O_TRUNC`), `read`, `fstat`, `lseek`, `getdents64`, `readlinkat`, `brk` с паттерном, `clock_gettime`, `nanosleep`, `uname`, `getpid`, `close`, `-EFAULT`/`-ENOSYS`/`-EBADF`/`-ENOMEM`; мутационная половина: `mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`/`ftruncate` и их ошибки; сокетная секция: `socket` (bad domain/type/protocol, второй сокет), `connect` к `10.0.2.2:8000` (без сервера — `SKIP`, не fail), `setsockopt`/`getsockopt`, `send`/`recv`, `shutdown`, EOF и `-EPIPE`; без `/mnt` выходит 77 после no-fs половины | весь native ABI без libpagh: файлы, каталоги, символические ссылки, мутации, heap, время, ошибки и один TCP-сокет |
+| `abi.rs` / `abi.elf` | `write`, `openat` (существующий файл, создание, `O_APPEND`, `O_TRUNC`), `read`, `fstat`, `lseek`, `getdents64`, `readlinkat`, `brk` с паттерном, `clock_gettime`, `nanosleep`, `uname`, `getpid`, `close`, `-EFAULT`/`-ENOSYS`/`-EBADF`/`-ENOMEM`; **секция потоков**: `gettid`/`set_tid_address`, матрица ошибок `clone`, два потока с общим atomic-счётчиком, futex wait/wake-rendezvous, `exit` не-главного, `exit_group`; мутационная половина: `mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`/`ftruncate` и их ошибки; сокетная секция: `socket` (bad domain/type/protocol, второй сокет), `connect` к `10.0.2.2:8000` (без сервера — `SKIP`, не fail), `setsockopt`/`getsockopt`, `send`/`recv`, `shutdown`, EOF и `-EPIPE`; без `/mnt` выходит 77 после no-fs половины, оставляя живой tail-поток | весь native ABI без libpagh: файлы, каталоги, символические ссылки, мутации, heap, время, ошибки, один TCP-сокет, `clone`/futex/`exit_group` |
 | `user.ld` | линковка: `_start` = `0x1_0000`, PT_LOAD-раскладка | совпадает с окном из `src/user/elf.rs` |
 
 ELF-файлы **закоммичены** — это часть дерева, как шрифт `assets/font8x18.bin`.
@@ -38,9 +38,13 @@ toolchain: `TOOLCHAIN=nightly-... ./userland/build.sh`. `strip=debuginfo`
 
 - Linux/RISC-V номера: `read=63`, `write=64`, `openat=56`, `close=57`,
   `getdents64=61`, `lseek=62`, `fstat=80`, `readlinkat=78`, `nanosleep=101`,
-  `clock_gettime=113`, `uname=160`, `brk=214`, `exit=93`, `sched_yield=124`,
-  `getpid=172`, `socket=198`, `connect=203`, `sendto=206`, `recvfrom=207`,
-  `setsockopt=208`, `getsockopt=209`, `shutdown=210`. Регистры: `a7` — номер,
+  `clock_gettime=113`, `uname=160`, `brk=214`, `exit=93`, `exit_group=94`,
+  `set_tid_address=96`, `futex=98`, `sched_yield=124`, `getpid=172`,
+  `gettid=178`, `clone=220`, `socket=198`, `connect=203`, `sendto=206`,
+  `recvfrom=207`, `setsockopt=208`, `getsockopt=209`, `shutdown=210`.
+  `clone` — **нативная** подпись `clone(flags, stack, entry, arg)`, не Linux-raw:
+  ребёнок стартует на `entry(arg)`, из syscall не возвращается. Регистры: `a7` —
+  номер,
   `a0..a5` — аргументы, `a0` — результат
   (`-errno`); диспетчер — `src/user/syscall.rs`.
 - Вход: `a0 = argc`, `a1 = argv`, `sp` — 16-выровненный SysV-кадр
@@ -55,7 +59,10 @@ toolchain: `TOOLCHAIN=nightly-... ./userland/build.sh`. `strip=debuginfo`
 - Пределы: 16 fd, путь ≤ 256 B, heap ровно 1 MiB (`brk`), `read(0)` неблокирующий
   (`-EAGAIN`), `getdents64` — снимок на `openat`; один TCP-сокет
   (`AF_INET`/`SOCK_STREAM`, IPv4-литерал), `recv` неблокирующий, без
-  `listen`/`accept`/UDP/DNS/TLS.
+  `listen`/`accept`/UDP/DNS/TLS. Потоков ≤ 14 на прогон, у каждого 16 KiB
+  kernel-стека + guard; TLS/`CLONE_SETTLS`, PI/requeue-фьютексы и `join`/`waitid`
+  отсутствуют; futex-таблица 32 ожидающих на 16 адресов; user-стек выделяет
+  вызывающий.
 
 ## Как это видно из шелла
 
@@ -73,5 +80,5 @@ pagh:rv64> run spin
 run: spin exited with code 7
 pagh:rv64> selftest
 SELFTEST user-abi-argv PASS
-SELFTEST user-abi-syscalls PASS     # с /mnt (включая abi: mutations ok); без него SKIP
+SELFTEST user-abi-syscalls PASS     # с /mnt (включая abi: threads ok и abi: mutations ok); без него SKIP
 ```
