@@ -305,7 +305,10 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
     initially held a 12 KiB frame ring inline and building it on the boot stack
     overflowed into `.bss` too (`chunk_count = 16384`). Box large buffers in
     device/stack structs, keep `probe`-style builders returning small values, and
-    do not spend the remaining ~64 KiB on a stack local.
+    do not spend the remaining ~64 KiB on a stack local. The same rule applies
+    to a user task's 16 KiB kernel stack: `execve` runs the ELF loader there, and
+    the loader's 256-entry page-plan array is a heap `Vec` for exactly this
+    reason — it used to overflow the guard during the ABI fixture's exec child.
 26. **Network parsing never panics and never trusts a frame.** `src/net/wire.rs`
     is the only place that reads packet bytes: bounds-checked reads, checked
     arithmetic, checksum validation, fragments dropped. Before a DHCP lease

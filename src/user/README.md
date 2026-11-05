@@ -546,8 +546,10 @@ futex-wait, synchronous SIGSEGV в отдельном потоке, плохой
 потоке и SIGTSTP/SIGCONT на futex-ожидании; маркеры `abi: altstack ok`,
 `abi: siginfo ok`, `abi: jobcontrol ok`, затем секцию процессов:
 `fork`/`getppid`/`wait4` (`WNOHANG`, `ECHILD`, `EINVAL`), `abi: fork ok`,
-`abi: wait ok`, `execve` с ошибками (`ENOENT`/`EFAULT`/`ENOEXEC`) и успешной
-заменой образа (`abi: exec ok`, `abi: exec wait ok`); маркеры проверяются и
+`abi: wait ok`, наследование pipe и обработчика SIGUSR1 (ребёнок шлёт сигнал
+себе и видит +1), `execve` с ошибками (`ENOENT`/`EFAULT`/`ENOEXEC`) и успешной
+заменой образа (`abi: exec ok`, `abi: exec wait ok`), второй exec — сброс
+`SIG_IGN` в `SIG_DFL` и сохранение blocked-маски; маркеры проверяются и
 раннером по перехваченному serial-выводу, затем мутационную
 половину: `mkdirat` (+`EEXIST`, игнор `mode`), `unlinkat` с `AT_REMOVEDIR`
 (`EISDIR`/`ENOTDIR`/`ENOTEMPTY`), `renameat2`, `linkat` (+`EISDIR`/`EINVAL`),

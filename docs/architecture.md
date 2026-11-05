@@ -1009,7 +1009,10 @@ POSIX-усыновление.
 foreground (0) и у ребёнка; `fork` + маркер `abi: fork ok`; `wait4` с blocking
 и `WNOHANG`, `ECHILD`/`EINVAL`; fork-ребёнок `execve`-ит `/mnt/exec-child` с
 `argv=["exec-child","exec-arg"]`, `PWD=/mnt`, маркеры `abi: exec ok` и
-`abi: exec wait ok`, статус 0; не-ELF файл даёт `-ENOEXEC`, процесс выживает.
+`abi: exec wait ok`, статус 0; pipe и обработчик SIGUSR1 наследуются (ребёнок
+читает байт из унаследованного pipe и получает собственный SIGUSR1), а второй
+exec проверяет сброс `SIG_IGN` в `SIG_DFL` и сохранение blocked-маски; не-ELF
+файл даёт `-ENOEXEC`, процесс выживает.
 `SELFTEST user-abi-syscalls` требует, чтобы `forks`/`waits`/`getppids`/
 `execs` выросли, `live_processes() == 0`, `live_pipes() == 0`, а selftest с
 диском проходит 10/10; PMM-ledger в двух прогонах совпадает.
