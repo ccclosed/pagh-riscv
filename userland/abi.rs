@@ -29,10 +29,22 @@ _start:
 
 // ─── syscall wrapper ───────────────────────────────────────────────────────
 
-fn syscall4(number: usize, a0: usize, a1: usize, a2: usize, a3: usize) -> isize {
+fn syscall5(
+    number: usize,
+    a0: usize,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+) -> isize {
     let result: isize;
-    // SAFETY: `ecall` enters the kernel with `a7` as the number and `a0..a3` as
+    // SAFETY: `ecall` enters the kernel with `a7` as the number and `a0..a4` as
     // arguments; the kernel restores the same `sp` and callee-saved registers.
+    //
+    // No `nostack` option: the kernel writes into buffers this program passes
+    // by address (path strings, `Stat`, `Uname`, the directory array), and some
+    // of them live on this stack frame. `nostack` promises the asm does not
+    // write the stack, which would be a false promise here.
     unsafe {
         core::arch::asm!(
             "ecall",
@@ -41,10 +53,14 @@ fn syscall4(number: usize, a0: usize, a1: usize, a2: usize, a3: usize) -> isize 
             in("a1") a1,
             in("a2") a2,
             in("a3") a3,
-            options(nostack)
+            in("a4") a4,
         )
     };
     result
+}
+
+fn syscall4(number: usize, a0: usize, a1: usize, a2: usize, a3: usize) -> isize {
+    syscall5(number, a0, a1, a2, a3, 0)
 }
 
 fn syscall3(number: usize, a0: usize, a1: usize, a2: usize) -> isize {
@@ -73,9 +89,19 @@ const SYS_CLOCK_GETTIME: usize = 113;
 const SYS_READLINKAT: usize = 78;
 const SYS_UNAME: usize = 160;
 const SYS_BRK: usize = 214;
+const SYS_MKDIRAT: usize = 34;
+const SYS_UNLINKAT: usize = 35;
+const SYS_SYMLINKAT: usize = 36;
+const SYS_LINKAT: usize = 37;
+const SYS_FCHMODAT: usize = 53;
+const SYS_FTRUNCATE: usize = 46;
+const SYS_RENAMEAT2: usize = 276;
+
+const AT_REMOVEDIR: usize = 0x200;
 
 const O_RDONLY: usize = 0;
 const O_WRONLY: usize = 1;
+const O_RDWR: usize = 2;
 const O_CREAT: usize = 0x40;
 const O_TRUNC: usize = 0x80;
 const O_APPEND: usize = 0x100;
@@ -88,6 +114,10 @@ const EISDIR: isize = -21;
 const EINVAL: isize = -22;
 const ENOMEM: isize = -12;
 const ENOSYS: isize = -38;
+const EEXIST: isize = -17;
+const ENOTEMPTY: isize = -39;
+const ENOTSUP: isize = -95;
+const ENAMETOOLONG: isize = -36;
 
 #[repr(C)]
 struct Stat {
@@ -221,6 +251,26 @@ fn directory_has(buffer: &[u8], length: usize, expected: &[u8]) -> bool {
     offset == length
 }
 
+/// Every record is well-formed and none is named `expected`. Unlike
+/// `!directory_has`, a malformed record fails this check instead of passing it
+/// vacuously — the mutation half uses it to prove the names are really gone.
+fn directory_lacks(buffer: &[u8], length: usize, expected: &[u8]) -> bool {
+    let mut offset = 0usize;
+    while offset + 8 <= length {
+        let name_length = buffer[offset + 9] as usize;
+        let record = (12 + name_length + 7) & !7;
+        if record < 8 || offset + record > length || offset + 12 + name_length > length {
+            return false;
+        }
+        let name = &buffer[offset + 12..offset + 12 + name_length];
+        if buffer_equals(name, expected) {
+            return false;
+        }
+        offset += record;
+    }
+    offset == length
+}
+
 // ─── the fixture ───────────────────────────────────────────────────────────
 
 #[no_mangle]
@@ -256,7 +306,7 @@ pub extern "C" fn abi_main() -> i32 {
         "uname.machine",
     );
     check(
-        cstr_eq(uname.release.as_ptr(), b"0.10.0-dev"),
+        cstr_eq(uname.release.as_ptr(), b"0.10.0"),
         6,
         "uname.release",
     );
@@ -654,6 +704,438 @@ pub extern "C" fn abi_main() -> i32 {
     );
     check(syscall1(SYS_CLOSE, fd as usize) == 0, 72, "close /mnt");
 
+    // ── path mutations: mkdirat / unlinkat / symlinkat / linkat / renameat2 /
+    // fchmodat / ftruncate. Reached only with /mnt: the no-filesystem boot
+    // exited 77 before this point. Every check below is a real syscall through
+    // `ecall`; the kernel-side selftest verifies the tree afterwards. ──
+    let mut_path = b"/mnt/abi-mut.txt\0";
+    let renamed = b"/mnt/abi-renamed.txt\0";
+    let hard = b"/mnt/abi-hard.txt\0";
+    let sym = b"/mnt/abi-sym\0";
+    let sym2 = b"/mnt/abi-sym2\0";
+    let dir_path = b"/mnt/abi-dir\0";
+    let dir2 = b"/mnt/abi-dir2\0";
+    let inside = b"/mnt/abi-dir/inside.txt\0";
+    let missing = b"/mnt/abi-missing.txt\0";
+    let bad_parent = b"/mnt/abi-missing-dir/x\0";
+
+    // ── directory lifecycle ──
+    check(
+        syscall3(SYS_MKDIRAT, 0, dir_path.as_ptr() as usize, 0o700) == 0,
+        74,
+        "mkdirat",
+    );
+    check(
+        syscall3(SYS_MKDIRAT, 0, dir_path.as_ptr() as usize, 0o755) == EEXIST,
+        75,
+        "mkdirat exists",
+    );
+    // `mode` is accepted and ignored (no VFS `set_mode`): the directory carries
+    // ext2's default 0o755, not the 0o700 that was asked for. This pins the
+    // documented behavior.
+    let dir_fd = syscall4(SYS_OPENAT, 0, dir_path.as_ptr() as usize, O_RDONLY, 0);
+    check(dir_fd >= 3, 76, "openat new directory");
+    check(
+        syscall2(SYS_FSTAT, dir_fd as usize, &mut stat as *mut Stat as usize) == 0
+            && stat.kind == KIND_DIR
+            && stat.mode & 0o777 == 0o755,
+        77,
+        "mkdirat mode is ignored",
+    );
+    check(
+        syscall2(SYS_FTRUNCATE, dir_fd as usize, 0) == EISDIR,
+        78,
+        "ftruncate on a directory",
+    );
+    check(syscall1(SYS_CLOSE, dir_fd as usize) == 0, 79, "close directory");
+
+    let fd = syscall4(
+        SYS_OPENAT,
+        0,
+        inside.as_ptr() as usize,
+        O_WRONLY | O_CREAT | O_TRUNC,
+        0o644,
+    );
+    check(fd >= 3, 80, "create inside directory");
+    check(syscall1(SYS_CLOSE, fd as usize) == 0, 81, "close inside");
+
+    check(
+        syscall3(SYS_UNLINKAT, 0, dir_path.as_ptr() as usize, 0) == EISDIR,
+        82,
+        "unlinkat directory without AT_REMOVEDIR",
+    );
+    check(
+        syscall3(
+            SYS_UNLINKAT,
+            0,
+            dir_path.as_ptr() as usize,
+            AT_REMOVEDIR,
+        ) == ENOTEMPTY,
+        83,
+        "rmdir non-empty",
+    );
+    check(
+        syscall3(
+            SYS_UNLINKAT,
+            0,
+            inside.as_ptr() as usize,
+            AT_REMOVEDIR,
+        ) == ENOTDIR,
+        84,
+        "AT_REMOVEDIR on a file",
+    );
+    check(
+        syscall3(SYS_UNLINKAT, 0, inside.as_ptr() as usize, 0) == 0,
+        85,
+        "unlink inside",
+    );
+    check(
+        syscall3(
+            SYS_UNLINKAT,
+            0,
+            dir_path.as_ptr() as usize,
+            AT_REMOVEDIR,
+        ) == 0,
+        86,
+        "rmdir empty",
+    );
+    check(
+        syscall3(
+            SYS_UNLINKAT,
+            0,
+            dir_path.as_ptr() as usize,
+            AT_REMOVEDIR,
+        ) == ENOENT,
+        87,
+        "rmdir gone",
+    );
+    check(
+        syscall3(SYS_MKDIRAT, 0, b"relative\0".as_ptr() as usize, 0o755) == EINVAL,
+        88,
+        "mkdirat relative path",
+    );
+    check(
+        syscall3(SYS_UNLINKAT, 0, mut_path.as_ptr() as usize, 0x400) == EINVAL,
+        89,
+        "unlinkat unknown flag",
+    );
+    check(
+        syscall3(SYS_UNLINKAT, 0, 0x10, 0) == EFAULT,
+        90,
+        "unlinkat bad pointer",
+    );
+    check(
+        syscall3(
+            SYS_MKDIRAT,
+            0,
+            bad_parent.as_ptr() as usize,
+            0o755,
+        ) == ENOENT,
+        91,
+        "mkdirat missing parent",
+    );
+
+    // ── file lifecycle: create, write, chmod, rename, truncate, link ──
+    let fd = syscall4(
+        SYS_OPENAT,
+        0,
+        mut_path.as_ptr() as usize,
+        O_WRONLY | O_CREAT | O_TRUNC,
+        0o644,
+    );
+    check(fd >= 3, 92, "create abi-mut.txt");
+    check(
+        syscall3(SYS_WRITE, fd as usize, b"mutate\n".as_ptr() as usize, 7) == 7,
+        93,
+        "write abi-mut.txt",
+    );
+    check(syscall1(SYS_CLOSE, fd as usize) == 0, 94, "close abi-mut.txt");
+
+    check(
+        syscall4(
+            SYS_FCHMODAT,
+            0,
+            mut_path.as_ptr() as usize,
+            0o600,
+            0,
+        ) == 0,
+        95,
+        "fchmodat",
+    );
+    let fd = syscall4(SYS_OPENAT, 0, mut_path.as_ptr() as usize, O_RDONLY, 0);
+    check(fd >= 3, 96, "open after chmod");
+    check(
+        syscall2(SYS_FSTAT, fd as usize, &mut stat as *mut Stat as usize) == 0
+            && stat.mode & 0o7777 == 0o600,
+        97,
+        "fstat sees the chmod",
+    );
+    check(
+        syscall2(SYS_FTRUNCATE, fd as usize, 0) == EBADF,
+        98,
+        "ftruncate read-only fd",
+    );
+    check(syscall1(SYS_CLOSE, fd as usize) == 0, 99, "close after chmod");
+    check(
+        syscall4(
+            SYS_FCHMODAT,
+            0,
+            mut_path.as_ptr() as usize,
+            0o644,
+            0,
+        ) == 0,
+        100,
+        "fchmodat restore",
+    );
+    check(
+        syscall4(SYS_FCHMODAT, 0, mut_path.as_ptr() as usize, 0o644, 0x100) == EINVAL,
+        101,
+        "fchmodat flags",
+    );
+    check(
+        syscall4(SYS_FCHMODAT, 0, b"/\0".as_ptr() as usize, 0o755, 0) == ENOTSUP,
+        102,
+        "fchmodat synthetic node",
+    );
+    check(
+        syscall2(SYS_FTRUNCATE, 1, 0) == EINVAL,
+        103,
+        "ftruncate console",
+    );
+
+    check(
+        syscall5(
+            SYS_RENAMEAT2,
+            0,
+            mut_path.as_ptr() as usize,
+            0,
+            renamed.as_ptr() as usize,
+            0,
+        ) == 0,
+        104,
+        "renameat2",
+    );
+    check(
+        syscall5(
+            SYS_RENAMEAT2,
+            0,
+            renamed.as_ptr() as usize,
+            0,
+            hard.as_ptr() as usize,
+            1,
+        ) == EINVAL,
+        105,
+        "renameat2 flags",
+    );
+    check(
+        syscall4(SYS_OPENAT, 0, mut_path.as_ptr() as usize, O_RDONLY, 0) == ENOENT,
+        106,
+        "old name gone after rename",
+    );
+
+    let fd = syscall4(SYS_OPENAT, 0, renamed.as_ptr() as usize, O_RDWR, 0);
+    check(fd >= 3, 107, "open renamed");
+    check(
+        syscall2(SYS_FSTAT, fd as usize, &mut stat as *mut Stat as usize) == 0 && stat.size == 7,
+        108,
+        "renamed size",
+    );
+    let renamed_ino = stat.ino;
+    check(
+        syscall2(SYS_FTRUNCATE, fd as usize, 0) == 0,
+        109,
+        "ftruncate to zero",
+    );
+    check(
+        syscall2(SYS_FSTAT, fd as usize, &mut stat as *mut Stat as usize) == 0 && stat.size == 0,
+        110,
+        "size after truncate",
+    );
+    check(syscall3(SYS_LSEEK, fd as usize, 0, 0) == 0, 111, "seek after truncate");
+    check(
+        syscall3(SYS_WRITE, fd as usize, b"link\n".as_ptr() as usize, 5) == 5,
+        112,
+        "rewrite after truncate",
+    );
+    check(
+        syscall2(SYS_FSTAT, fd as usize, &mut stat as *mut Stat as usize) == 0 && stat.size == 5,
+        113,
+        "size after rewrite",
+    );
+    check(syscall1(SYS_CLOSE, fd as usize) == 0, 114, "close renamed");
+
+    check(
+        syscall5(
+            SYS_LINKAT,
+            0,
+            renamed.as_ptr() as usize,
+            0,
+            hard.as_ptr() as usize,
+            0,
+        ) == 0,
+        115,
+        "linkat",
+    );
+    let fd = syscall4(SYS_OPENAT, 0, hard.as_ptr() as usize, O_RDONLY, 0);
+    check(fd >= 3, 116, "open hard link");
+    check(
+        syscall2(SYS_FSTAT, fd as usize, &mut stat as *mut Stat as usize) == 0
+            && stat.ino == renamed_ino
+            && stat.size == 5,
+        117,
+        "hard link shares the inode",
+    );
+    check(syscall1(SYS_CLOSE, fd as usize) == 0, 118, "close hard link");
+    check(
+        syscall5(
+            SYS_LINKAT,
+            0,
+            renamed.as_ptr() as usize,
+            0,
+            hard.as_ptr() as usize,
+            1,
+        ) == EINVAL,
+        119,
+        "linkat flags",
+    );
+
+    // ── symlink: created by path, read back, followed by openat ──
+    check(
+        syscall3(
+            SYS_SYMLINKAT,
+            b"abi-renamed.txt\0".as_ptr() as usize,
+            0,
+            sym.as_ptr() as usize,
+        ) == 0,
+        120,
+        "symlinkat",
+    );
+    let length = syscall4(
+        SYS_READLINKAT,
+        0,
+        sym.as_ptr() as usize,
+        target.as_mut_ptr() as usize,
+        target.len(),
+    );
+    check(length == 15, 121, "readlinkat new link length");
+    check(
+        buffer_equals(&target[..15], b"abi-renamed.txt"),
+        122,
+        "readlinkat new link target",
+    );
+    let fd = syscall4(SYS_OPENAT, 0, sym.as_ptr() as usize, O_RDONLY, 0);
+    check(fd >= 3, 123, "open through new link");
+    check(
+        syscall2(SYS_FSTAT, fd as usize, &mut stat as *mut Stat as usize) == 0 && stat.size == 5,
+        124,
+        "new link follows to the file",
+    );
+    check(syscall1(SYS_CLOSE, fd as usize) == 0, 125, "close through link");
+    check(
+        syscall3(
+            SYS_SYMLINKAT,
+            b"\0".as_ptr() as usize,
+            0,
+            sym2.as_ptr() as usize,
+        ) == EINVAL,
+        126,
+        "symlinkat empty target",
+    );
+
+    // ── unlink everything again ──
+    check(
+        syscall3(SYS_UNLINKAT, 0, hard.as_ptr() as usize, 0) == 0,
+        127,
+        "unlink hard link",
+    );
+    check(
+        syscall3(SYS_UNLINKAT, 0, renamed.as_ptr() as usize, 0) == 0,
+        128,
+        "unlink renamed",
+    );
+    check(
+        syscall3(SYS_UNLINKAT, 0, sym.as_ptr() as usize, 0) == 0,
+        129,
+        "unlink symlink",
+    );
+    check(
+        syscall3(SYS_UNLINKAT, 0, missing.as_ptr() as usize, 0) == ENOENT,
+        130,
+        "unlink missing",
+    );
+    check(
+        syscall4(SYS_OPENAT, 0, renamed.as_ptr() as usize, O_RDONLY, 0) == ENOENT
+            && syscall4(SYS_OPENAT, 0, hard.as_ptr() as usize, O_RDONLY, 0) == ENOENT
+            && syscall4(SYS_OPENAT, 0, sym.as_ptr() as usize, O_RDONLY, 0) == ENOENT,
+        131,
+        "mutation artifacts gone",
+    );
+
+    // A directory may not be hard-linked; the check runs while one exists.
+    check(
+        syscall3(SYS_MKDIRAT, 0, dir2.as_ptr() as usize, 0o755) == 0,
+        132,
+        "mkdirat second directory",
+    );
+    check(
+        syscall5(
+            SYS_LINKAT,
+            0,
+            dir2.as_ptr() as usize,
+            0,
+            hard.as_ptr() as usize,
+            0,
+        ) == EISDIR,
+        133,
+        "linkat directory",
+    );
+    check(
+        syscall3(
+            SYS_UNLINKAT,
+            0,
+            dir2.as_ptr() as usize,
+            AT_REMOVEDIR,
+        ) == 0,
+        134,
+        "rmdir second directory",
+    );
+
+    // A path that never terminates inside the 256-byte ABI buffer is refused,
+    // not truncated.
+    let mut long_path = [b'a'; 300];
+    long_path[0] = b'/';
+    long_path[299] = 0;
+    check(
+        syscall3(SYS_UNLINKAT, 0, long_path.as_ptr() as usize, 0) == ENAMETOOLONG,
+        135,
+        "overlong path",
+    );
+
+    // Finally: the directory is back to the fixture inputs, with no mutation
+    // artifact left behind (also what the kernel-side ledger check assumes).
+    let fd = syscall4(SYS_OPENAT, 0, mnt.as_ptr() as usize, O_RDONLY, 0);
+    check(fd >= 3, 136, "reopen /mnt");
+    let encoded = syscall3(
+        SYS_GETDENTS64,
+        fd as usize,
+        entries.as_mut_ptr() as usize,
+        entries.len(),
+    );
+    check(encoded > 0, 137, "getdents64 after mutations");
+    let encoded = encoded as usize;
+    check(
+        directory_has(&entries, encoded, b"abi-syscalls.txt")
+            && directory_lacks(&entries, encoded, b"abi-mut.txt")
+            && directory_lacks(&entries, encoded, b"abi-renamed.txt")
+            && directory_lacks(&entries, encoded, b"abi-hard.txt")
+            && directory_lacks(&entries, encoded, b"abi-sym")
+            && directory_lacks(&entries, encoded, b"abi-dir"),
+        138,
+        "mutation cleanup in the directory",
+    );
+    check(syscall1(SYS_CLOSE, fd as usize) == 0, 139, "close /mnt again");
+
+    print("abi: mutations ok\n");
     print("abi: ok\n");
     0
 }

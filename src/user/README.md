@@ -13,8 +13,8 @@
 |---|---|
 | `mod.rs` | `run_image(bytes, name)` / `run_image_with_args` для фикстур и `run_file(path)` / `run_file_with_args` / `run_file_with_argv0` для `run <path>` — весь сценарий запуска: ELF → user-стек → SysV-кадр `argc/argv/envp` → `spawn` задачи → `enter_user` (`a0=argc`, `a1=argv`, `sret`) → ожидание `Exited` → `reap` → снятие маппингов и heap-кадров; `FileSource` поверх `VfsNode` (потоковое чтение), `Exit`/`UserError`, `on_fault`, `RUN` (одна программа за раз), `brk` (user heap), capture для ABI-теста, встроенные фикстуры `HELLO_ELF`/`FAULT_ELF`/`SPIN_ELF`/`ARGV_ELF`/`ABI_ELF` |
 | `elf.rs` | ELF64-загрузчик: `ImageSource` (`len` + `read_at`) и потоковое чтение — заголовок, таблица program headers (≤ 8) и сегменты кусками ≤ 512 B в уже замапленные страницы, **без буфера размером с образ**; валидация заголовка/сегментов до первого кадра, `PT_LOAD`-страницы `U=1` в общей карте, нулевой `.bss`-хвост, откат кадров при любой ошибке; `Loaded { entry, pages(), release() }`, типизированные `ElfError`/`SourceError` |
-| `syscall.rs` | `dispatch(frame)`: `read(63)`, `write(64)`, `openat(56)`, `close(57)`, `lseek(62)`, `fstat(80)`, `getdents64(61)`, `brk(214)`, `clock_gettime(113)`, `nanosleep(101)`, `uname(160)`, `readlinkat(78)`, `exit(93)`, `sched_yield(124)`, `getpid(172)`; таблица 16 fd на прогон, `copy_from_user`/`copy_to_user` (проверка `U/R/W` по PTE, `SUM` только вокруг копии), `-errno`/`-ENOSYS`, `ecall → sepc + 4`, счётчики для selftest |
-| `selftest.rs` | десять проверок для `selftest`: `user-abi-argv` (точная строка из фикстуры), `user-abi-syscalls` (все вызовы, с диском exit 0, без `/mnt` — SKIP после no-fs половины), accept фикстуры, reject-матрица (14 мутаций заголовка/сегментов), отказ `run_image` на битом ELF, round-trip `hello`, fault-изоляция, запуск после fault, таймер-in-U и `user-run-large-file` (100 KiB образ с нулевым хвостом через `run_file`) |
+| `syscall.rs` | `dispatch(frame)`: `read(63)`, `write(64)`, `openat(56)`, `close(57)`, `lseek(62)`, `fstat(80)`, `getdents64(61)`, `brk(214)`, `clock_gettime(113)`, `nanosleep(101)`, `uname(160)`, `readlinkat(78)`, `exit(93)`, `sched_yield(124)`, `getpid(172)` + мутации `mkdirat(34)`, `unlinkat(35)`, `symlinkat(36)`, `linkat(37)`, `fchmodat(53)`, `ftruncate(46)`, `renameat2(276)`; таблица 16 fd на прогон, per-run таблица режимов для `fchmodat`/`fstat`, `copy_from_user`/`copy_to_user` (проверка `U/R/W` по PTE, `SUM` только вокруг копии), `-errno`/`-ENOSYS`, `ecall → sepc + 4`, счётчики для selftest |
+| `selftest.rs` | десять проверок для `selftest`: `user-abi-argv` (точная строка из фикстуры), `user-abi-syscalls` (все вызовы + мутационная половина: mkdir/rmdir, rename, link, symlink, chmod, ftruncate, unlink; с диском exit 0 и «все имена убраны», без `/mnt` — SKIP после no-fs половины), accept фикстуры, reject-матрица (14 мутаций заголовка/сегментов), отказ `run_image` на битом ELF, round-trip `hello`, fault-изоляция, запуск после fault, таймер-in-U и `user-run-large-file` (100 KiB образ с нулевым хвостом через `run_file`) |
 
 ## Вход в U-mode и начальный стек
 
@@ -97,9 +97,19 @@ S-mode page fault (тот напечатал бы и остановил hart). �
   до 8). Если в буфер не влезает даже одна запись, возвращается 0 — с точки
   зрения вызывающего это неотличимо от конца каталога; 264 байта покрывают
   максимальное имя ext2.
-* `openat` принимает `mode`, но не применяет: в `VfsNode` нет `set_mode`,
-  ext2 создаёт файл с 0o644. Это задокументированное ограничение, а не забытый
-  код.
+* `openat`/`mkdirat` принимают `mode`, но не применяют: в `VfsNode` нет
+  `set_mode`, ext2 создаёт файл с 0o644, каталог — с 0o755. Это
+  задокументированное ограничение, а не забытый код.
+* `fchmodat` — компромисс: `mode & 0o7777` кладётся в статическую таблицу
+  прогона (ключ — `fs_ino`), `fstat` отдаёт эти биты до конца программы; inode
+  на диске не меняется, права ни на что не влияют. Синтетический узел (`ino 0`)
+  — `-ENOTSUP`; семнадцатый chmod в прогоне — `-ENOSPC`.
+* Мутации путей (`mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`) —
+  `read_user_path` + `read_path` (UTF-8, абсолютный) → `parent_and_leaf` →
+  `walk(parent, true)` → один вызов VFS. `unlinkat`/`linkat` не разыменовывают
+  последнюю ссылку, `fchmodat` разыменовывает; неизвестный бит `flags` —
+  `-EINVAL`. `openat(O_CREAT)` при нехватке fd удаляет созданный файл, а
+  `O_TRUNC` выполняет после установки fd и откатывает её при ошибке.
 * `clock_gettime` и `nanosleep` работают от 100 Гц тика: разрешение 10 ms,
   `nsec` всегда кратен миллиону.
 
@@ -181,8 +191,9 @@ S-mode page fault (тот напечатал бы и остановил hart). �
   нулевой хвост после последнего `PT_LOAD` игнорируется;
 - 16 fd на прогон (кончились — `-ENOSPC`), путь ≤ 256 B, кадр `argv/env` ≤ 64
   строк и ≤ 16 KiB, heap ровно 1 MiB;
-- `mode` в `openat` игнорируется (нет `set_mode` в VFS); `getdents64` при
-  слишком маленьком буфере возвращает 0; `lseek` на каталоге — `-EINVAL`;
+- `mode` в `openat`/`mkdirat` игнорируется (нет `set_mode` в VFS);
+  `fchmodat`-режим не переживает прогон; `getdents64` при слишком маленьком
+  буфере возвращает 0; `lseek` на каталоге — `-EINVAL`;
   `clock_gettime`/`nanosleep` имеют разрешение тика 10 ms;
 - нет per-process page table/ASID (изоляция только «юзер vs ядро»), `mmap`,
   `fork`/`exec`, сигналов, нескольких процессов; нет блокирующего `read(0)`.
@@ -203,8 +214,13 @@ selftest         # SELFTEST user-*: 10/10 с /mnt (8/10 + 2 SKIP без диск
 запускает `userland/abi.elf`: `write`, `openat` (существующий файл, создание,
 `O_APPEND`, `O_TRUNC`), `read`, `fstat`, `lseek`, `getdents64`, `readlinkat`,
 `brk` с записью/проверкой паттерна, `clock_gettime`, `nanosleep`, `uname`,
-`getpid`, `close`, `-ENOSYS`/`-EFAULT`/`-EBADF`/`-ENOMEM`; без `/mnt` фикстура
-проходит no-fs половину и выходит 77, что selftest считает SKIP.
+`getpid`, `close`, `-ENOSYS`/`-EFAULT`/`-EBADF`/`-ENOMEM`, затем мутационную
+половину: `mkdirat` (+`EEXIST`, игнор `mode`), `unlinkat` с `AT_REMOVEDIR`
+(`EISDIR`/`ENOTDIR`/`ENOTEMPTY`), `renameat2`, `linkat` (+`EISDIR`/`EINVAL`),
+`symlinkat`, `readlinkat`, `fchmodat` (+`ENOTSUP`), `ftruncate`
+(+`EINVAL`/`EBADF`/`EISDIR`), уборку всех имён и `ENAMETOOLONG` на 300-байтном
+пути. Без `/mnt` фикстура проходит no-fs половину и выходит 77, что selftest
+считает SKIP.
 
 Два `selftest` подряд печатают одинаковые ledger'ы — это и есть доказательство,
 что не течёт ни образ, ни стек, ни стек задачи, ни heap-кадры, ни fd-узлы.

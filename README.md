@@ -199,7 +199,7 @@ SELFTEST SUMMARY: 7/7 passed
 | Файловая система (ext2) | готово | чтение/запись файлов (direct + single/double indirect), truncate, каталоги, create/unlink/mkdir/rmdir/rename, симлинки; совместимо с образом хостового `mkfs.ext2 -t ext2`; форматируется только пустое устройство (MBR/GPT/чужие данные — отказ с причиной); журнала/WAL нет | `src/fs/ext2/`, `src/fs/format_policy.rs` |
 | VFS | готово | `VfsNode`, синтетический корень, монтирование в `/mnt`, два примитива разрешения путей (`lookup_path` без последней симлинки / `walk` с переходом и бюджетом) | `src/vfs/mod.rs` |
 | Планировщик, потоки ядра (M6a) | готово | контекстный switch (callee-saved ABI), до 8 потоков, round-robin, квант 8 тиков, стек 16 KiB + guard из PMM, вытеснение тиком таймера из trap-контекста (включая вытеснение U-mode), `tasks`/`spawn`/`yield`; exit возвращает кадры | `src/arch/riscv64/switch.rs`, `src/task/` |
-| User mode, syscalls, ELF, native ABI (M6b) | готово | `sret` в U-mode (`SPP=0`, `SPIE=1`, `SUM=0`, `sscratch`-контракт); вход `a0=argc`, `a1=argv`, SysV-кадр `argc/argv/envp` с `argv[0]` как набран и `PWD=<cwd>`; `ecall`-диспетчер: `read`/`write`/`openat`/`close`/`lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/`readlinkat`/`exit`/`sched_yield`/`getpid`, `sepc+4`, таблица 16 fd на прогон, `copy_from_user`/`copy_to_user` с проверкой `U/R/W` и `SUM` вокруг копии, heap-окно 1 MiB с возвратом кадров; ELF64-загрузчик с откатом кадров и **потоковым чтением** `ImageSource` (сегменты кусками ≤ 512 B, без буфера размером с файл), `run <path> [args...]` до 1 MiB и фикстуры `demo`/`fault`/`spin`/`argv`/`abi`; fault из U убивает только задачу; таймер вытесняет U-mode | `src/user/`, `userland/` |
+| User mode, syscalls, ELF, native ABI (M6b) | готово | `sret` в U-mode (`SPP=0`, `SPIE=1`, `SUM=0`, `sscratch`-контракт); вход `a0=argc`, `a1=argv`, SysV-кадр `argc/argv/envp` с `argv[0]` как набран и `PWD=<cwd>`; `ecall`-диспетчер: `read`/`write`/`openat`/`close`/`lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/`readlinkat`/`exit`/`sched_yield`/`getpid` + `mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`/`ftruncate` (мутации через `parent_and_leaf` + `walk(parent, true)`, per-run режим для `fstat`), `sepc+4`, таблица 16 fd на прогон, `copy_from_user`/`copy_to_user` с проверкой `U/R/W` и `SUM` вокруг копии, heap-окно 1 MiB с возвратом кадров; ELF64-загрузчик с откатом кадров и **потоковым чтением** `ImageSource` (сегменты кусками ≤ 512 B, без буфера размером с файл), `run <path> [args...]` до 1 MiB и фикстуры `demo`/`fault`/`spin`/`argv`/`abi`; fault из U убивает только задачу; таймер вытесняет U-mode | `src/user/`, `userland/` |
 | Сеть (M7) | готово | virtio-net (modern, polled) + свой стек: Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP-клиент, DNS-резолвер, `net`/`dhcp`/`ping`/`dns`/`http`; без smoltcp и внешних крейтов | `src/net/`, `src/drivers/virtio_net.rs` |
 | Пакеты (`pkg`) | MVP | нативный установщик (не apt): плоский `index` и `.ppkg` с репозитория по **plain HTTP** (`http://IP:port/`, в QEMU хост — `10.0.2.2`), потоковая загрузка в `/mnt/pkg` кусками 4 KiB, шлюз «размер + SHA-256 из индекса» **до** разбора `PPKG0001`; `kind=app` → `/mnt/bin/<name>`, `applet-bundle` → `/mnt/bin/paghbox` + симлинки; манифест в `/mnt/pkg/<name>.manifest`; TLS/OpenPGP/apt по-прежнему нет | `src/pkg/` |
 | apt / TLS / OpenPGP | **нет** | apt намеренно не подключён, пока нет vendored TLS + проверки подписей Debian; `pkg` — отдельный нативный путь для портов | — |
@@ -305,11 +305,25 @@ selftest        # + SELFTEST user-*: 10/10 с /mnt (без диска 8/10 + 2 S
 | 172 | `getpid` | id текущей задачи |
 | 124 | `sched_yield` | добровольное переключение |
 | 93 | `exit` | `Exit::Code(a0)`, не возвращается |
+| 34 | `mkdirat` | создать каталог; `dirfd` игнорируется, `mode` принимается и **игнорируется** (в VFS нет `set_mode`, ext2 даёт 0o755) |
+| 35 | `unlinkat` | `flags = 0` — удалить файл или ссылку (каталог — `-EISDIR`); `0x200` (`AT_REMOVEDIR`) — пустой каталог (не пустой — `-ENOTEMPTY`, файл — `-ENOTDIR`) |
+| 36 | `symlinkat` | создать ссылку: `a0` — цель (сырая строка, **не** резолвится), `a1` — `dirfd` (игнорируется), `a2` — путь |
+| 37 | `linkat` | жёсткая ссылка; оба `dirfd` игнорируются, `flags` обязан быть 0; каталог — `-EISDIR` |
+| 276 | `renameat2` | переименование/перенос одной транзакцией VFS; `flags` обязан быть 0; межмонтовый перенос — `-ENOTSUP` |
+| 53 | `fchmodat` | `mode & 0o7777` пишется в per-run таблицу по `fs_ino`; `fstat` видит новые биты до конца прогона, на диск не пишется; синтетический узел — `-ENOTSUP` |
+| 46 | `ftruncate` | изменить размер открытого regular-файла; fd 0/1/2 — `-EINVAL`, каталог — `-EISDIR`, read-only fd — `-EBADF` |
 
 Пределы и отличия, которые важно знать userland'у: 16 дескрипторов включая
 0/1/2 (кончились — `-ENOSPC`); путь ≤ 256 байт с NUL; `argv`+`env` ≤ 64 строк и
 ≤ 16 KiB; heap — ровно 1 MiB в `0x2000_0000..0x2010_0000`, кадры под него
 возвращаются в PMM после прогона (включая fault); `mmap`/`fork`/`exec` нет.
+Мутации каталога (`mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`)
+идут через `parent_and_leaf` + `walk(parent, true)` и одну VFS-транзакцию:
+ошибка не оставляет полусостояния, а неудачный `openat(O_CREAT)` (кончились fd)
+удаляет только что созданный файл. `chmod` **не сохраняется**: режим живёт в
+таблице прогона и виден только `fstat` этого процесса — на диск и на права он
+не влияет (в VFS нет `set_mode`); `mkdirat`/`openat` игнорируют `mode` по той же
+причине.
 `getdents64` при буфере меньше одной записи возвращает 0 — как конец каталога;
 буфер на 264 байта покрывает самое длинное имя ext2. Неизвестный номер —
 `-ENOSYS`; плохой указатель — `-EFAULT`, а не page fault.
@@ -323,7 +337,7 @@ backspace работает, всё остальное — команды:
 |---|---|
 | `help` | список команд |
 | `mem` | память из device tree **и** статистика PMM и кучи (свободно/всего кадров, диапазон пула, байты кучи) |
-| `selftest` | in-QEMU self-tests: 7 памяти, 4 блока/указателя, 11 ext2/VFS, 4 таймера/PLIC, 5 планировщика, 10 user-mode (без `/mnt` два SKIP — `user-run-large-file` и `user-abi-syscalls`, итог 8/10); печатает ledger свободных кадров до и после каждого блока |
+| `selftest` | in-QEMU self-tests: 7 памяти, 4 блока/указателя, 11 ext2/VFS, 4 таймера/PLIC, 5 планировщика, 10 user-mode (включая мутационную половину ABI-фикстуры; без `/mnt` два SKIP — `user-run-large-file` и `user-abi-syscalls`, итог 8/10); печатает ledger свободных кадров до и после каждого блока |
 | `disk` | блочное устройство: имя, ёмкость, живая проверка чтения сектора 0 |
 | `ls [path]` | листинг каталога (каталоги с `/`) |
 | `cat <path>` | содержимое файла |
@@ -541,7 +555,7 @@ src/memory/heap.rs             куча: free-list поверх чанков п�
 src/memory/selftest.rs         in-QEMU self-tests памяти (selftest)
 src/user/mod.rs                run_image: ELF -> user-стек -> задача -> sret в U-mode
 src/user/elf.rs                ELF64-загрузчик: валидация, PT_LOAD с U=1, откат кадров
-src/user/syscall.rs            ecall-диспетчер: read/write/openat/close/lseek/fstat/getdents64/brk/time/uname/readlinkat
+src/user/syscall.rs            ecall-диспетчер: read/write/openat/close/lseek/fstat/getdents64/brk/time/uname/readlinkat + mkdirat/unlinkat/symlinkat/linkat/renameat2/fchmodat/ftruncate
 src/user/selftest.rs           in-QEMU self-tests user mode (10 проверок)
 src/net/mod.rs                 сетевой стек: poll, ARP-кэш, диспетчер кадров, ping
 src/net/wire.rs                чистые форматы Ethernet/ARP/IPv4/ICMP/UDP/TCP/DHCP/DNS

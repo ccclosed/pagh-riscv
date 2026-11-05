@@ -548,6 +548,27 @@ User-страницы кладутся в **ту же** Sv39-карту с `U=1`
 | 93 | `exit` | `Exit::Code(a0)`, `scheduler::exit` — не возвращается |
 | 124 | `sched_yield` | `scheduler::yield_now()`, возврат в U |
 | 172 | `getpid` | id текущей задачи |
+| 34 | `mkdirat` | `dirfd`/`mode` игнорируются; `create_dir` родителя; 0o755 — дефолт VFS |
+| 35 | `unlinkat` | 0 — файл/ссылка (`lookup_path`, без разыменования последней ссылки), `0x200` — пустой каталог; тип проверяется до мутации: `-EISDIR`/`-ENOTDIR`, непустой — `-ENOTEMPTY` |
+| 36 | `symlinkat` | `a0` — цель (сырые байты, не резолвится), `a2` — путь; `create_symlink` |
+| 37 | `linkat` | жёсткая ссылка через `link`; `flags` = 0, каталог — `-EISDIR` |
+| 276 | `renameat2` | `vfs::rename` после проверки источника и родителя назначения; одна транзакция ext2 |
+| 53 | `fchmodat` | `mode & 0o7777` в per-run таблицу по `fs_ino`; `fstat` её читает, inode не меняется; синтетика — `-ENOTSUP` |
+| 46 | `ftruncate` | `VfsNode::truncate`; 0/1/2 — `-EINVAL`, каталог — `-EISDIR`, read-only fd — `-EBADF` |
+
+**Мутации путей** (`mkdirat`, `unlinkat`, `symlinkat`, `linkat`, `renameat2`,
+`fchmodat`) устроены одинаково: `read_user_path` → `read_path` (UTF-8 +
+абсолютный) → `vfs::parent_and_leaf` → `vfs::walk(parent, true)` → один вызов
+мутации на родительском узле. `dirfd` игнорируется, `flags` вне
+поддерживаемого набора — `-EINVAL`; последняя компонента не разыменовывается у
+`unlinkat`/`linkat` (удаляется/линкуется сама ссылка) и разыменовывается у
+`fchmodat`, как у `chmod`. Каждая мутация — одна VFS/ext2-транзакция, поэтому
+ошибка не оставляет полусостояния; исключение — `openat(O_CREAT)`, где файл
+создаётся до установки fd: при `-ENOSPC` он удаляется, а `O_TRUNC` выполняется
+после установки fd и откатывает её при ошибке. `fchmodat` не пишет inode
+(в `VfsNode` нет `set_mode`): режим хранится в статической таблице прогона по
+`fs_ino` (до 16 inode'ов, затем `-ENOSPC`), `fstat` отдаёт его до конца
+прогона, на диск и на права он не влияет — это задокументированный разрыв ABI.
 
 **Fd-таблица** — одна статическая на прогон, 16 слотов: 0 stdin, 1/2 stdout/stderr,
 3.. — `Arc<dyn VfsNode>` + offset + flags; сбрасывается перед спавном и
@@ -572,8 +593,9 @@ User-страницы кладутся в **ту же** Sv39-карту с `U=1`
 1 MiB — но одновременно исполняется один user-образ; нет `fork`/`exec`,
 сигналов, `mmap`, динамического ELF и per-process page table. 16 fd, heap ровно
 1 MiB, `getdents64` без записи в буфере отдаёт 0 (неотличимо от конца каталога —
-буфер на 264 B покрывает имя ext2), `openat` игнорирует `mode`, `uname.release`
-намеренно `0.10.0` при `Cargo.toml` 0.9.1 (версию поднимет release-коммит).
+буфер на 264 B покрывает имя ext2), `openat`/`mkdirat` игнорируют `mode`,
+`chmod` живёт только до конца прогона, `uname.release` намеренно `0.10.0` при
+`Cargo.toml` 0.10.1 (версию поднимет release-коммит).
 Подробности — [`../src/user/README.md`](../src/user/README.md) и
 [`../userland/README.md`](../userland/README.md).
 

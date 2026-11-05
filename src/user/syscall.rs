@@ -33,9 +33,24 @@
 //!
 //! Unknown numbers are `-ENOSYS` and are counted, so the userland side can tell
 //! "old kernel" from "bad arguments" (the ABI document promises this).
+//!
+//! # Path mutations
+//!
+//! The directory-mutating calls (`mkdirat`, `unlinkat`, `symlinkat`, `linkat`,
+//! `renameat2`, `fchmodat`) share one shape: read the path through
+//! [`read_user_path`], split it with [`vfs::parent_and_leaf`], resolve the parent
+//! with [`vfs::walk`] (`follow_final = true` — a parent may be reached through a
+//! link) and then call the mutation on that parent directory. The final component
+//! is never followed for `unlinkat`/`linkat` (that is what makes `rm link` remove
+//! the link, not its target); `fchmodat` follows it like `chmod` does. Every
+//! mutation is a single VFS call that the filesystem commits transactionally, so
+//! an error leaves the tree as it was — the one exception is handled explicitly
+//! in [`openat`], where a created file is removed again if the descriptor cannot
+//! be installed.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -62,6 +77,16 @@ const SYS_BRK: usize = 214;
 const SYS_EXIT: usize = 93;
 const SYS_SCHED_YIELD: usize = 124;
 const SYS_GETPID: usize = 172;
+// The directory mutators (path family). Numbers follow the generic RISC-V table
+// like the rest of this layer; the semantics are pagh's own and are frozen in
+// `pagh-api/docs/abi.md`.
+const SYS_MKDIRAT: usize = 34;
+const SYS_UNLINKAT: usize = 35;
+const SYS_SYMLINKAT: usize = 36;
+const SYS_LINKAT: usize = 37;
+const SYS_FCHMODAT: usize = 53;
+const SYS_FTRUNCATE: usize = 46;
+const SYS_RENAMEAT2: usize = 276;
 
 // ─── errno values (negated in `a0`) ────────────────────────────────────────
 const ENOENT: isize = -2;
@@ -78,6 +103,7 @@ const ENOSPC: isize = -28;
 const ENAMETOOLONG: isize = -36;
 const EOVERFLOW: isize = -75;
 const ENOSYS: isize = -38;
+const ENOTEMPTY: isize = -39;
 const ENOTSUP: isize = -95;
 
 // ─── `openat` flags (the ABI's own small set) ──────────────────────────────
@@ -88,6 +114,10 @@ const O_RDWR: usize = 2;
 const O_CREAT: usize = 0x40;
 const O_TRUNC: usize = 0x80;
 const O_APPEND: usize = 0x100;
+
+// ─── `unlinkat` flags (the ABI's own small set) ────────────────────────────
+/// `unlinkat` flag: remove a directory (must be empty) instead of a file.
+const AT_REMOVEDIR: usize = 0x200;
 
 /// File descriptors per run, including 0/1/2 (the ABI's limit).
 pub(crate) const MAX_FDS: usize = 16;
@@ -136,6 +166,20 @@ pub struct Stats {
     pub unames: u64,
     /// `readlinkat` calls that returned a target.
     pub readlinks: u64,
+    /// `mkdirat` calls that created a directory.
+    pub mkdirs: u64,
+    /// `unlinkat` calls that removed a file, link or empty directory.
+    pub unlinks: u64,
+    /// `symlinkat` calls that created a symbolic link.
+    pub symlinks: u64,
+    /// `linkat` calls that created a hard link.
+    pub links: u64,
+    /// `renameat2` calls that moved or renamed an entry.
+    pub renames: u64,
+    /// `fchmodat` calls that recorded a mode override.
+    pub chmods: u64,
+    /// `ftruncate` calls that resized a file.
+    pub truncates: u64,
     /// Unknown syscall numbers answered with `-ENOSYS`.
     pub unknown: u64,
     /// Bad user buffers answered with `-EFAULT`.
@@ -158,6 +202,13 @@ static CLOCKS: AtomicU64 = AtomicU64::new(0);
 static SLEEPS: AtomicU64 = AtomicU64::new(0);
 static UNAMES: AtomicU64 = AtomicU64::new(0);
 static READLINKS: AtomicU64 = AtomicU64::new(0);
+static MKDIRS: AtomicU64 = AtomicU64::new(0);
+static UNLINKS: AtomicU64 = AtomicU64::new(0);
+static SYMLINKS: AtomicU64 = AtomicU64::new(0);
+static LINKS: AtomicU64 = AtomicU64::new(0);
+static RENAMES: AtomicU64 = AtomicU64::new(0);
+static CHMODS: AtomicU64 = AtomicU64::new(0);
+static TRUNCATES: AtomicU64 = AtomicU64::new(0);
 static UNKNOWN: AtomicU64 = AtomicU64::new(0);
 static FAULTS: AtomicU64 = AtomicU64::new(0);
 
@@ -181,6 +232,13 @@ pub fn stats() -> Stats {
         sleeps: SLEEPS.load(Ordering::Relaxed),
         unames: UNAMES.load(Ordering::Relaxed),
         readlinks: READLINKS.load(Ordering::Relaxed),
+        mkdirs: MKDIRS.load(Ordering::Relaxed),
+        unlinks: UNLINKS.load(Ordering::Relaxed),
+        symlinks: SYMLINKS.load(Ordering::Relaxed),
+        links: LINKS.load(Ordering::Relaxed),
+        renames: RENAMES.load(Ordering::Relaxed),
+        chmods: CHMODS.load(Ordering::Relaxed),
+        truncates: TRUNCATES.load(Ordering::Relaxed),
         unknown: UNKNOWN.load(Ordering::Relaxed),
         faults: FAULTS.load(Ordering::Relaxed),
     }
@@ -239,20 +297,92 @@ impl FdTable {
 
 static FDS: Spinlock<FdTable> = Spinlock::new(FdTable::empty());
 
+// ─── permission-mode overrides (fchmodat) ─────────────────────────────────
+
+/// Distinct inodes one run may retarget with `fchmodat`. Sixteen covers a
+/// program that chmods a handful of files; a seventeenth call is `-ENOSPC`.
+const MAX_MODE_OVERRIDES: usize = 16;
+
+#[derive(Clone, Copy)]
+struct ModeOverride {
+    ino: u64,
+    mode: u16,
+}
+
+/// `fchmodat` has no VFS counterpart: [`VfsNode`] exposes `mode()` but no
+/// `set_mode`, and ext2's writer has no permission-bit path behind the trait.
+/// The syscall therefore records the new `0o7777` bits here, and [`fstat`]
+/// reports them for the rest of the run — the same per-run shim the x86 tree
+/// used before its filesystem grew a writable mode. The table is keyed by
+/// [`VfsNode::fs_ino`] (so a hard link sees the change too), cleared with the
+/// descriptor table, and deliberately not persisted: this is observable
+/// metadata, not an on-disk permission change, and no access check consults it.
+struct ModeTable {
+    entries: [ModeOverride; MAX_MODE_OVERRIDES],
+    count: usize,
+}
+
+impl ModeTable {
+    const fn empty() -> Self {
+        ModeTable {
+            entries: [ModeOverride { ino: 0, mode: 0 }; MAX_MODE_OVERRIDES],
+            count: 0,
+        }
+    }
+
+    fn get(&self, ino: u64) -> Option<u16> {
+        self.entries[..self.count]
+            .iter()
+            .find(|entry| entry.ino == ino)
+            .map(|entry| entry.mode)
+    }
+
+    fn set(&mut self, ino: u64, mode: u16) -> Result<(), isize> {
+        if let Some(entry) = self.entries[..self.count]
+            .iter_mut()
+            .find(|entry| entry.ino == ino)
+        {
+            entry.mode = mode;
+            return Ok(());
+        }
+        if self.count == MAX_MODE_OVERRIDES {
+            return Err(ENOSPC);
+        }
+        self.entries[self.count] = ModeOverride { ino, mode };
+        self.count += 1;
+        Ok(())
+    }
+}
+
+static MODES: Spinlock<ModeTable> = Spinlock::new(ModeTable::empty());
+
+/// The override recorded for `ino`, if this run chmod'ed it. Synthetic nodes
+/// (`ino == 0`) are never recorded.
+fn mode_override(ino: u64) -> Option<u16> {
+    if ino == 0 {
+        return None;
+    }
+    MODES.lock().get(ino)
+}
+
 /// Fill the table with the three console descriptors. Called by the runner
 /// before a task starts; a second call discards whatever a previous run left.
+/// The `fchmodat` overrides are per run too, so they are cleared here.
 pub(crate) fn reset_fds() {
     let mut table = FDS.lock();
     *table = FdTable::empty();
     table.slots[0] = Some(FdEntry::Stdin);
     table.slots[1] = Some(FdEntry::Stdout);
     table.slots[2] = Some(FdEntry::Stdout);
+    drop(table);
+    *MODES.lock() = ModeTable::empty();
 }
 
 /// Drop every open node. Called by the runner after the task is gone, before the
 /// image mappings are released; `Arc::drop` is the only side effect.
 pub(crate) fn release_fds() {
     *FDS.lock() = FdTable::empty();
+    *MODES.lock() = ModeTable::empty();
 }
 
 /// What a syscall needs from a descriptor, copied out of the table so the lock
@@ -329,6 +459,15 @@ pub fn dispatch(frame: &mut TrapFrame) {
         SYS_FSTAT => fstat(frame.a0, frame.a1),
         SYS_GETDENTS64 => getdents64(frame.a0, frame.a1, frame.a2),
         SYS_READLINKAT => readlinkat(frame.a0, frame.a1, frame.a2, frame.a3),
+        SYS_MKDIRAT => mkdirat(frame.a0, frame.a1, frame.a2),
+        SYS_UNLINKAT => unlinkat(frame.a0, frame.a1, frame.a2),
+        // Linux's `symlinkat(target, newdirfd, linkpath)`: the target is the
+        // first argument, not the path.
+        SYS_SYMLINKAT => symlinkat(frame.a0, frame.a1, frame.a2),
+        SYS_LINKAT => linkat(frame.a0, frame.a1, frame.a2, frame.a3, frame.a4),
+        SYS_RENAMEAT2 => renameat2(frame.a0, frame.a1, frame.a2, frame.a3, frame.a4),
+        SYS_FCHMODAT => fchmodat(frame.a0, frame.a1, frame.a2, frame.a3),
+        SYS_FTRUNCATE => ftruncate(frame.a0, frame.a1),
         SYS_CLOCK_GETTIME => clock_gettime(frame.a0, frame.a1),
         SYS_NANOSLEEP => nanosleep(frame.a0, frame.a1),
         SYS_UNAME => uname(frame.a0),
@@ -592,6 +731,9 @@ fn openat(dirfd: usize, path_ptr: usize, flags: usize, mode: usize) -> isize {
         return EINVAL;
     }
 
+    // Set when this call created the entry: `(parent, leaf)` is what a later
+    // failure must remove again.
+    let mut created: Option<(Arc<dyn VfsNode>, String)> = None;
     let node = match vfs::walk(path, true) {
         Ok(node) => node,
         Err(VfsError::NotFound) if flags & O_CREAT != 0 => {
@@ -607,7 +749,10 @@ fn openat(dirfd: usize, path_ptr: usize, flags: usize, mode: usize) -> isize {
                 return ENOTDIR;
             }
             match parent.create_file(&leaf) {
-                Ok(node) => node,
+                Ok(node) => {
+                    created = Some((parent, leaf));
+                    node
+                }
                 Err(error) => return errno(error),
             }
         }
@@ -626,20 +771,46 @@ fn openat(dirfd: usize, path_ptr: usize, flags: usize, mode: usize) -> isize {
             Ok(entries) => dir = Some(DirSnapshot { entries, index: 0 }),
             Err(error) => return errno(error),
         }
-    } else if flags & O_TRUNC != 0 {
-        match node.truncate(0) {
-            Ok(()) => {}
-            Err(VfsError::NotSupported) => return ENOTSUP,
-            Err(error) => return errno(error),
-        }
     }
 
-    match install(node, flags, dir) {
-        Ok(fd) => {
-            OPENS.fetch_add(1, Ordering::Relaxed);
-            fd as isize
+    // Install first, then truncate. A descriptor that cannot be installed (all
+    // 16 slots open) must not leave a newly created file behind, and a failed
+    // truncation must not leave a descriptor the program never saw — the second
+    // is rolled back below, the first by removing the entry here.
+    let truncate = !node.is_directory() && flags & O_TRUNC != 0;
+    let fd = match install(Arc::clone(&node), flags, dir) {
+        Ok(fd) => fd,
+        Err(error) => {
+            if let Some((parent, leaf)) = created.as_ref() {
+                // Best effort: if this fails the filesystem is already unable
+                // to remove what it just created, and the open error is the
+                // more useful answer. No counter is bumped: this is rollback,
+                // not a user's `unlinkat`.
+                let _ = parent.remove(leaf);
+            }
+            return error;
         }
-        Err(error) => error,
+    };
+    if truncate {
+        if let Err(error) = node.truncate(0) {
+            release_slot(fd);
+            return match error {
+                VfsError::NotSupported => ENOTSUP,
+                error => errno(error),
+            };
+        }
+    }
+    OPENS.fetch_add(1, Ordering::Relaxed);
+    fd as isize
+}
+
+/// Remove a descriptor without counting a `close`; used by [`openat`] to roll
+/// back a descriptor whose truncation failed. `false` means the slot was empty.
+fn release_slot(fd: usize) -> bool {
+    let mut table = FDS.lock();
+    match table.slots.get_mut(fd) {
+        Some(slot) => slot.take().is_some(),
+        None => false,
     }
 }
 
@@ -647,19 +818,11 @@ fn openat(dirfd: usize, path_ptr: usize, flags: usize, mode: usize) -> isize {
 /// for this run (a later read/write is `-EBADF`); the runner resets the table
 /// for the next program.
 fn close(fd: usize) -> isize {
-    let mut table = FDS.lock();
-    match table.slots.get_mut(fd) {
-        Some(slot) => {
-            if slot.take().is_some() {
-                CLOSES.fetch_add(1, Ordering::Relaxed);
-                0
-            } else {
-                EBADF
-            }
-        }
-        // `get_mut` on `fd >= 16` is `None`; an already-closed slot is handled
-        // by the `take` above.
-        None => EBADF,
+    if release_slot(fd) {
+        CLOSES.fetch_add(1, Ordering::Relaxed);
+        0
+    } else {
+        EBADF
     }
 }
 
@@ -709,8 +872,9 @@ const KIND_OTHER: u32 = 3;
 
 /// `fstat(fd, *Stat)`: fill the native 24-byte structure from the `VfsNode`.
 ///
-/// `mode` is the permission bits only. An ext2 node reports its real mode; a
-/// synthetic node (the root, a mount wrapper) has none, so the documented
+/// `mode` is the permission bits only. A `fchmodat` override recorded for this
+/// run wins (see [`ModeTable`]); otherwise an ext2 node reports its real mode
+/// and a synthetic node (the root, a mount wrapper) has none, so the documented
 /// defaults are 0o755 for a directory, 0o777 for a symlink and 0o644 for a file.
 /// `ino` is `VfsNode::fs_ino` or 0 for a synthetic node. The three console
 /// descriptors answer `kind = OTHER`, size 0, ino 0, mode 0o644.
@@ -727,8 +891,9 @@ fn fstat(fd: usize, pointer: usize) -> isize {
             } else {
                 KIND_FILE
             };
+            let ino = node.fs_ino();
             let declared = (node.mode() & 0o7777) as u32;
-            let mode = if declared != 0 {
+            let default = if declared != 0 {
                 declared
             } else if is_dir {
                 0o755
@@ -737,7 +902,8 @@ fn fstat(fd: usize, pointer: usize) -> isize {
             } else {
                 0o644
             };
-            (kind, mode, node.size(), node.fs_ino())
+            let mode = mode_override(ino).map_or(default, u32::from);
+            (kind, mode, node.size(), ino)
         }
         Err(error) => return error,
     };
@@ -869,6 +1035,305 @@ fn readlinkat(dirfd: usize, path_ptr: usize, buf: usize, len: usize) -> isize {
     }
     READLINKS.fetch_add(1, Ordering::Relaxed);
     take as isize
+}
+
+// ─── path mutations: mkdirat / unlinkat / symlinkat / linkat / renameat2 /
+//     fchmodat / ftruncate ─────────────────────────────────────────────────
+
+/// Resolve the parent directory of `path` for the create/remove/rename family.
+///
+/// `vfs::parent_and_leaf` refuses `""`, `"."` and `".."` as the leaf (none of
+/// them can be created or removed); the parent is walked with `follow_final =
+/// true`, because a parent reached through a symbolic link is still a directory.
+/// A parent that resolves to a non-directory is `-ENOTDIR`, the same answer the
+/// filesystem would give but decided before any mutation is attempted.
+fn parent_dir(path: &str) -> Result<(Arc<dyn VfsNode>, String), isize> {
+    let (parent_path, leaf) = vfs::parent_and_leaf(path).map_err(errno)?;
+    let parent = vfs::walk(&parent_path, true).map_err(errno)?;
+    if !parent.is_directory() {
+        return Err(ENOTDIR);
+    }
+    Ok((parent, leaf))
+}
+
+/// `mkdirat(dirfd, path, mode)`.
+///
+/// `dirfd` is ignored: the ABI takes absolute paths only. `mode` is accepted and
+/// **ignored**, exactly like `openat`'s: the RISC-V [`VfsNode`] trait has no
+/// `set_mode`, so ext2's default `0o755` directory mode stands. That is the
+/// documented limitation ([`fchmodat`] records an observable override for the
+/// current run, but nothing writes the on-disk inode).
+fn mkdirat(dirfd: usize, path_ptr: usize, mode: usize) -> isize {
+    let _ = (dirfd, mode);
+    let mut path_buf = [0u8; PATH_CAPACITY];
+    let path = match read_path(path_ptr, &mut path_buf) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let (parent, leaf) = match parent_dir(path) {
+        Ok(parts) => parts,
+        Err(error) => return error,
+    };
+    match parent.create_dir(&leaf) {
+        Ok(_) => {
+            MKDIRS.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        Err(error) => errno(error),
+    }
+}
+
+/// `unlinkat(dirfd, path, flags)`.
+///
+/// `flags = 0` removes a file or a symbolic link (the final component is not
+/// followed: `rm link` removes the link); a directory is `-EISDIR`.
+/// `flags = AT_REMOVEDIR (0x200)` removes an *empty* directory: a file is
+/// `-ENOTDIR` and a directory with entries is `-ENOTEMPTY`. Any other flag bit
+/// is `-EINVAL`. The type is checked before the mutation because the underlying
+/// ext2 unlink accepts an empty directory and a file alike — the flag is the
+/// policy, not the filesystem.
+fn unlinkat(dirfd: usize, path_ptr: usize, flags: usize) -> isize {
+    let _ = dirfd;
+    if flags & !AT_REMOVEDIR != 0 {
+        return EINVAL;
+    }
+    let mut path_buf = [0u8; PATH_CAPACITY];
+    let path = match read_path(path_ptr, &mut path_buf) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let (parent, leaf) = match parent_dir(path) {
+        Ok(parts) => parts,
+        Err(error) => return error,
+    };
+    // `lookup_path` (not `walk`) is deliberate: the link itself is the entry to
+    // remove, so following a final symlink would target the wrong node.
+    let node = match vfs::lookup_path(path) {
+        Ok(node) => node,
+        Err(error) => return errno(error),
+    };
+    let wants_directory = flags & AT_REMOVEDIR != 0;
+    if wants_directory && !node.is_directory() {
+        return ENOTDIR;
+    }
+    if !wants_directory && node.is_directory() {
+        return EISDIR;
+    }
+    match parent.remove(&leaf) {
+        Ok(()) => {
+            UNLINKS.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        // ext2 reports a non-empty directory as `AlreadyExists` (its own
+        // internal name for "the rmdir precondition failed"); the ABI has the
+        // precise errno, so translate it here instead of leaking `-EEXIST`.
+        Err(VfsError::AlreadyExists) if wants_directory => ENOTEMPTY,
+        Err(error) => errno(error),
+    }
+}
+
+/// `symlinkat(target, dirfd, path)`: create `path` as a symbolic link whose
+/// target is the literal bytes of `target`.
+///
+/// `dirfd` is ignored. The target is a raw string, copied through
+/// [`read_user_path`] and stored verbatim: it is never resolved here, so a
+/// relative target stays relative to the directory containing the link (the
+/// VFS resolves it at walk time). An empty target is `-EINVAL`; a target that
+/// does not fit ext2's link layout is `-EINVAL` from the VFS.
+fn symlinkat(target_ptr: usize, dirfd: usize, path_ptr: usize) -> isize {
+    let _ = dirfd;
+    let mut target_buf = [0u8; PATH_CAPACITY];
+    let target_length = match read_user_path(target_ptr, &mut target_buf) {
+        Ok(length) => length,
+        Err(error) => return error,
+    };
+    if target_length == 0 {
+        return EINVAL;
+    }
+    let mut path_buf = [0u8; PATH_CAPACITY];
+    let path = match read_path(path_ptr, &mut path_buf) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let (parent, leaf) = match parent_dir(path) {
+        Ok(parts) => parts,
+        Err(error) => return error,
+    };
+    match parent.create_symlink(&leaf, &target_buf[..target_length]) {
+        Ok(_) => {
+            SYMLINKS.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        Err(error) => errno(error),
+    }
+}
+
+/// `linkat(olddirfd, oldpath, newdirfd, newpath, flags)`: a hard link.
+///
+/// Both dirfds are ignored; `flags` must be 0 (the ABI defines no
+/// `AT_SYMLINK_FOLLOW`), otherwise `-EINVAL`. The existing entry is resolved
+/// with `lookup_path`, so a link to a symbolic link links the link itself; a
+/// directory target is `-EISDIR` (ext2 has no directory hard links).
+fn linkat(
+    olddirfd: usize,
+    old_path_ptr: usize,
+    newdirfd: usize,
+    new_path_ptr: usize,
+    flags: usize,
+) -> isize {
+    let _ = (olddirfd, newdirfd);
+    if flags != 0 {
+        return EINVAL;
+    }
+    let mut old_buf = [0u8; PATH_CAPACITY];
+    let old_path = match read_path(old_path_ptr, &mut old_buf) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let mut new_buf = [0u8; PATH_CAPACITY];
+    let new_path = match read_path(new_path_ptr, &mut new_buf) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let target = match vfs::lookup_path(old_path) {
+        Ok(node) => node,
+        Err(error) => return errno(error),
+    };
+    if target.is_directory() {
+        return EISDIR;
+    }
+    let (parent, leaf) = match parent_dir(new_path) {
+        Ok(parts) => parts,
+        Err(error) => return error,
+    };
+    match parent.link(&leaf, &target) {
+        Ok(_) => {
+            LINKS.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        Err(error) => errno(error),
+    }
+}
+
+/// `renameat2(olddirfd, oldpath, newdirfd, newpath, flags)`.
+///
+/// Both dirfds are ignored; `flags` must be 0 (no `RENAME_NOREPLACE`/
+/// `RENAME_EXCHANGE` in this ABI), otherwise `-EINVAL`. Both paths are checked
+/// first — the source must exist and the destination parent must be a
+/// directory — and then [`vfs::rename`] does the move in one filesystem
+/// transaction: either the tree shows the new name or it still shows the old
+/// one, never both and never neither. A cross-filesystem rename is
+/// `-ENOTSUP` (copying is not renaming).
+fn renameat2(
+    olddirfd: usize,
+    old_path_ptr: usize,
+    newdirfd: usize,
+    new_path_ptr: usize,
+    flags: usize,
+) -> isize {
+    let _ = (olddirfd, newdirfd);
+    if flags != 0 {
+        return EINVAL;
+    }
+    let mut old_buf = [0u8; PATH_CAPACITY];
+    let old_path = match read_path(old_path_ptr, &mut old_buf) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let mut new_buf = [0u8; PATH_CAPACITY];
+    let new_path = match read_path(new_path_ptr, &mut new_buf) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    // Check both ends before the transaction: a missing source is `-ENOENT`
+    // and a destination inside a file is `-ENOTDIR`, both without touching the
+    // filesystem.
+    if let Err(error) = vfs::lookup_path(old_path) {
+        return errno(error);
+    }
+    if let Err(error) = parent_dir(new_path) {
+        return error;
+    }
+    match vfs::rename(old_path, new_path) {
+        Ok(()) => {
+            RENAMES.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        Err(error) => errno(error),
+    }
+}
+
+/// `fchmodat(dirfd, path, mode, flags)`: record `mode & 0o7777` as this run's
+/// permissions for the inode behind `path`.
+///
+/// `dirfd` is ignored; `flags` must be 0 (`AT_SYMLINK_NOFOLLOW` is not part of
+/// this ABI, so asking for it is `-EINVAL` rather than a silent follow). The
+/// path is resolved with `follow_final = true`, like `chmod`.
+///
+/// The VFS has no `set_mode`, so the mode is stored in [`ModeTable`] and
+/// [`fstat`] reports it until the run ends. It is **not** written to the ext2
+/// inode and no kernel access check consults it; a synthetic node (`ino == 0`,
+/// the root and a bare mount wrapper) has no inode to key on and is
+/// `-ENOTSUP`. The ABI document states the same limit.
+fn fchmodat(dirfd: usize, path_ptr: usize, mode: usize, flags: usize) -> isize {
+    let _ = dirfd;
+    if flags != 0 {
+        return EINVAL;
+    }
+    let mut path_buf = [0u8; PATH_CAPACITY];
+    let path = match read_path(path_ptr, &mut path_buf) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let node = match vfs::walk(path, true) {
+        Ok(node) => node,
+        Err(error) => return errno(error),
+    };
+    let ino = node.fs_ino();
+    if ino == 0 {
+        return ENOTSUP;
+    }
+    match MODES.lock().set(ino, (mode & 0o7777) as u16) {
+        Ok(()) => {
+            CHMODS.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        Err(error) => error,
+    }
+}
+
+/// `ftruncate(fd, length)`: resize the regular file open on `fd`.
+///
+/// The descriptor must be a writable regular file: 0/1/2 and any console
+/// descriptor are `-EINVAL`, a directory is `-EISDIR`, and a descriptor opened
+/// read-only is `-EBADF` (the same answer [`write`] gives). The resize goes to
+/// [`VfsNode::truncate`]; ext2 commits it as one transaction, so an error (a
+/// length past the filesystem's 4 GiB limit is `-EINVAL`) leaves the file as it
+/// was and exposes no partial state. The open offset is untouched, as POSIX
+/// requires.
+fn ftruncate(fd: usize, length: usize) -> isize {
+    if fd < 3 {
+        return EINVAL;
+    }
+    match lookup(fd) {
+        Ok(OpenFd::ConsoleIn) | Ok(OpenFd::ConsoleOut) => EINVAL,
+        Ok(OpenFd::File { node, flags, .. }) => {
+            if node.is_directory() {
+                return EISDIR;
+            }
+            if flags & O_ACCMODE == O_RDONLY {
+                return EBADF;
+            }
+            match node.truncate(length as u64) {
+                Ok(()) => {
+                    TRUNCATES.fetch_add(1, Ordering::Relaxed);
+                    0
+                }
+                Err(error) => errno(error),
+            }
+        }
+        Err(error) => error,
+    }
 }
 
 /// `struct Timespec` from the ABI: `i64 seconds`, `i64 nanos`.
@@ -1003,6 +1468,24 @@ fn read_user_path(pointer: usize, out: &mut [u8; PATH_CAPACITY]) -> Result<usize
     Err(ENAMETOOLONG)
 }
 
+/// Read an absolute, UTF-8 path from a user pointer into `out`.
+///
+/// This is the one shape every path-taking syscall shares: [`read_user_path`]
+/// copies up to the NUL (bounded, with `-EFAULT` on a bad page and
+/// `-ENAMETOOLONG` past the buffer), then the bytes must be UTF-8 — the VFS's
+/// names are `String`s, so a byte path that is not UTF-8 cannot name a node —
+/// and absolute, because `dirfd` is ignored and there is no cwd in the kernel.
+fn read_path<'a>(pointer: usize, out: &'a mut [u8; PATH_CAPACITY]) -> Result<&'a str, isize> {
+    let length = read_user_path(pointer, out)?;
+    let Ok(path) = core::str::from_utf8(&out[..length]) else {
+        return Err(EINVAL);
+    };
+    if !path.starts_with('/') {
+        return Err(EINVAL);
+    }
+    Ok(path)
+}
+
 // ─── user pointers ─────────────────────────────────────────────────────────
 
 /// True when every page covering `[start, end)` is mapped for U-mode read (and
@@ -1132,7 +1615,7 @@ fn errno(error: VfsError) -> isize {
         VfsError::InvalidArgument => EINVAL,
         VfsError::IoError | VfsError::Corrupt => EIO,
         VfsError::AlreadyExists => EEXIST,
-        VfsError::NotEmpty => EINVAL,
+        VfsError::NotEmpty => ENOTEMPTY,
         VfsError::IsADirectory => EISDIR,
         VfsError::NotADirectory => ENOTDIR,
         VfsError::NoSpace => ENOSPC,

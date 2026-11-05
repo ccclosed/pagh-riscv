@@ -310,8 +310,10 @@ without touching the runner's internet. The user-mode suite is the M6b/native-AB
 trip, `Exit::Fault`, a run after the fault, the timer-in-U counter
 (`traps::user_timer_ticks()`) moved by the `spin` fixture, the exact argv line
 from `userland/argv.elf` captured from U-mode `write`, and `userland/abi.elf`
-calling every syscall (it exits 77 and becomes a SKIP when `/mnt` is absent after
-the filesystem-independent half passed). `run demo` must print
+calling every syscall, including the mutation family (it exits 77 and becomes a
+SKIP when `/mnt` is absent after the filesystem-independent half passed; with a
+disk it creates, renames, hard-links, symlinks, truncates, unlinks and
+mkdir/rmdir's entries under `/mnt`, and the kernel verifies they are gone). `run demo` must print
 `run: demo exited with code 42`, `run fault` must be killed with cause 13 while
 the shell survives, `run spin` must exit 7. The package path has its own E2E
 (`tools/test_pkg.py`): a real `.ppkg`, a host HTTP mirror, a disk, and the
@@ -396,7 +398,7 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
 | The pointer/keyboard have **no IRQ**: both are polled from the shell's idle loop | a long-running command (or a blocking wait that does not poll) freezes the cursor and drops typed bytes; do not put input polling in a place that never returns to the idle loop |
 | The keyboard translates **US layout only** and ignores arrows/Home/End/dead keys | a program needing another layout or key semantics needs a keymap layer, not a driver tweak |
 | Clicks/selection are not consumed: `BTN_LEFT` is read and stored, nothing acts on it | mouse-driven editing/selection is a UI milestone, not a driver change |
-| One address space, one ASID: user pages carry `U=1` in the kernel's single Sv39 tree | two user programs are not isolated from each other; no per-process `satp`; `brk` is one fixed 1 MiB window, no `mmap`, `fork`/`exec`/signals; 16 fds, console reads are non-blocking (`-EAGAIN`), `getdents64` is a snapshot taken at `openat`, `openat` ignores `mode`; `run <path>` streams from the VFS and accepts images up to 1 MiB (`MAX_IMAGE_BYTES`), one image at a time |
+| One address space, one ASID: user pages carry `U=1` in the kernel's single Sv39 tree | two user programs are not isolated from each other; no per-process `satp`; `brk` is one fixed 1 MiB window, no `mmap`, `fork`/`exec`/signals; 16 fds, console reads are non-blocking (`-EAGAIN`), `getdents64` is a snapshot taken at `openat`, `openat`/`mkdirat` ignore `mode` and `fchmodat` is a per-run override never written to the inode or enforced; `run <path>` streams from the VFS and accepts images up to 1 MiB (`MAX_IMAGE_BYTES`), one image at a time |
 | The filesystem has **no journal** (M5 deliberately skipped the x86 WAL) | a power cut between two writes can leave an operation half-applied; do not claim crash consistency |
 | One block device slot, no partitions/hot-plug | a second disk is a design change, not a registration |
 | Formatting is the only destructive operation and is gated by `format_policy` | never format "to recover": a failed mount is not permission to erase |
@@ -454,3 +456,24 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
     this into "parse while downloading", "install then verify", or a whole-package
     heap buffer. There is no TLS, no OpenPGP and no apt: do not describe the
     SHA-256 as authentication, and do not call `pkg` an apt replacement.
+
+35. **Every path mutation shares one shape and one error contract.** `mkdirat`,
+    `unlinkat`, `symlinkat`, `linkat`, `renameat2` and `fchmodat` read the path
+    through `read_user_path`/`read_path` (absolute UTF-8, <= 255 bytes + NUL,
+    `-ENAMETOOLONG` rather than truncation), split it with
+    `vfs::parent_and_leaf`, resolve the parent with `vfs::walk(parent, true)`,
+    then call exactly one mutating `VfsNode` method on that directory.
+    `unlinkat`/`linkat` resolve the final component with `lookup_path` (the link
+    itself, never its target); `fchmodat` follows it like `chmod`. A `flags` bit
+    the ABI does not implement is `-EINVAL`, never silently ignored. A mutation
+    is one VFS transaction, so an error leaves the tree as it was; the one
+    create-then-install path, `openat(O_CREAT)`, removes the new entry when the
+    descriptor cannot be installed and rolls the descriptor back when `O_TRUNC`
+    fails. Permissions are the documented gap: `mkdirat`/`openat` ignore `mode`,
+    and `fchmodat` only fills the per-run `ModeTable` that `fstat` reads — not
+    the ext2 inode, not an access check, gone with the run (`-ENOTSUP` on a
+    synthetic node, `-ENOSPC` past 16 overrides). A non-empty `rmdir` is
+    `-ENOTEMPTY` (ext2 reports it as `AlreadyExists` internally; translate it),
+    and a cross-mount `linkat`/`renameat2` is `-ENOTSUP`. Do not add path
+    mutation anywhere else (the shell keeps using the VFS directly); the
+    `selftest` run through `userland/abi.elf` is the evidence.

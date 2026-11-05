@@ -50,7 +50,7 @@
 | `task/selftest.rs` | пять проверок планировщика для `selftest` |
 | `user/mod.rs` | `run_image`/`run_file`: ELF → user-стек → SysV-кадр `argc/argv/envp` → задача → `sret` в U-mode → reap; `brk`-heap, `on_fault`, capture для ABI-теста; встроенные hello/fault/spin/argv/abi |
 | `user/elf.rs` | ELF64-загрузчик: валидация до первого кадра, `PT_LOAD` с `U=1`, потоковые сегменты кусками ≤ 512 B, откат кадров, `Loaded`/`ElfError` |
-| `user/syscall.rs` | native ABI: `read`/`write`/`openat`/`close`/`lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/`readlinkat`/`exit`/`sched_yield`/`getpid`; fd-таблица на прогон, `copy_from_user`/`copy_to_user`, `sepc+4` |
+| `user/syscall.rs` | native ABI: `read`/`write`/`openat`/`close`/`lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/`readlinkat`/`exit`/`sched_yield`/`getpid` + мутации `mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`/`ftruncate`; fd-таблица и таблица режимов на прогон, `copy_from_user`/`copy_to_user`, `sepc+4` |
 | `user/selftest.rs` | десять проверок user-mode для `selftest` (argv-строка, все syscall'ы ABI, ELF-матрица, fault, таймер, 100 KiB) |
 | `net/mod.rs` | сетевой стек: состояние, ARP-кэш, `poll()`, диспетчер ARP/IPv4/ICMP/UDP/TCP, `ping`, DHCP-конфигурация |
 | `net/wire.rs` | чистые форматы Ethernet/ARP/IPv4/ICMP/UDP/TCP/DHCP/DNS и контрольные суммы (без устройства и часов) |

@@ -336,9 +336,40 @@ const ABI_CREATED: &str = "abi-created.txt";
 const ABI_LINK: &str = "abi-link";
 const ABI_FILE_BYTES: &[u8] = b"pagh-abi\n";
 
+/// Every name the ABI fixture's mutation half may create. The fixture removes
+/// them itself; this list is the kernel-side idempotency guard (a crashed run
+/// must not turn the next `selftest` into `EEXIST`) and the "all gone" check.
+const ABI_MUTATION_NAMES: [&str; 5] = [
+    "abi-mut.txt",
+    "abi-renamed.txt",
+    "abi-hard.txt",
+    "abi-sym",
+    "abi-dir",
+];
+
 /// Remove every fixture input; missing entries are fine (idempotency).
 fn cleanup_abi_files(dir: &Arc<dyn VfsNode>) {
+    // A run that died between `mkdirat` and removing the child leaves a
+    // non-empty `/mnt/abi-dir`; empty it first so the removal below can work.
+    // One level is enough: the fixture only ever creates `inside.txt` there.
+    if let Ok(node) = dir.lookup("abi-dir") {
+        if let Ok(children) = node.readdir() {
+            for child in children {
+                let _ = node.remove(child.name());
+            }
+        }
+    }
     for name in [ABI_FILE, ABI_CREATED, ABI_LINK] {
+        match dir.remove(name) {
+            Ok(()) | Err(VfsError::NotFound) => {}
+            Err(error) => crate::kprintln!(
+                "[selftest] user: cannot remove stale /mnt/{}: {}",
+                name,
+                error.as_str()
+            ),
+        }
+    }
+    for name in ABI_MUTATION_NAMES {
         match dir.remove(name) {
             Ok(()) | Err(VfsError::NotFound) => {}
             Err(error) => crate::kprintln!(
@@ -417,6 +448,22 @@ fn user_abi_syscalls(_buf: &mut Vec<u8>) -> Outcome {
     };
     let stats = syscall::stats();
 
+    // The fixture removes every mutation artifact itself (rename, link, symlink,
+    // truncate, unlink and the mkdir/rmdir pair). Verify that from the kernel
+    // side before the cleanup below hides a leftover: an empty-looking success
+    // that leaked a directory entry is a failed acceptance run.
+    if let (Some(dir), Some(Ok(Exit::Code(0)))) = (dir.as_ref(), result.as_ref()) {
+        for name in ABI_MUTATION_NAMES {
+            match dir.lookup(name) {
+                Err(VfsError::NotFound) => {}
+                _ => {
+                    crate::kprintln!("[selftest] user: the ABI fixture left /mnt/{} behind", name);
+                    ok = false;
+                }
+            }
+        }
+    }
+
     if let Some(dir) = dir.as_ref() {
         cleanup_abi_files(dir);
     }
@@ -457,7 +504,14 @@ fn user_abi_syscalls(_buf: &mut Vec<u8>) -> Outcome {
         && (stats.reads <= stats_before.reads
             || stats.seeks <= stats_before.seeks
             || stats.dirents <= stats_before.dirents
-            || stats.readlinks <= stats_before.readlinks)
+            || stats.readlinks <= stats_before.readlinks
+            || stats.mkdirs <= stats_before.mkdirs
+            || stats.unlinks <= stats_before.unlinks
+            || stats.symlinks <= stats_before.symlinks
+            || stats.links <= stats_before.links
+            || stats.renames <= stats_before.renames
+            || stats.chmods <= stats_before.chmods
+            || stats.truncates <= stats_before.truncates)
     {
         crate::kprintln!(
             "[selftest] user: filesystem ABI counters did not move (before {:?}, after {:?})",

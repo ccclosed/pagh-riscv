@@ -11,7 +11,7 @@ checkout собирается **без** кросс-компилятора.
 | `fault.rs` / `fault.elf` | `getpid`, затем `ld` с адреса 0 | fault из U убивает задачу, а не машину; `run_image` возвращает `Exit::Fault` |
 | `spin.rs` / `spin.elf` | `rdtime`-цикл на 0.2 s (~20 тиков), `getpid`, `exit(7)` | таймерное прерывание, взятое в U-mode, обрабатывается и возвращается в U |
 | `argv.rs` / `argv.elf` | проверяет `a0=argc`, `a1=argv`, `sp`, `envp = argv+argc+1`, NULL-терминаторы и выравнивание; печатает `argv: argc=3 argv[0]=argv.elf argv[1]=alpha argv[2]=beta env[0]=PWD=/` | SysV-кадр входа и точную строку, которую selftest сравнивает побайтно |
-| `abi.rs` / `abi.elf` | `write`, `openat` (существующий файл, создание, `O_APPEND`, `O_TRUNC`), `read`, `fstat`, `lseek`, `getdents64`, `readlinkat`, `brk` с паттерном, `clock_gettime`, `nanosleep`, `uname`, `getpid`, `close`, `-EFAULT`/`-ENOSYS`/`-EBADF`/`-ENOMEM`; без `/mnt` выходит 77 после no-fs половины | весь native ABI без libpagh: файлы, каталоги, символические ссылки, heap, время, ошибки |
+| `abi.rs` / `abi.elf` | `write`, `openat` (существующий файл, создание, `O_APPEND`, `O_TRUNC`), `read`, `fstat`, `lseek`, `getdents64`, `readlinkat`, `brk` с паттерном, `clock_gettime`, `nanosleep`, `uname`, `getpid`, `close`, `-EFAULT`/`-ENOSYS`/`-EBADF`/`-ENOMEM`; мутационная половина: `mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`/`ftruncate` и их ошибки; без `/mnt` выходит 77 после no-fs половины | весь native ABI без libpagh: файлы, каталоги, символические ссылки, мутации, heap, время, ошибки |
 | `user.ld` | линковка: `_start` = `0x1_0000`, PT_LOAD-раскладка | совпадает с окном из `src/user/elf.rs` |
 
 ELF-файлы **закоммичены** — это часть дерева, как шрифт `assets/font8x18.bin`.
@@ -69,5 +69,5 @@ pagh:rv64> run spin
 run: spin exited with code 7
 pagh:rv64> selftest
 SELFTEST user-abi-argv PASS
-SELFTEST user-abi-syscalls PASS     # с /mnt; без него SKIP
+SELFTEST user-abi-syscalls PASS     # с /mnt (включая abi: mutations ok); без него SKIP
 ```
