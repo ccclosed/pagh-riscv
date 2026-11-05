@@ -153,7 +153,7 @@
 //! `continue_task` with the signal lock released. Every table access masks
 //! interrupts, because `interrupted()` is called from `nanosleep` with `SIE` on.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::riscv64::csr;
 use crate::arch::riscv64::mmu::{PTE_U, PTE_X};
@@ -298,6 +298,11 @@ struct ThreadSignal {
     /// is what `sigaltstack` reports as `SS_ONSTACK`, and what keeps a nested
     /// delivery from switching to the same stack top again.
     alt_active: u32,
+    /// This thread's `SA_RESTART` request, armed by [`interrupted`] and consumed
+    /// by `dispatch`. Per thread on purpose: `nanosleep` runs with interrupts
+    /// enabled, so between arming and consuming it a tick can switch to another
+    /// task, whose own `-EINTR` must not consume this request.
+    restart: bool,
     /// Sender identity and `si_code` stored with each pending bit, so delivery
     /// can fill `siginfo` after the sender has gone. A second send for a signal
     /// that is already pending overwrites these (one pending entry per signal).
@@ -319,6 +324,7 @@ impl ThreadSignal {
             alt_size: 0,
             alt_disabled: true,
             alt_active: 0,
+            restart: false,
             pending_pid: [0; MAX_SIGNALS],
             pending_uid: [0; MAX_SIGNALS],
             pending_code: [0; MAX_SIGNALS],
@@ -405,10 +411,6 @@ static STOPS: AtomicU64 = AtomicU64::new(0);
 static CONTINUES: AtomicU64 = AtomicU64::new(0);
 static RESTARTS: AtomicU64 = AtomicU64::new(0);
 
-/// Set by `interrupted()` when the deliverable signal that caused `-EINTR` has
-/// `SA_RESTART`; consumed by `dispatch`, which then leaves the `ecall` in place.
-static REQUEST_RESTART: AtomicBool = AtomicBool::new(false);
-
 /// Counters the selftest reads as evidence that the signal path ran.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
@@ -471,14 +473,12 @@ pub(crate) fn live_pending() -> usize {
 /// Reset the per-run handler table and every thread entry. Called by
 /// `run_source` before the first task can issue an `ecall`.
 pub(crate) fn begin_run(run: u64) {
-    REQUEST_RESTART.store(false, Ordering::Relaxed);
     csr::without_interrupts(|| SIGNALS.lock().reset(run));
 }
 
 /// Forget everything a finished run installed. Called by the runner after the
 /// last thread is gone and before the next run can start.
 pub(crate) fn clear_run(run: u64) {
-    REQUEST_RESTART.store(false, Ordering::Relaxed);
     csr::without_interrupts(|| {
         let mut table = SIGNALS.lock();
         if table.run == run {
@@ -1098,10 +1098,12 @@ pub(crate) fn tgkill(tgid: usize, tid: usize, sig: isize) -> isize {
 /// and not blocked). A blocking syscall uses this to answer `-EINTR`; the handler
 /// itself runs at the trap boundary after the syscall returns.
 ///
-/// If the lowest deliverable signal has `SA_RESTART`, this also arms
-/// [`REQUEST_RESTART`] so `dispatch` can leave the `ecall` in place and the
-/// syscall re-enters after `rt_sigreturn`. Only `futex`/`nanosleep` call this
-/// from a position where they answer `-EINTR`, which is what scopes the flag.
+/// If the lowest deliverable signal has `SA_RESTART`, this also arms the
+/// current thread's restart flag so `dispatch` can leave the `ecall` in place
+/// and the syscall re-enters after `rt_sigreturn`. Only `futex`/`nanosleep`
+/// call this from a position where they answer `-EINTR`, which scopes the flag;
+/// it lives in `ThreadSignal` so a preemption between arming and consuming it
+/// cannot hand the request to another task.
 pub(crate) fn interrupted() -> bool {
     // `nanosleep` calls this with `SIE` on, so the `RUN` lock must be taken with
     // interrupts masked too: a tick inside `current_run_id` would re-enter the
@@ -1112,7 +1114,7 @@ pub(crate) fn interrupted() -> bool {
             return false;
         };
         let tid = scheduler::current_id();
-        let restart = with_table(|table| {
+        let deliverable = with_table(|table| {
             if table.run != run {
                 return None;
             }
@@ -1124,14 +1126,14 @@ pub(crate) fn interrupted() -> bool {
                 return None;
             }
             let signal = deliverable.trailing_zeros() as usize + 1;
-            Some(table.actions[signal].flags & SA_RESTART != 0)
+            if table.actions[signal].flags & SA_RESTART != 0 {
+                table.threads[index].restart = true;
+            }
+            Some(())
         });
-        match restart {
-            Some(restart) => {
+        match deliverable {
+            Some(()) => {
                 INTERRUPTS.fetch_add(1, Ordering::Relaxed);
-                if restart {
-                    REQUEST_RESTART.store(true, Ordering::Relaxed);
-                }
                 true
             }
             None => false,
@@ -1139,16 +1141,26 @@ pub(crate) fn interrupted() -> bool {
     })
 }
 
-/// Consume the restart request armed by [`interrupted`]. Called once per
-/// returning syscall by `dispatch`; a `true` answer means the caller must not
-/// write `a0` or advance `sepc`, so `sret` re-executes the `ecall` after the
-/// handler's `rt_sigreturn`.
+/// Consume the current thread's restart request armed by [`interrupted`].
+/// Called once per returning syscall by `dispatch`; a `true` answer means the
+/// caller must not write `a0` or advance `sepc`, so `sret` re-executes the
+/// `ecall` after the handler's `rt_sigreturn`.
 pub(crate) fn take_restart() -> bool {
-    let restart = REQUEST_RESTART.swap(false, Ordering::Relaxed);
-    if restart {
-        RESTARTS.fetch_add(1, Ordering::Relaxed);
-    }
-    restart
+    csr::without_interrupts(|| {
+        let tid = scheduler::current_id();
+        let restart = with_table(|table| {
+            let Some(index) = table.thread_index(tid) else {
+                return false;
+            };
+            let restart = table.threads[index].restart;
+            table.threads[index].restart = false;
+            restart
+        });
+        if restart {
+            RESTARTS.fetch_add(1, Ordering::Relaxed);
+        }
+        restart
+    })
 }
 
 /// Fill the 128-byte `siginfo_t`.
@@ -1252,7 +1264,7 @@ fn arm(frame: &mut TrapFrame, run: u64, signal: usize, action: Action, source: S
     };
 
     // The mask in force inside the handler. `SA_NODEFER` omits the delivered
-    // signal itself; SA_KILL/SA_STOP can never enter a mask.
+    // signal itself; SIGKILL/SIGSTOP can never enter a mask.
     let mut next_blocked = (blocked | action.mask) & VALID_MASK & !UNBLOCKABLE_MASK;
     if action.flags & SA_NODEFER == 0 {
         next_blocked = (next_blocked | (1u64 << (signal - 1))) & VALID_MASK & !UNBLOCKABLE_MASK;
