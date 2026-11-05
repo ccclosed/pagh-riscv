@@ -29,16 +29,17 @@ _start:
 
 // ─── syscall wrapper ───────────────────────────────────────────────────────
 
-fn syscall5(
+fn syscall6(
     number: usize,
     a0: usize,
     a1: usize,
     a2: usize,
     a3: usize,
     a4: usize,
+    a5: usize,
 ) -> isize {
     let result: isize;
-    // SAFETY: `ecall` enters the kernel with `a7` as the number and `a0..a4` as
+    // SAFETY: `ecall` enters the kernel with `a7` as the number and `a0..a5` as
     // arguments; the kernel restores the same `sp` and callee-saved registers.
     //
     // No `nostack` option: the kernel writes into buffers this program passes
@@ -54,9 +55,21 @@ fn syscall5(
             in("a2") a2,
             in("a3") a3,
             in("a4") a4,
+            in("a5") a5,
         )
     };
     result
+}
+
+fn syscall5(
+    number: usize,
+    a0: usize,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+) -> isize {
+    syscall6(number, a0, a1, a2, a3, a4, 0)
 }
 
 fn syscall4(number: usize, a0: usize, a1: usize, a2: usize, a3: usize) -> isize {
@@ -77,6 +90,14 @@ fn syscall1(number: usize, a0: usize) -> isize {
 
 // ─── numbers and structs (the ABI document, not Linux) ────────────────────
 
+const SYS_POLL: usize = 7;
+const SYS_DUP: usize = 23;
+const SYS_DUP2: usize = 24;
+const SYS_PIPE2: usize = 59;
+const SYS_PPOLL: usize = 72;
+const SYS_MUNMAP: usize = 215;
+const SYS_MMAP: usize = 222;
+const SYS_MPROTECT: usize = 226;
 const SYS_READ: usize = 63;
 const SYS_WRITE: usize = 64;
 const SYS_OPENAT: usize = 56;
@@ -106,8 +127,20 @@ const O_CREAT: usize = 0x40;
 const O_TRUNC: usize = 0x80;
 const O_APPEND: usize = 0x100;
 
+const PROT_READ: usize = 1;
+const PROT_WRITE: usize = 2;
+const PROT_EXEC: usize = 4;
+const MAP_SHARED: usize = 1;
+const MAP_PRIVATE: usize = 2;
+const MAP_ANONYMOUS: usize = 0x20;
+
+const POLLIN: i16 = 0x1;
+const POLLOUT: i16 = 0x4;
+const POLLHUP: i16 = 0x10;
+
 const ENOENT: isize = -2;
 const EBADF: isize = -9;
+const EAGAIN: isize = -11;
 const EFAULT: isize = -14;
 const ENOTDIR: isize = -20;
 const EISDIR: isize = -21;
@@ -116,6 +149,7 @@ const ENOMEM: isize = -12;
 const ENOSYS: isize = -38;
 const EEXIST: isize = -17;
 const ENOTEMPTY: isize = -39;
+const EPIPE: isize = -32;
 const ENOTSUP: isize = -95;
 const ENAMETOOLONG: isize = -36;
 
@@ -131,6 +165,13 @@ struct Stat {
 struct Timespec {
     seconds: i64,
     nanos: i64,
+}
+
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
 }
 
 #[repr(C)]
@@ -215,6 +256,37 @@ fn cstr_eq(pointer: *const u8, expected: &[u8]) -> bool {
     }
     // SAFETY: one byte past the literal is the NUL of a matching string.
     unsafe { *pointer.add(expected.len()) == 0 }
+}
+
+/// Fill `words` 64-bit slots at `address` with `value`.
+fn fill_words(address: usize, words: usize, value: u64) {
+    // SAFETY: the caller passes an address returned by `mmap` and a word count
+    // that fits inside that mapping; the stores stay within it.
+    unsafe {
+        let target = address as *mut u64;
+        let mut index = 0usize;
+        while index < words {
+            *target.add(index) = value;
+            index += 1;
+        }
+    }
+}
+
+/// True when every one of `words` slots at `address` is `value`.
+fn words_match(address: usize, words: usize, value: u64) -> bool {
+    // SAFETY: as `fill_words`; the reads stay inside the mapping the caller
+    // created and the program still owns.
+    unsafe {
+        let target = address as *const u64;
+        let mut index = 0usize;
+        while index < words {
+            if *target.add(index) != value {
+                return false;
+            }
+            index += 1;
+        }
+    }
+    true
 }
 
 fn buffer_equals(buffer: &[u8], expected: &[u8]) -> bool {
@@ -412,6 +484,558 @@ pub extern "C" fn abi_main() -> i32 {
         syscall1(SYS_BRK, base as usize + (2 << 20)) == ENOMEM,
         21,
         "brk past window",
+    );
+
+    // ── mmap / mprotect / munmap: anonymous private memory above brk ──
+    const PAGE: usize = 4096;
+    let mapped = syscall6(
+        SYS_MMAP,
+        0,
+        4 * PAGE,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        usize::MAX,
+        0,
+    );
+    check(mapped > 0, 140, "mmap anon");
+    let mapped = mapped as usize;
+    check(
+        mapped >= 0x3000_0000 && mapped < 0x3f00_0000 && mapped % PAGE == 0,
+        141,
+        "mmap address in the window",
+    );
+    // SAFETY: `mapped` is a live 16 KiB anonymous mapping just created; the
+    // first word is inside it.
+    unsafe {
+        check(
+            *(mapped as *const u64) == 0,
+            142,
+            "mmap pages are zeroed",
+        );
+    }
+    fill_words(mapped, 4 * PAGE / 8, 0x1122_3344_5566_7788);
+    check(
+        words_match(mapped, 4 * PAGE / 8, 0x1122_3344_5566_7788),
+        143,
+        "mmap write pattern",
+    );
+    // Leave a printable marker in the mapping so the read-back through the
+    // now read-only page is visible in the serial log instead of eight binary
+    // bytes.
+    let marker = b"mprotect\n";
+    for (index, byte) in marker.iter().enumerate() {
+        // SAFETY: `mapped` is the live 16 KiB mapping; `marker` is nine bytes.
+        unsafe { *((mapped + index) as *mut u8) = *byte };
+    }
+    check(
+        syscall3(SYS_MPROTECT, mapped, 4 * PAGE, PROT_READ) == 0,
+        144,
+        "mprotect read-only",
+    );
+    // A kernel read through the now read-only page must still work: this is the
+    // user-pointer validation path in `write` (and proves the PTE kept R).
+    check(
+        syscall3(SYS_WRITE, 1, mapped, marker.len()) == marker.len() as isize,
+        145,
+        "write reads the read-only mapping",
+    );
+    check(
+        syscall3(
+            SYS_MPROTECT,
+            mapped,
+            4 * PAGE,
+            PROT_READ | PROT_WRITE,
+        ) == 0,
+        146,
+        "mprotect read-write",
+    );
+    fill_words(mapped, 1, 0xdead_beef_0bad_f00d);
+    check(
+        words_match(mapped, 1, 0xdead_beef_0bad_f00d),
+        147,
+        "write after mprotect rw",
+    );
+    check(
+        syscall2(SYS_MUNMAP, mapped, 4 * PAGE) == 0,
+        148,
+        "munmap",
+    );
+    check(
+        syscall2(SYS_MUNMAP, mapped, 4 * PAGE) == EINVAL,
+        149,
+        "munmap twice",
+    );
+    check(
+        syscall2(SYS_MUNMAP, mapped + 1, 4 * PAGE) == EINVAL,
+        150,
+        "munmap unaligned",
+    );
+    check(
+        syscall3(SYS_MPROTECT, mapped, 4 * PAGE, PROT_READ) == EINVAL,
+        151,
+        "mprotect after munmap",
+    );
+
+    // A hint is honoured when it is page-aligned and free, and ignored when the
+    // requested range is occupied: the second mapping must land somewhere else.
+    let hint = 0x3100_0000usize;
+    let first = syscall6(
+        SYS_MMAP,
+        hint,
+        PAGE,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        usize::MAX,
+        0,
+    );
+    check(first as usize == hint, 152, "mmap honours a free hint");
+    let second = syscall6(
+        SYS_MMAP,
+        hint,
+        PAGE,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        usize::MAX,
+        0,
+    );
+    check(second > 0, 153, "mmap falls back from an occupied hint");
+    let second = second as usize;
+    check(
+        second != hint && second % PAGE == 0,
+        154,
+        "mmap fallback is a different page",
+    );
+    fill_words(hint, 1, 0xaaaa_bbbb_cccc_dddd);
+    fill_words(second, 1, 0x0123_4567_89ab_cdef);
+    check(
+        words_match(hint, 1, 0xaaaa_bbbb_cccc_dddd)
+            && words_match(second, 1, 0x0123_4567_89ab_cdef),
+        155,
+        "two mappings are independent",
+    );
+    check(syscall2(SYS_MUNMAP, hint, PAGE) == 0, 156, "munmap hint");
+    check(
+        syscall2(SYS_MUNMAP, second, PAGE) == 0,
+        157,
+        "munmap fallback",
+    );
+
+    // Argument validation: zero length, shared/file-backed, W^X and a real fd
+    // are all refused without touching the frame pool.
+    check(
+        syscall6(
+            SYS_MMAP,
+            0,
+            0,
+            PROT_READ,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            usize::MAX,
+            0,
+        ) == EINVAL,
+        158,
+        "mmap zero length",
+    );
+    check(
+        syscall6(
+            SYS_MMAP,
+            0,
+            PAGE,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED | MAP_ANONYMOUS,
+            usize::MAX,
+            0,
+        ) == ENOTSUP,
+        159,
+        "mmap shared",
+    );
+    check(
+        syscall6(
+            SYS_MMAP,
+            0,
+            PAGE,
+            PROT_WRITE | PROT_EXEC,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            usize::MAX,
+            0,
+        ) == EINVAL,
+        160,
+        "mmap W+X",
+    );
+    check(
+        syscall6(
+            SYS_MMAP,
+            0,
+            PAGE,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            4,
+            0,
+        ) == EINVAL,
+        161,
+        "mmap file-backed fd",
+    );
+
+    // ── pipe2, read/write, EOF, poll, dup/dup2 ──
+    let mut pipe_fds = [0i32; 2];
+    check(
+        syscall2(SYS_PIPE2, pipe_fds.as_mut_ptr() as usize, 0) == 0,
+        162,
+        "pipe2",
+    );
+    let read_fd = pipe_fds[0];
+    let write_fd = pipe_fds[1];
+    check(
+        read_fd >= 3 && write_fd >= 3 && read_fd != write_fd,
+        163,
+        "pipe2 descriptors",
+    );
+
+    let mut pipe_buffer = [0u8; 8];
+    check(
+        syscall3(
+            SYS_READ,
+            read_fd as usize,
+            pipe_buffer.as_mut_ptr() as usize,
+            pipe_buffer.len(),
+        ) == EAGAIN,
+        164,
+        "read empty pipe is EAGAIN",
+    );
+    let mut poll_read = PollFd {
+        fd: read_fd,
+        events: POLLIN,
+        revents: 0,
+    };
+    check(
+        syscall3(
+            SYS_POLL,
+            &mut poll_read as *mut PollFd as usize,
+            1,
+            0,
+        ) == 0
+            && poll_read.revents == 0,
+        165,
+        "poll empty pipe",
+    );
+    let mut poll_write = PollFd {
+        fd: write_fd,
+        events: POLLOUT,
+        revents: 0,
+    };
+    check(
+        syscall3(
+            SYS_POLL,
+            &mut poll_write as *mut PollFd as usize,
+            1,
+            0,
+        ) == 1
+            && poll_write.revents & POLLOUT != 0,
+        166,
+        "poll write-ready pipe",
+    );
+    // A short timeout on a pipe with no data must come back 0, not spin forever.
+    let mut poll_timeout = PollFd {
+        fd: read_fd,
+        events: POLLIN,
+        revents: 0,
+    };
+    check(
+        syscall3(
+            SYS_POLL,
+            &mut poll_timeout as *mut PollFd as usize,
+            1,
+            20,
+        ) == 0,
+        167,
+        "poll timeout",
+    );
+    check(
+        syscall3(
+            SYS_WRITE,
+            write_fd as usize,
+            b"hello".as_ptr() as usize,
+            5,
+        ) == 5,
+        168,
+        "pipe write",
+    );
+    check(
+        syscall3(
+            SYS_POLL,
+            &mut poll_read as *mut PollFd as usize,
+            1,
+            0,
+        ) == 1
+            && poll_read.revents & POLLIN != 0,
+        169,
+        "poll read-ready pipe",
+    );
+    check(
+        syscall3(
+            SYS_READ,
+            read_fd as usize,
+            pipe_buffer.as_mut_ptr() as usize,
+            pipe_buffer.len(),
+        ) == 5,
+        170,
+        "pipe read length",
+    );
+    check(
+        buffer_equals(&pipe_buffer[..5], b"hello"),
+        171,
+        "pipe read content",
+    );
+    check(
+        syscall3(
+            SYS_READ,
+            read_fd as usize,
+            pipe_buffer.as_mut_ptr() as usize,
+            pipe_buffer.len(),
+        ) == EAGAIN,
+        172,
+        "pipe empty again",
+    );
+    check(syscall1(SYS_CLOSE, write_fd as usize) == 0, 173, "close pipe writer");
+    let mut poll_hup = PollFd {
+        fd: read_fd,
+        events: POLLIN,
+        revents: 0,
+    };
+    check(
+        syscall3(
+            SYS_POLL,
+            &mut poll_hup as *mut PollFd as usize,
+            1,
+            0,
+        ) == 1
+            && poll_hup.revents & POLLHUP != 0,
+        174,
+        "poll reports HUP after the writer closes",
+    );
+    check(
+        syscall3(
+            SYS_READ,
+            read_fd as usize,
+            pipe_buffer.as_mut_ptr() as usize,
+            pipe_buffer.len(),
+        ) == 0,
+        175,
+        "pipe EOF after the writer closes",
+    );
+    check(syscall1(SYS_CLOSE, read_fd as usize) == 0, 176, "close pipe reader");
+
+    // ppoll with a zero `Timespec` is poll's timeout 0 and sees a writable pipe.
+    check(
+        syscall2(SYS_PIPE2, pipe_fds.as_mut_ptr() as usize, 0) == 0,
+        177,
+        "pipe2 for ppoll",
+    );
+    let zero_timeout = Timespec {
+        seconds: 0,
+        nanos: 0,
+    };
+    let mut poll_ppoll = PollFd {
+        fd: pipe_fds[1],
+        events: POLLOUT,
+        revents: 0,
+    };
+    check(
+        syscall4(
+            SYS_PPOLL,
+            &mut poll_ppoll as *mut PollFd as usize,
+            1,
+            &zero_timeout as *const Timespec as usize,
+            0,
+        ) == 1
+            && poll_ppoll.revents & POLLOUT != 0,
+        178,
+        "ppoll",
+    );
+
+    // dup: both descriptors share the 4 KiB ring; EOF waits for the last writer.
+    let duped = syscall1(SYS_DUP, pipe_fds[1] as usize);
+    check(duped >= 3 && duped != pipe_fds[1] as isize, 179, "dup");
+    check(
+        syscall3(SYS_WRITE, duped as usize, b"dup".as_ptr() as usize, 3) == 3,
+        180,
+        "write through dup",
+    );
+    check(
+        syscall1(SYS_CLOSE, pipe_fds[1] as usize) == 0,
+        181,
+        "close original writer",
+    );
+    check(
+        syscall3(SYS_WRITE, duped as usize, b"!".as_ptr() as usize, 1) == 1,
+        182,
+        "dup keeps the write end alive",
+    );
+    check(
+        syscall3(
+            SYS_READ,
+            pipe_fds[0] as usize,
+            pipe_buffer.as_mut_ptr() as usize,
+            pipe_buffer.len(),
+        ) == 4,
+        183,
+        "read both messages",
+    );
+    check(
+        buffer_equals(&pipe_buffer[..4], b"dup!"),
+        184,
+        "dup shared the ring",
+    );
+    check(syscall1(SYS_CLOSE, duped as usize) == 0, 185, "close dup");
+    check(
+        syscall3(
+            SYS_READ,
+            pipe_fds[0] as usize,
+            pipe_buffer.as_mut_ptr() as usize,
+            pipe_buffer.len(),
+        ) == 0,
+        186,
+        "EOF after the last writer",
+    );
+    check(
+        syscall1(SYS_CLOSE, pipe_fds[0] as usize) == 0,
+        187,
+        "close pipe reader after dup",
+    );
+
+    // dup2 onto an explicit free slot; `oldfd == newfd` is the dup2 no-op.
+    check(
+        syscall2(SYS_PIPE2, pipe_fds.as_mut_ptr() as usize, 0) == 0,
+        188,
+        "pipe2 for dup2",
+    );
+    check(
+        syscall3(
+            SYS_DUP2,
+            pipe_fds[0] as usize,
+            pipe_fds[0] as usize,
+            0,
+        ) == pipe_fds[0] as isize,
+        189,
+        "dup2 same descriptor",
+    );
+    check(
+        syscall3(SYS_DUP2, pipe_fds[1] as usize, 5, 0) == 5,
+        190,
+        "dup2 onto slot 5",
+    );
+    check(
+        syscall3(SYS_WRITE, 5, b"xy".as_ptr() as usize, 2) == 2,
+        191,
+        "write through dup2",
+    );
+    check(
+        syscall3(
+            SYS_READ,
+            pipe_fds[0] as usize,
+            pipe_buffer.as_mut_ptr() as usize,
+            pipe_buffer.len(),
+        ) == 2
+            && buffer_equals(&pipe_buffer[..2], b"xy"),
+        192,
+        "read through the dup2 pipe",
+    );
+    check(
+        syscall1(SYS_CLOSE, pipe_fds[1] as usize) == 0,
+        193,
+        "close dup2 source",
+    );
+    check(syscall1(SYS_CLOSE, 5) == 0, 194, "close dup2 target");
+    check(
+        syscall3(
+            SYS_READ,
+            pipe_fds[0] as usize,
+            pipe_buffer.as_mut_ptr() as usize,
+            pipe_buffer.len(),
+        ) == 0,
+        195,
+        "dup2 EOF after both writers close",
+    );
+    check(
+        syscall1(SYS_CLOSE, pipe_fds[0] as usize) == 0,
+        196,
+        "close dup2 reader",
+    );
+    check(
+        syscall3(SYS_DUP2, 999, 5, 0) == EBADF,
+        197,
+        "dup2 bad source",
+    );
+
+    // No reader: poll reports POLLERR and write is EPIPE, then closing the
+    // writer frees the ring (the kernel-side selftest checks `live_pipes`).
+    check(
+        syscall2(SYS_PIPE2, pipe_fds.as_mut_ptr() as usize, 0) == 0,
+        198,
+        "pipe2 for EPIPE",
+    );
+    check(
+        syscall1(SYS_CLOSE, pipe_fds[0] as usize) == 0,
+        199,
+        "close read end",
+    );
+    let mut poll_err = PollFd {
+        fd: pipe_fds[1],
+        events: POLLOUT,
+        revents: 0,
+    };
+    check(
+        syscall3(
+            SYS_POLL,
+            &mut poll_err as *mut PollFd as usize,
+            1,
+            0,
+        ) == 1
+            && poll_err.revents & 0x8 != 0,
+        200,
+        "poll POLLERR without a reader",
+    );
+    check(
+        syscall3(
+            SYS_WRITE,
+            pipe_fds[1] as usize,
+            b"x".as_ptr() as usize,
+            1,
+        ) == EPIPE,
+        201,
+        "write without a reader is EPIPE",
+    );
+    check(
+        syscall1(SYS_CLOSE, pipe_fds[1] as usize) == 0,
+        202,
+        "close EPIPE writer",
+    );
+
+    let mut bad_pipe = [0i32; 2];
+    check(
+        syscall2(SYS_PIPE2, 0x10, 0) == EFAULT,
+        203,
+        "pipe2 bad pointer",
+    );
+    check(
+        syscall2(SYS_PIPE2, bad_pipe.as_mut_ptr() as usize, 0x80000) == EINVAL,
+        204,
+        "pipe2 unknown flag",
+    );
+    let mut poll_bad = PollFd {
+        fd: 99,
+        events: POLLIN,
+        revents: 0,
+    };
+    check(
+        syscall3(
+            SYS_POLL,
+            &mut poll_bad as *mut PollFd as usize,
+            1,
+            0,
+        ) == 1
+            && poll_bad.revents & 0x20 != 0,
+        205,
+        "poll reports POLLNVAL",
     );
 
     // ── error paths that must not fault the machine ──

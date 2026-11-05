@@ -55,13 +55,26 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::arch::riscv64::csr;
-use crate::arch::riscv64::mmu::{PTE_R, PTE_U, PTE_W};
+use crate::arch::riscv64::mmu::{PTE_A, PTE_D, PTE_R, PTE_U, PTE_V, PTE_W, PTE_X};
 use crate::arch::riscv64::traps::TrapFrame;
 use crate::memory::{paging, FRAME_SIZE};
 use crate::sync::Spinlock;
+use crate::user::{MmapError, USER_MMAP_PAGES};
 use crate::vfs::{self, VfsError, VfsNode};
 
 // ─── syscall numbers (RISC-V Linux generic, per the ABI document) ──────────
+const SYS_POLL: usize = 7;
+const SYS_DUP: usize = 23;
+/// RISC-V asm-generic calls number 24 `dup3`; pagh answers it with the `dup2`
+/// rule (`oldfd == newfd` is a successful no-op) and accepts only `flags = 0`,
+/// which is exactly `dup2` for every caller that exists today. See
+/// `pagh-api/docs/abi.md` §2.
+const SYS_DUP2: usize = 24;
+const SYS_PIPE2: usize = 59;
+const SYS_PPOLL: usize = 72;
+const SYS_MUNMAP: usize = 215;
+const SYS_MMAP: usize = 222;
+const SYS_MPROTECT: usize = 226;
 const SYS_READ: usize = 63;
 const SYS_WRITE: usize = 64;
 const SYS_OPENAT: usize = 56;
@@ -100,6 +113,7 @@ const ENOTDIR: isize = -20;
 const EISDIR: isize = -21;
 const EINVAL: isize = -22;
 const ENOSPC: isize = -28;
+const EPIPE: isize = -32;
 const ENAMETOOLONG: isize = -36;
 const EOVERFLOW: isize = -75;
 const ENOSYS: isize = -38;
@@ -118,6 +132,36 @@ const O_APPEND: usize = 0x100;
 // ─── `unlinkat` flags (the ABI's own small set) ────────────────────────────
 /// `unlinkat` flag: remove a directory (must be empty) instead of a file.
 const AT_REMOVEDIR: usize = 0x200;
+
+// ─── `mmap`/`mprotect` protection and flags ────────────────────────────────
+const PROT_READ: usize = 1;
+const PROT_WRITE: usize = 2;
+const PROT_EXEC: usize = 4;
+const MAP_SHARED: usize = 1;
+const MAP_PRIVATE: usize = 2;
+const MAP_ANONYMOUS: usize = 0x20;
+const MAP_FIXED: usize = 0x10;
+
+// ─── `poll` events (Linux values; the ABI documents this small set) ────────
+const POLLIN: i16 = 0x1;
+const POLLOUT: i16 = 0x4;
+const POLLERR: i16 = 0x8;
+const POLLHUP: i16 = 0x10;
+const POLLNVAL: i16 = 0x20;
+
+/// Most `pollfd`s one `poll`/`ppoll` call may pass. The array is copied into a
+/// fixed kernel buffer, so this is a resource limit, not a policy.
+const MAX_POLL_FDS: usize = 64;
+/// `struct pollfd`: `i32 fd`, `i16 events`, `i16 revents`, no padding.
+const POLLFD_SIZE: usize = 8;
+
+// ─── pipes ─────────────────────────────────────────────────────────────────
+/// Bytes in one pipe ring. Fixed and small on purpose: this is a signalling
+/// buffer between two descriptors, not a socket.
+const PIPE_CAPACITY: usize = 4096;
+/// Pipes one run may hold open at once. Each is 4 KiB of static RAM; eight is
+/// enough for a shell pipeline and bounded.
+const MAX_PIPES: usize = 8;
 
 /// File descriptors per run, including 0/1/2 (the ABI's limit).
 pub(crate) const MAX_FDS: usize = 16;
@@ -180,6 +224,18 @@ pub struct Stats {
     pub chmods: u64,
     /// `ftruncate` calls that resized a file.
     pub truncates: u64,
+    /// `mmap` calls that returned a user address.
+    pub mmaps: u64,
+    /// `munmap` calls that removed tracked pages.
+    pub munmaps: u64,
+    /// `mprotect` calls that rewrote page permissions.
+    pub mprotects: u64,
+    /// `pipe2` calls that created a pipe.
+    pub pipes: u64,
+    /// `dup`/`dup2`/`dup3` calls that returned a descriptor.
+    pub dups: u64,
+    /// `poll`/`ppoll` calls that returned to user mode.
+    pub polls: u64,
     /// Unknown syscall numbers answered with `-ENOSYS`.
     pub unknown: u64,
     /// Bad user buffers answered with `-EFAULT`.
@@ -209,6 +265,12 @@ static LINKS: AtomicU64 = AtomicU64::new(0);
 static RENAMES: AtomicU64 = AtomicU64::new(0);
 static CHMODS: AtomicU64 = AtomicU64::new(0);
 static TRUNCATES: AtomicU64 = AtomicU64::new(0);
+static MMAPS: AtomicU64 = AtomicU64::new(0);
+static MUNMAPS: AtomicU64 = AtomicU64::new(0);
+static MPROTECTS: AtomicU64 = AtomicU64::new(0);
+static PIPE_CREATES: AtomicU64 = AtomicU64::new(0);
+static DUPS: AtomicU64 = AtomicU64::new(0);
+static POLLS: AtomicU64 = AtomicU64::new(0);
 static UNKNOWN: AtomicU64 = AtomicU64::new(0);
 static FAULTS: AtomicU64 = AtomicU64::new(0);
 
@@ -239,6 +301,12 @@ pub fn stats() -> Stats {
         renames: RENAMES.load(Ordering::Relaxed),
         chmods: CHMODS.load(Ordering::Relaxed),
         truncates: TRUNCATES.load(Ordering::Relaxed),
+        mmaps: MMAPS.load(Ordering::Relaxed),
+        munmaps: MUNMAPS.load(Ordering::Relaxed),
+        mprotects: MPROTECTS.load(Ordering::Relaxed),
+        pipes: PIPE_CREATES.load(Ordering::Relaxed),
+        dups: DUPS.load(Ordering::Relaxed),
+        polls: POLLS.load(Ordering::Relaxed),
         unknown: UNKNOWN.load(Ordering::Relaxed),
         faults: FAULTS.load(Ordering::Relaxed),
     }
@@ -255,6 +323,7 @@ fn fault() -> isize {
 /// One open file: the node (shared with the VFS), the read/write offset and the
 /// `openat` flags. `Arc` keeps the node alive after the mount table is replaced,
 /// which is what `close` releases.
+#[derive(Clone)]
 struct FileHandle {
     node: Arc<dyn VfsNode>,
     offset: u64,
@@ -270,9 +339,145 @@ struct FileHandle {
 /// children at `openat` (the same thing the x86 shell does) and walks the
 /// snapshot. A directory that changes while it is open is not reflected in the
 /// stream; that is the v1 contract.
+#[derive(Clone)]
 struct DirSnapshot {
     entries: Vec<Arc<dyn VfsNode>>,
     index: usize,
+}
+
+// ─── pipes ─────────────────────────────────────────────────────────────────
+
+/// One fixed 4 KiB ring shared by every descriptor that names it.
+///
+/// `readers`/`writers` are descriptor-reference counts, not processes: a `dup`
+/// increments the matching one and `close` decrements it. EOF is `writers == 0`
+/// with an empty ring; a write with no readers is `-EPIPE`; the storage is
+/// released when both reach zero, which is also what makes the pipe table
+/// idempotent across a `selftest` pass (every run resets it).
+struct Pipe {
+    in_use: bool,
+    data: [u8; PIPE_CAPACITY],
+    /// Index of the oldest byte.
+    head: usize,
+    /// Bytes currently stored (`0..=PIPE_CAPACITY`).
+    len: usize,
+    readers: usize,
+    writers: usize,
+}
+
+impl Pipe {
+    const fn empty() -> Self {
+        Pipe {
+            in_use: false,
+            data: [0; PIPE_CAPACITY],
+            head: 0,
+            len: 0,
+            readers: 0,
+            writers: 0,
+        }
+    }
+
+    fn free(&self) -> usize {
+        PIPE_CAPACITY - self.len
+    }
+
+    /// Put the ring back into the free state without moving 4 KiB of data.
+    ///
+    /// The buffer is left as it is: `in_use = false` and `len = 0` make it
+    /// unreadable, and a later `create` overwrites bytes as they are written. A
+    /// `*self = Pipe::empty()` would build a 4 KiB temporary on the task stack,
+    /// which is exactly the kind of stack overflow the boot stack has paid for
+    /// before.
+    fn reset(&mut self) {
+        self.in_use = false;
+        self.head = 0;
+        self.len = 0;
+        self.readers = 0;
+        self.writers = 0;
+    }
+}
+
+struct PipeTable {
+    pipes: [Pipe; MAX_PIPES],
+}
+
+impl PipeTable {
+    const fn empty() -> Self {
+        PipeTable {
+            pipes: [const { Pipe::empty() }; MAX_PIPES],
+        }
+    }
+
+    /// Reserve a free pipe with one reader and one writer reference.
+    fn create(&mut self) -> Option<usize> {
+        for (id, pipe) in self.pipes.iter_mut().enumerate() {
+            if !pipe.in_use {
+                pipe.reset();
+                pipe.in_use = true;
+                pipe.readers = 1;
+                pipe.writers = 1;
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// Release every ring in place (no whole-table temporary).
+    fn clear(&mut self) {
+        for pipe in &mut self.pipes {
+            pipe.reset();
+        }
+    }
+
+    /// Drop one descriptor reference; both ends gone frees the ring.
+    fn release(&mut self, id: usize, read: bool) {
+        let Some(pipe) = self.pipes.get_mut(id) else {
+            return;
+        };
+        if !pipe.in_use {
+            return;
+        }
+        if read {
+            pipe.readers = pipe.readers.saturating_sub(1);
+        } else {
+            pipe.writers = pipe.writers.saturating_sub(1);
+        }
+        if pipe.readers == 0 && pipe.writers == 0 {
+            pipe.reset();
+        }
+    }
+
+    fn retain(&mut self, id: usize, read: bool) {
+        let Some(pipe) = self.pipes.get_mut(id) else {
+            return;
+        };
+        if !pipe.in_use {
+            return;
+        }
+        if read {
+            pipe.readers += 1;
+        } else {
+            pipe.writers += 1;
+        }
+    }
+}
+
+static PIPES: Spinlock<PipeTable> = Spinlock::new(PipeTable::empty());
+
+/// Add one descriptor reference to a pipe (the `dup` side of the lifetime).
+fn pipe_retain(id: usize, read: bool) {
+    PIPES.lock().retain(id, read);
+}
+
+/// Drop one descriptor reference to a pipe.
+fn pipe_release(id: usize, read: bool) {
+    PIPES.lock().release(id, read);
+}
+
+/// Pipes currently allocated. The selftest reads this after a run to prove
+/// every end was closed; it is not part of the user ABI.
+pub(crate) fn live_pipes() -> usize {
+    PIPES.lock().pipes.iter().filter(|pipe| pipe.in_use).count()
 }
 
 enum FdEntry {
@@ -281,6 +486,29 @@ enum FdEntry {
     /// fd 1/2: console output.
     Stdout,
     File(FileHandle),
+    /// One end of a pipe; `read` selects the direction. The ring is shared by
+    /// every descriptor with the same `id`.
+    Pipe {
+        id: usize,
+        read: bool,
+    },
+}
+
+impl Clone for FdEntry {
+    fn clone(&self) -> Self {
+        match self {
+            FdEntry::Stdin => FdEntry::Stdin,
+            FdEntry::Stdout => FdEntry::Stdout,
+            FdEntry::File(file) => FdEntry::File(file.clone()),
+            FdEntry::Pipe { id, read } => {
+                pipe_retain(*id, *read);
+                FdEntry::Pipe {
+                    id: *id,
+                    read: *read,
+                }
+            }
+        }
+    }
 }
 
 struct FdTable {
@@ -376,13 +604,18 @@ pub(crate) fn reset_fds() {
     table.slots[2] = Some(FdEntry::Stdout);
     drop(table);
     *MODES.lock() = ModeTable::empty();
+    // A pipe whose descriptors a previous run forgot is dead storage, not state
+    // the next program can reach: the table is per run, the rings with it.
+    PIPES.lock().clear();
 }
 
 /// Drop every open node. Called by the runner after the task is gone, before the
-/// image mappings are released; `Arc::drop` is the only side effect.
+/// image mappings are released; `Arc::drop` is the only side effect, and the
+/// whole pipe table is discarded because no descriptor can outlive the run.
 pub(crate) fn release_fds() {
     *FDS.lock() = FdTable::empty();
     *MODES.lock() = ModeTable::empty();
+    PIPES.lock().clear();
 }
 
 /// What a syscall needs from a descriptor, copied out of the table so the lock
@@ -396,6 +629,10 @@ enum OpenFd {
         offset: u64,
         flags: usize,
     },
+    Pipe {
+        id: usize,
+        read: bool,
+    },
 }
 
 fn lookup(fd: usize) -> Result<OpenFd, isize> {
@@ -408,8 +645,45 @@ fn lookup(fd: usize) -> Result<OpenFd, isize> {
             offset: file.offset,
             flags: file.flags,
         }),
+        Some(FdEntry::Pipe { id, read }) => Ok(OpenFd::Pipe {
+            id: *id,
+            read: *read,
+        }),
         None => Err(EBADF),
     }
+}
+
+/// First empty descriptor slot, including 0/1/2 once a program has closed them.
+/// `dup` and `pipe2` use it, which is why they can hand back 0 after a program
+/// closed its stdin — the ABI's "0/1/2 are console" describes the initial table,
+/// not a permanent reservation.
+fn alloc_fd() -> Option<usize> {
+    let table = FDS.lock();
+    table.slots.iter().position(|slot| slot.is_none())
+}
+
+/// Put an entry in `fd`, returning the previous occupant (released by the
+/// caller). `None` means the slot was free or out of range.
+fn take_slot(fd: usize) -> Option<FdEntry> {
+    let mut table = FDS.lock();
+    table.slots.get_mut(fd).and_then(|slot| slot.take())
+}
+
+/// Release one descriptor entry, dropping a pipe reference if it was one end.
+fn drop_entry(entry: FdEntry) {
+    if let FdEntry::Pipe { id, read } = entry {
+        pipe_release(id, read);
+    }
+}
+
+/// Install a pipe end in the first free slot.
+fn install_pipe(id: usize, read: bool) -> Result<usize, isize> {
+    let mut table = FDS.lock();
+    let Some(fd) = table.slots.iter().position(|slot| slot.is_none()) else {
+        return Err(ENOSPC);
+    };
+    table.slots[fd] = Some(FdEntry::Pipe { id, read });
+    Ok(fd)
 }
 
 /// Publish the new offset of an open file. A descriptor closed in between (only
@@ -468,6 +742,14 @@ pub fn dispatch(frame: &mut TrapFrame) {
         SYS_RENAMEAT2 => renameat2(frame.a0, frame.a1, frame.a2, frame.a3, frame.a4),
         SYS_FCHMODAT => fchmodat(frame.a0, frame.a1, frame.a2, frame.a3),
         SYS_FTRUNCATE => ftruncate(frame.a0, frame.a1),
+        SYS_MMAP => mmap(frame.a0, frame.a1, frame.a2, frame.a3, frame.a4, frame.a5),
+        SYS_MUNMAP => munmap(frame.a0, frame.a1),
+        SYS_MPROTECT => mprotect(frame.a0, frame.a1, frame.a2),
+        SYS_PIPE2 => pipe2(frame.a0, frame.a1),
+        SYS_DUP => dup(frame.a0),
+        SYS_DUP2 => dup2(frame.a0, frame.a1, frame.a2),
+        SYS_POLL => poll(frame.a0, frame.a1, frame.a2 as isize as i64),
+        SYS_PPOLL => ppoll(frame.a0, frame.a1, frame.a2),
         SYS_CLOCK_GETTIME => clock_gettime(frame.a0, frame.a1),
         SYS_NANOSLEEP => nanosleep(frame.a0, frame.a1),
         SYS_UNAME => uname(frame.a0),
@@ -518,6 +800,7 @@ fn read(fd: usize, buf: usize, len: usize) -> isize {
     match lookup(fd) {
         Ok(OpenFd::ConsoleIn) => read_console(buf),
         Ok(OpenFd::ConsoleOut) => EBADF,
+        Ok(OpenFd::Pipe { id, read }) => read_pipe(id, read, buf, len),
         Ok(OpenFd::File {
             node,
             offset,
@@ -597,6 +880,7 @@ fn write(fd: usize, buf: usize, len: usize) -> isize {
     match lookup(fd) {
         Ok(OpenFd::ConsoleIn) => EBADF,
         Ok(OpenFd::ConsoleOut) => write_console(buf, len),
+        Ok(OpenFd::Pipe { id, read }) => write_pipe(id, read, buf, len),
         Ok(OpenFd::File {
             node,
             offset,
@@ -689,6 +973,552 @@ fn write_console(buf: usize, len: usize) -> isize {
     WRITES.fetch_add(1, Ordering::Relaxed);
     BYTES.fetch_add(len as u64, Ordering::Relaxed);
     len as isize
+}
+
+// ─── pipes, dup and poll ───────────────────────────────────────────────────
+
+/// `read` on a pipe end: non-blocking, like the console.
+///
+/// Returns queued bytes, `-EAGAIN` when the ring is empty but a writer is still
+/// open, and `0` (EOF) once every write end is closed and the ring drained. The
+/// user buffer is validated before a byte is consumed, so `-EFAULT` never loses
+/// data. The ring lock is held across the copies: a pipe copy is memory-to-memory
+/// and cannot block on a device, which is the property the fd-table rule cares
+/// about.
+fn read_pipe(id: usize, read: bool, buf: usize, len: usize) -> isize {
+    if !read {
+        return EBADF;
+    }
+    if len == 0 {
+        return 0;
+    }
+    let Some(end) = buf.checked_add(len) else {
+        return fault();
+    };
+    if !user_range_valid(buf, end, true) {
+        return fault();
+    }
+    let mut pipes = PIPES.lock();
+    let Some(pipe) = pipes.pipes.get_mut(id) else {
+        return EBADF;
+    };
+    if !pipe.in_use {
+        return EBADF;
+    }
+    if pipe.len == 0 {
+        return if pipe.writers == 0 { 0 } else { EAGAIN };
+    }
+    let count = pipe.len.min(len);
+    let mut done = 0usize;
+    while done < count {
+        let start = (pipe.head + done) % PIPE_CAPACITY;
+        let take = (count - done).min(PIPE_CAPACITY - start);
+        if let Err(error) = copy_to_user(buf + done, &pipe.data[start..start + take]) {
+            return if done > 0 { done as isize } else { error };
+        }
+        done += take;
+    }
+    pipe.head = (pipe.head + count) % PIPE_CAPACITY;
+    pipe.len -= count;
+    READS.fetch_add(1, Ordering::Relaxed);
+    READ_BYTES.fetch_add(count as u64, Ordering::Relaxed);
+    count as isize
+}
+
+/// `write` on a pipe end: append what fits, `-EAGAIN` only when the ring is full.
+///
+/// A partial write is a normal success (the return value says how much was
+/// stored). With no read end open the write is `-EPIPE` — there is no signal
+/// layer in this ABI, so an applet must notice the error. The source is validated
+/// before the ring is touched.
+fn write_pipe(id: usize, read: bool, buf: usize, len: usize) -> isize {
+    if read {
+        return EBADF;
+    }
+    if len == 0 {
+        return 0;
+    }
+    let Some(end) = buf.checked_add(len) else {
+        return fault();
+    };
+    if !user_range_valid(buf, end, false) {
+        return fault();
+    }
+    let mut pipes = PIPES.lock();
+    let Some(pipe) = pipes.pipes.get_mut(id) else {
+        return EBADF;
+    };
+    if !pipe.in_use {
+        return EBADF;
+    }
+    if pipe.readers == 0 {
+        return EPIPE;
+    }
+    if pipe.free() == 0 {
+        return EAGAIN;
+    }
+    let count = pipe.free().min(len);
+    let start = (pipe.head + pipe.len) % PIPE_CAPACITY;
+    let mut done = 0usize;
+    while done < count {
+        let at = (start + done) % PIPE_CAPACITY;
+        let take = (count - done).min(PIPE_CAPACITY - at);
+        if let Err(error) = copy_from_user(&mut pipe.data[at..at + take], buf + done) {
+            pipe.len += done;
+            return if done > 0 { done as isize } else { error };
+        }
+        done += take;
+    }
+    pipe.len += count;
+    count as isize
+}
+
+/// `pipe2(*fds, flags)`: create a pipe and install its two ends.
+///
+/// `flags` must be 0: `O_NONBLOCK` is already the only mode and `O_CLOEXEC` has
+/// no meaning without `exec`, so a bit the ABI does not implement is `-EINVAL`
+/// rather than silently dropped. The read end is installed first, the write end
+/// second; if either the second slot or the `fds` write fails, both references
+/// are dropped, so a failed `pipe2` leaves neither a descriptor nor a ring.
+fn pipe2(fds: usize, flags: usize) -> isize {
+    if flags != 0 {
+        return EINVAL;
+    }
+    let Some(end) = fds.checked_add(2 * core::mem::size_of::<i32>()) else {
+        return fault();
+    };
+    if !user_range_valid(fds, end, true) {
+        return fault();
+    }
+    let id = match PIPES.lock().create() {
+        Some(id) => id,
+        None => return ENOSPC,
+    };
+    let read_fd = match install_pipe(id, true) {
+        Ok(fd) => fd,
+        Err(error) => {
+            pipe_release(id, true);
+            pipe_release(id, false);
+            return error;
+        }
+    };
+    let write_fd = match install_pipe(id, false) {
+        Ok(fd) => fd,
+        Err(error) => {
+            release_slot(read_fd);
+            pipe_release(id, false);
+            return error;
+        }
+    };
+    let mut raw = [0u8; 8];
+    raw[0..4].copy_from_slice(&(read_fd as i32).to_le_bytes());
+    raw[4..8].copy_from_slice(&(write_fd as i32).to_le_bytes());
+    if let Err(error) = copy_to_user(fds, &raw) {
+        release_slot(read_fd);
+        release_slot(write_fd);
+        return error;
+    }
+    PIPE_CREATES.fetch_add(1, Ordering::Relaxed);
+    0
+}
+
+/// Clone one descriptor table entry, if it exists.
+fn clone_slot(fd: usize) -> Option<FdEntry> {
+    FDS.lock()
+        .slots
+        .get(fd)
+        .and_then(|slot| slot.as_ref())
+        .cloned()
+}
+
+/// `dup(oldfd)`: duplicate into the first free descriptor slot.
+///
+/// The duplicate shares the underlying object: a file node (`Arc`), a directory
+/// snapshot (independent cursor — this ABI has no shared file description), or a
+/// pipe ring. The last sentence is what makes `dup` on a pipe end meaningful: the
+/// two descriptors read/write the same 4 KiB ring and the ring is freed when the
+/// last reference on both sides is closed.
+fn dup(oldfd: usize) -> isize {
+    let Some(entry) = clone_slot(oldfd) else {
+        return EBADF;
+    };
+    let Some(fd) = alloc_fd() else {
+        drop_entry(entry);
+        return ENOSPC;
+    };
+    FDS.lock().slots[fd] = Some(entry);
+    DUPS.fetch_add(1, Ordering::Relaxed);
+    fd as isize
+}
+
+/// `dup2/dup3(oldfd, newfd, flags)`: duplicate onto `newfd`.
+///
+/// `flags` must be 0. `oldfd == newfd` returns `newfd` without touching the table
+/// (the `dup2` rule; Linux's `dup3` would answer `-EINVAL`, a difference the ABI
+/// document records). `newfd` is closed first if it is open; the table is
+/// updated before the old occupant is dropped, so no error path can lose both.
+fn dup2(oldfd: usize, newfd: usize, flags: usize) -> isize {
+    if flags != 0 {
+        return EINVAL;
+    }
+    if newfd >= MAX_FDS {
+        return EBADF;
+    }
+    let Some(entry) = clone_slot(oldfd) else {
+        return EBADF;
+    };
+    if oldfd == newfd {
+        drop_entry(entry);
+        return newfd as isize;
+    }
+    let previous = take_slot(newfd);
+    FDS.lock().slots[newfd] = Some(entry);
+    if let Some(previous) = previous {
+        drop_entry(previous);
+    }
+    DUPS.fetch_add(1, Ordering::Relaxed);
+    newfd as isize
+}
+
+// ─── poll / ppoll ─────────────────────────────────────────────────────────
+
+/// True when the console would hand out a byte right now, without consuming it.
+///
+/// The UART ring is interrupt-fed; the keyboard needs a device poll first, which
+/// is exactly what the shell's idle loop does. `poll` performs that device poll
+/// itself before every scan so a program waiting for typed input makes progress
+/// without depending on the idle loop being scheduled in the right order.
+fn console_readable() -> bool {
+    crate::drivers::uart::rx_ready() || crate::drivers::virtio_input::key_ready()
+}
+
+/// Revision of one descriptor for `poll`.
+///
+/// `POLLERR`/`POLLHUP` are reported regardless of `events` (they are conditions,
+/// not requests), `POLLIN`/`POLLOUT` only when asked for. A closed or invalid fd
+/// becomes `POLLNVAL`, the standard "this array entry is not a descriptor".
+fn poll_one(fd: usize, events: i16) -> i16 {
+    match lookup(fd) {
+        Ok(OpenFd::ConsoleIn) => {
+            if events & POLLIN != 0 && console_readable() {
+                POLLIN
+            } else {
+                0
+            }
+        }
+        Ok(OpenFd::ConsoleOut) => {
+            if events & POLLOUT != 0 {
+                POLLOUT
+            } else {
+                0
+            }
+        }
+        // A regular file (and a directory) is always ready: there is no page
+        // cache wait and no blocking backend behind the VFS.
+        Ok(OpenFd::File { .. }) => {
+            let mut revents = 0;
+            if events & POLLIN != 0 {
+                revents |= POLLIN;
+            }
+            if events & POLLOUT != 0 {
+                revents |= POLLOUT;
+            }
+            revents
+        }
+        Ok(OpenFd::Pipe { id, read }) => {
+            let pipes = PIPES.lock();
+            let Some(pipe) = pipes.pipes.get(id).filter(|pipe| pipe.in_use) else {
+                return POLLNVAL;
+            };
+            let mut revents = 0;
+            if read {
+                if events & POLLIN != 0 && pipe.len > 0 {
+                    revents |= POLLIN;
+                }
+                if pipe.writers == 0 {
+                    revents |= POLLHUP;
+                }
+            } else {
+                if events & POLLOUT != 0 && pipe.readers > 0 && pipe.free() > 0 {
+                    revents |= POLLOUT;
+                }
+                if pipe.readers == 0 {
+                    revents |= POLLERR;
+                }
+            }
+            revents
+        }
+        Err(_) => POLLNVAL,
+    }
+}
+
+/// Read the `i`th `pollfd` from user memory as `(fd, events, revents_offset)`.
+///
+/// Byte-wise on purpose: a `pollfd` array has only C alignment (8 bytes per
+/// record), so a struct-shaped load could be unaligned and `copy_from_user` is
+/// the same contract every other pointer in this layer follows.
+fn read_pollfd(base: usize, index: usize) -> Result<(i32, i16), isize> {
+    let mut raw = [0u8; POLLFD_SIZE];
+    copy_from_user(&mut raw, base + index * POLLFD_SIZE)?;
+    let fd = i32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let events = i16::from_le_bytes([raw[4], raw[5]]);
+    Ok((fd, events))
+}
+
+/// Write back `revents` for one `pollfd`; `fd`, `events` stay untouched.
+fn write_pollfd(base: usize, index: usize, revents: i16) -> Result<(), isize> {
+    let offset = base + index * POLLFD_SIZE + 6;
+    copy_to_user(offset, &revents.to_le_bytes())
+}
+
+/// Shared body of [`poll`] and [`ppoll`]: scan, wait, scan until a deadline.
+///
+/// `timeout_ms < 0` waits forever, `0` scans once and returns. Waiting is
+/// `scheduler::yield_now`, never a busy `wfi`: other tasks (the shell's idle loop,
+/// the network poll) must run so the keyboard and pointer keep working while a
+/// program waits. The timeout is measured in kernel ticks, so a 1 ms request is
+/// one tick (10 ms).
+fn poll_wait(fds: usize, nfds: usize, timeout_ms: i64) -> isize {
+    let deadline = if timeout_ms < 0 {
+        None
+    } else {
+        let ticks = (timeout_ms as u64)
+            .saturating_mul(crate::arch::riscv64::timer::TICK_HZ as u64)
+            .div_ceil(1000);
+        Some(crate::arch::riscv64::timer::ticks().saturating_add(ticks))
+    };
+
+    loop {
+        // The keyboard has no routed interrupt (see the drivers README): make
+        // pending key events visible before deciding nothing is ready.
+        crate::drivers::virtio_input::poll();
+        let mut revents = [0i16; MAX_POLL_FDS];
+        let mut ready = 0usize;
+        for index in 0..nfds {
+            let (fd, events) = match read_pollfd(fds, index) {
+                Ok(entry) => entry,
+                Err(error) => return error,
+            };
+            if fd < 0 {
+                continue;
+            }
+            let value = poll_one(fd as usize, events);
+            if value != 0 {
+                revents[index] = value;
+                ready += 1;
+            }
+        }
+        if ready > 0 || timeout_ms == 0 {
+            for index in 0..nfds {
+                if let Err(error) = write_pollfd(fds, index, revents[index]) {
+                    return error;
+                }
+            }
+            return ready as isize;
+        }
+        if let Some(deadline) = deadline {
+            if crate::arch::riscv64::timer::ticks() >= deadline {
+                for index in 0..nfds {
+                    if let Err(error) = write_pollfd(fds, index, 0) {
+                        return error;
+                    }
+                }
+                return 0;
+            }
+        }
+        crate::task::scheduler::yield_now();
+    }
+}
+
+/// Validate the `pollfd` array's address range, then run [`poll_wait`].
+fn poll_common(fds: usize, nfds: usize, timeout_ms: i64) -> isize {
+    if nfds > MAX_POLL_FDS {
+        return EINVAL;
+    }
+    let Some(bytes) = nfds.checked_mul(POLLFD_SIZE) else {
+        return fault();
+    };
+    if bytes > 0 {
+        let Some(end) = fds.checked_add(bytes) else {
+            return fault();
+        };
+        if !user_range_valid(fds, end, true) {
+            return fault();
+        }
+    }
+    let result = poll_wait(fds, nfds, timeout_ms);
+    if result >= 0 {
+        POLLS.fetch_add(1, Ordering::Relaxed);
+    }
+    result
+}
+
+/// `poll(fds, nfds, timeout_ms)`: wait for events on up to [`MAX_POLL_FDS`]
+/// descriptors.
+///
+/// `timeout_ms` 0 is a single non-blocking scan; negative waits without a
+/// deadline. A zero return is a timeout, not an error.
+fn poll(fds: usize, nfds: usize, timeout_ms: i64) -> isize {
+    poll_common(fds, nfds, timeout_ms)
+}
+
+/// `ppoll(fds, nfds, *Timespec, sigmask, sigsetsize)`.
+///
+/// The timeout is a `Timespec` rounded up to whole milliseconds; a null pointer
+/// means "wait forever". The signal mask and its size are accepted and ignored —
+/// this kernel has no signals, so there is nothing to unmask during the wait.
+/// Every other rule is [`poll`]'s.
+fn ppoll(fds: usize, nfds: usize, timeout: usize) -> isize {
+    let timeout_ms = if timeout == 0 {
+        -1
+    } else {
+        let mut raw = [0u8; TIMESPEC_SIZE];
+        if let Err(error) = copy_from_user(&mut raw, timeout) {
+            return error;
+        }
+        let seconds = i64::from_le_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
+        let nanos = i64::from_le_bytes(raw[8..16].try_into().unwrap_or([0; 8]));
+        if seconds < 0 || nanos < 0 || nanos >= NANOS_PER_SEC as i64 {
+            return EINVAL;
+        }
+        (seconds as i128)
+            .saturating_mul(1000)
+            .saturating_add((nanos as i128 + 999_999) / 1_000_000)
+            .min(i64::MAX as i128) as i64
+    };
+    poll_common(fds, nfds, timeout_ms)
+}
+
+// ─── mmap / munmap / mprotect ─────────────────────────────────────────────
+
+/// Turn the ABI's `PROT_*` bits into PTE permissions.
+///
+/// `R` is always set: a RISC-V leaf without `R` is write-only (reserved as a
+/// normal mapping), and every user buffer helper validates `R`. `W` and `X` may
+/// not be combined — pagh's W^X policy — so a program cannot ask for a writable
+/// and executable page; allocate twice if a JIT needs that. `PROT_NONE` is not
+/// expressible either (a leaf with no R/W/X is not a leaf to the walker), so it
+/// is `-EINVAL` rather than a mapping that would fault on first touch.
+fn prot_bits(prot: usize) -> Result<u64, isize> {
+    const ALLOWED: usize = PROT_READ | PROT_WRITE | PROT_EXEC;
+    if prot == 0 || prot & !ALLOWED != 0 {
+        return Err(EINVAL);
+    }
+    let write = prot & PROT_WRITE != 0;
+    let execute = prot & PROT_EXEC != 0;
+    if write && execute {
+        return Err(EINVAL);
+    }
+    let mut bits = PTE_V | PTE_R | PTE_U | PTE_A | PTE_D;
+    if write {
+        bits |= PTE_W;
+    }
+    if execute {
+        bits |= PTE_X;
+    }
+    Ok(bits)
+}
+
+/// Whole pages needed for `length` bytes, or `None` on overflow.
+fn pages_for(length: usize) -> Option<usize> {
+    length
+        .checked_add(FRAME_SIZE - 1)
+        .map(|rounded| rounded / FRAME_SIZE)
+}
+
+/// `mmap(addr, length, prot, flags, fd, offset)`: anonymous private memory.
+///
+/// Only `MAP_PRIVATE | MAP_ANONYMOUS` is implemented. `MAP_SHARED`, `MAP_FIXED`
+/// and a real `fd`/`offset` are `-ENOTSUP`/`-EINVAL` rather than silently
+/// ignored — a caller asking for shared or file-backed memory must know it did
+/// not get it. `addr` is a hint: it is used when page-aligned, inside the
+/// [`crate::user::USER_MMAP_BASE`]..[`crate::user::USER_MMAP_TOP`] window and
+/// entirely free; otherwise the kernel picks the first free run.
+///
+/// Frames are allocated and zeroed now. A failed allocation (or a full region
+/// table) rolls every page of this call back, so the answer is either a complete
+/// mapping or an unchanged ledger.
+fn mmap(addr: usize, length: usize, prot: usize, flags: usize, fd: usize, offset: usize) -> isize {
+    if length == 0 {
+        return EINVAL;
+    }
+    if flags & MAP_SHARED != 0 || flags & MAP_FIXED != 0 {
+        return ENOTSUP;
+    }
+    if flags != MAP_PRIVATE | MAP_ANONYMOUS {
+        return EINVAL;
+    }
+    if fd as isize != -1 || offset != 0 {
+        return EINVAL;
+    }
+    let bits = match prot_bits(prot) {
+        Ok(bits) => bits,
+        Err(error) => return error,
+    };
+    let Some(pages) = pages_for(length) else {
+        return ENOMEM;
+    };
+    if pages > USER_MMAP_PAGES {
+        return ENOMEM;
+    }
+    let hint = if addr % FRAME_SIZE == 0 { addr } else { 0 };
+    match crate::user::mmap(hint, pages, bits) {
+        Ok(base) => {
+            MMAPS.fetch_add(1, Ordering::Relaxed);
+            base as isize
+        }
+        Err(MmapError::Invalid) => EINVAL,
+        Err(MmapError::NoMemory) => ENOMEM,
+    }
+}
+
+/// `munmap(addr, length)`: unmap whole pages, rounding `length` up.
+///
+/// `addr` must be page-aligned and `length` non-zero. The range must be part of
+/// mappings made by this run's `mmap`; freeing the image, the stack or a hole is
+/// `-EINVAL`, and a partial unmap splits the bookkeeping extent so teardown frees
+/// exactly what is left.
+fn munmap(addr: usize, length: usize) -> isize {
+    if length == 0 || addr % FRAME_SIZE != 0 {
+        return EINVAL;
+    }
+    let Some(pages) = pages_for(length) else {
+        return EINVAL;
+    };
+    match crate::user::munmap(addr, pages) {
+        Ok(()) => {
+            MUNMAPS.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        Err(MmapError::Invalid) => EINVAL,
+        Err(MmapError::NoMemory) => ENOMEM,
+    }
+}
+
+/// `mprotect(addr, length, prot)`: rewrite R/W/X on mapped user pages.
+///
+/// The same `PROT_*` validation as [`mmap`] applies (W^X rejected, `R` implied,
+/// `PROT_NONE` refused). Every page is checked to be a live user leaf before the
+/// first PTE is touched, so an unmapped page or a bad range changes nothing.
+fn mprotect(addr: usize, length: usize, prot: usize) -> isize {
+    if length == 0 || addr % FRAME_SIZE != 0 {
+        return EINVAL;
+    }
+    let bits = match prot_bits(prot) {
+        Ok(bits) => bits,
+        Err(error) => return error,
+    };
+    let Some(pages) = pages_for(length) else {
+        return EINVAL;
+    };
+    match crate::user::mprotect(addr, pages, bits) {
+        Ok(()) => {
+            MPROTECTS.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        Err(MmapError::Invalid) => EINVAL,
+        Err(MmapError::NoMemory) => ENOMEM,
+    }
 }
 
 // ─── open / close ──────────────────────────────────────────────────────────
@@ -807,9 +1637,15 @@ fn openat(dirfd: usize, path_ptr: usize, flags: usize, mode: usize) -> isize {
 /// Remove a descriptor without counting a `close`; used by [`openat`] to roll
 /// back a descriptor whose truncation failed. `false` means the slot was empty.
 fn release_slot(fd: usize) -> bool {
-    let mut table = FDS.lock();
-    match table.slots.get_mut(fd) {
-        Some(slot) => slot.take().is_some(),
+    // The table lock is released before a pipe reference is dropped: the pipe
+    // table is a second lock, and taking it after the descriptor table (never
+    // before) is the one order every path here follows.
+    let entry = take_slot(fd);
+    match entry {
+        Some(entry) => {
+            drop_entry(entry);
+            true
+        }
         None => false,
     }
 }
@@ -837,7 +1673,7 @@ fn close(fd: usize) -> isize {
 fn lseek(fd: usize, offset: usize, whence: usize) -> isize {
     let delta = offset as isize as i128;
     match lookup(fd) {
-        Ok(OpenFd::ConsoleIn) | Ok(OpenFd::ConsoleOut) => EINVAL,
+        Ok(OpenFd::ConsoleIn) | Ok(OpenFd::ConsoleOut) | Ok(OpenFd::Pipe { .. }) => EINVAL,
         Ok(OpenFd::File { node, offset, .. }) => {
             if node.is_directory() {
                 return EINVAL;
@@ -881,6 +1717,20 @@ const KIND_OTHER: u32 = 3;
 fn fstat(fd: usize, pointer: usize) -> isize {
     let (kind, mode, size, ino) = match lookup(fd) {
         Ok(OpenFd::ConsoleIn) | Ok(OpenFd::ConsoleOut) => (KIND_OTHER, 0o644u32, 0u64, 0u64),
+        // A pipe reports `OTHER`, no inode and the bytes currently queued as
+        // its size: there is no filesystem object behind it, and the ABI's
+        // `Stat` is the only metadata query a pipe has.
+        Ok(OpenFd::Pipe { id, .. }) => (
+            KIND_OTHER,
+            0o600u32,
+            PIPES
+                .lock()
+                .pipes
+                .get(id)
+                .filter(|pipe| pipe.in_use)
+                .map_or(0, |pipe| pipe.len as u64),
+            0u64,
+        ),
         Ok(OpenFd::File { node, .. }) => {
             let is_dir = node.is_directory();
             let is_link = node.is_symlink();
@@ -1316,7 +2166,7 @@ fn ftruncate(fd: usize, length: usize) -> isize {
         return EINVAL;
     }
     match lookup(fd) {
-        Ok(OpenFd::ConsoleIn) | Ok(OpenFd::ConsoleOut) => EINVAL,
+        Ok(OpenFd::ConsoleIn) | Ok(OpenFd::ConsoleOut) | Ok(OpenFd::Pipe { .. }) => EINVAL,
         Ok(OpenFd::File { node, flags, .. }) => {
             if node.is_directory() {
                 return EISDIR;

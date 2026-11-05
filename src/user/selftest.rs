@@ -492,6 +492,12 @@ fn user_abi_syscalls(_buf: &mut Vec<u8>) -> Outcome {
         || stats.closes <= stats_before.closes
         || stats.fstats <= stats_before.fstats
         || stats.sleeps <= stats_before.sleeps
+        || stats.mmaps <= stats_before.mmaps
+        || stats.munmaps <= stats_before.munmaps
+        || stats.mprotects <= stats_before.mprotects
+        || stats.pipes <= stats_before.pipes
+        || stats.dups <= stats_before.dups
+        || stats.polls <= stats_before.polls
     {
         crate::kprintln!(
             "[selftest] user: ABI counters did not move as expected (before {:?}, after {:?})",
@@ -517,6 +523,17 @@ fn user_abi_syscalls(_buf: &mut Vec<u8>) -> Outcome {
             "[selftest] user: filesystem ABI counters did not move (before {:?}, after {:?})",
             stats_before,
             stats
+        );
+        ok = false;
+    }
+
+    // Pipe rings are static memory, not PMM frames, so the ledger cannot see a
+    // leaked one. The fixture closes every end; a non-zero count would mean a
+    // reference was lost and the ring would stay allocated for the whole boot.
+    if crate::user::syscall::live_pipes() != 0 {
+        crate::kprintln!(
+            "[selftest] user: the ABI run left {} pipe(s) allocated",
+            crate::user::syscall::live_pipes()
         );
         ok = false;
     }

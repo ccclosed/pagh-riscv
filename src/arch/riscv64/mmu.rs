@@ -333,6 +333,17 @@ pub fn sfence_vma_all() {
     unsafe { asm!("sfence.vma", options(nostack)) };
 }
 
+/// Synchronise the instruction stream after code pages changed.
+///
+/// `sfence.vma` orders page-table writes; it does not make a hart discard
+/// instructions it prefetched before a page became executable. `fence.i` is the
+/// per-hart counterpart and must follow a permission change that adds `X`.
+pub fn fence_i() {
+    // SAFETY: `fence.i` is a local instruction-fetch fence, not a memory access;
+    // it cannot fault and needs no operands.
+    unsafe { asm!("fence.i", options(nostack)) };
+}
+
 /// Flush the translation of one page, for every ASID.
 pub fn sfence_vma_page(va: usize) {
     // SAFETY: as `sfence_vma_all`. The one-operand form is the assembler's

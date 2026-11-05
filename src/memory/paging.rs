@@ -340,6 +340,58 @@ pub fn map(va: usize, pa: usize, flags: Flags) -> Result<(), MapError> {
     result
 }
 
+/// Replace the permission bits of the mapping at `va`, keeping its frame.
+///
+/// This is the `mprotect` half of the map: the physical address in the leaf is
+/// preserved (only the flags half is rewritten), so a caller can narrow or widen
+/// access without moving the page. The whole `flags` value is installed, which is
+/// what makes `U` disappear if a caller passes kernel flags — the syscall layer
+/// never does; [`Flags::user_rw`]/[`Flags::user_rx`]/[`Flags::from_bits`] carry
+/// `U` for user pages.
+///
+/// A missing page is [`MapError::NotMapped`] and a superpage is refused rather
+/// than half-updated. Nothing changes on error.
+pub fn protect(va: usize, flags: Flags) -> Result<(), MapError> {
+    if va % FRAME_SIZE != 0 {
+        return Err(MapError::Misaligned(va));
+    }
+    with_space(|space| {
+        if space.root == 0 {
+            return Err(MapError::NotInitialised);
+        }
+        let mut table = space.root;
+        for level in (1..mmu::LEVELS).rev() {
+            // SAFETY: `table` is the live root or a table reached through a
+            // valid entry; `vpn` keeps the index in range.
+            let entry = unsafe { PageTable::entry(table as *const PageTable, mmu::vpn(va, level)) };
+            if mmu::pte_is_leaf(entry) {
+                return Err(MapError::Superpage(va));
+            }
+            if !mmu::pte_is_valid(entry) {
+                return Err(MapError::NotMapped(va));
+            }
+            table = mmu::pte_address(entry);
+        }
+        let index = mmu::vpn(va, 0);
+        // SAFETY: as above, at the leaf level.
+        let entry = unsafe { PageTable::entry(table as *const PageTable, index) };
+        if !mmu::pte_is_leaf(entry) {
+            return Err(MapError::NotMapped(va));
+        }
+        let pa = mmu::pte_address(entry);
+        // SAFETY: this walk owns `table` (the address space is locked) and the
+        // entry is the live leaf read just above, so replacing it with the same
+        // PPN and new permissions cannot tear another mapping.
+        unsafe { PageTable::set_entry(table as *mut PageTable, index, mmu::pte_leaf(pa, flags)) };
+        Ok(())
+    })?;
+    mmu::sfence_vma_page(va);
+    // Without this a freshly executable page may be fetched from a stale
+    // instruction cache; `fence.i` is cheap and unconditional, like the flush.
+    mmu::fence_i();
+    Ok(())
+}
+
 /// Remove the mapping at `va`, returning the physical address it pointed at.
 ///
 /// Tables that become empty are handed back to the frame allocator, so a

@@ -58,7 +58,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use alloc::sync::Arc;
 
-use crate::arch::riscv64::mmu::Flags;
+use crate::arch::riscv64::mmu::{Flags, PTE_R, PTE_U};
 use crate::memory::paging;
 use crate::memory::pmm;
 use crate::memory::FRAME_SIZE;
@@ -125,6 +125,61 @@ pub const USER_HEAP_SIZE: usize = 1 << 20;
 pub const USER_HEAP_TOP: usize = USER_HEAP_BASE + USER_HEAP_SIZE;
 /// Pages in the heap window.
 pub const USER_HEAP_PAGES: usize = USER_HEAP_SIZE / FRAME_SIZE;
+
+/// The `mmap` window: 240 MiB above the `brk` heap, below the user stack.
+///
+/// The range is deliberately disjoint from every other user allocation the
+/// runner makes: the image loader accepts pages below [`USER_STACK_BASE`], the
+/// `brk` heap is the 1 MiB window at [`USER_HEAP_BASE`], and the stack is the
+/// last 64 KiB before `0x4000_0000`. `mmap` still validates every candidate page
+/// with `paging::flags`, so an image that happens to sit inside this window is
+/// never overwritten — the window is a search range, not a reservation.
+pub const USER_MMAP_BASE: usize = 0x3000_0000;
+/// One past the last `mmap` byte (`0x3f00_0000`, 16 MiB below the stack base).
+pub const USER_MMAP_TOP: usize = 0x3f00_0000;
+/// Pages in the `mmap` window.
+pub const USER_MMAP_PAGES: usize = (USER_MMAP_TOP - USER_MMAP_BASE) / FRAME_SIZE;
+
+/// Most `mmap` regions one run may track.
+///
+/// A region is a contiguous extent returned by one `mmap`; a partial `munmap`
+/// can split one into two. Eight extents cover ordinary allocator-shaped use
+/// (one arena plus a handful of small mappings) while keeping `RunState` small
+/// enough for the shell thread's 16 KiB stack — the 32-entry version overflowed
+/// it and hung the large-file selftest. Running out is `-ENOMEM` *before* any
+/// page is touched, never a half-applied `munmap`.
+const MAX_MMAP_REGIONS: usize = 8;
+
+/// One contiguous extent of anonymous private mappings owned by the run.
+///
+/// Teardown needs only the extent: every page is translated and freed one by
+/// one, so no per-page frame array (the heap's shape) is required.
+#[derive(Clone, Copy)]
+struct MmapRegion {
+    start: usize,
+    pages: usize,
+}
+
+impl MmapRegion {
+    const fn empty() -> Self {
+        MmapRegion { start: 0, pages: 0 }
+    }
+
+    fn end(&self) -> usize {
+        self.start + self.pages * FRAME_SIZE
+    }
+}
+
+/// Why an `mmap`/`munmap`/`mprotect` call failed. The syscall layer maps these
+/// to `-ENOMEM` and `-EINVAL`; keeping the enum here means the address-space
+/// policy does not spell errno values of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MmapError {
+    /// Bad range, nothing mapped, or no such tracked mapping.
+    Invalid,
+    /// The window or the frame pool has no room, or the region table is full.
+    NoMemory,
+}
 
 /// How a user task ended.
 ///
@@ -269,6 +324,11 @@ struct RunState {
     /// syscall layer is the only writer.
     heap_frames: [usize; USER_HEAP_PAGES],
     heap_count: usize,
+    /// Contiguous extents created by `mmap`, sorted and non-overlapping. The
+    /// runner frees every page still listed here after the task is gone; the
+    /// syscall layer is the only writer while the program runs.
+    mmap_regions: [MmapRegion; MAX_MMAP_REGIONS],
+    mmap_count: usize,
 }
 
 static RUN: Spinlock<Option<RunState>> = Spinlock::new(None);
@@ -502,6 +562,8 @@ fn run_source<S: ImageSource + ?Sized>(
             heap_end: USER_HEAP_BASE,
             heap_frames: [0; USER_HEAP_PAGES],
             heap_count: 0,
+            mmap_regions: [MmapRegion::empty(); MAX_MMAP_REGIONS],
+            mmap_count: 0,
         });
     }
 
@@ -590,6 +652,7 @@ fn run_source<S: ImageSource + ?Sized>(
     loaded.release();
     let mut run = RUN.lock().take();
     if let Some(run) = run.as_mut() {
+        release_mmap(run);
         release_heap(run);
     }
     let exit = run.and_then(|run| run.exit).unwrap_or(Exit::Fault {
@@ -808,6 +871,292 @@ fn release_heap_to(run: &mut RunState, target: usize) {
 /// a second call (heap already shrunk to the base) has nothing to do.
 fn release_heap(run: &mut RunState) {
     release_heap_to(run, USER_HEAP_BASE);
+}
+
+// ─── mmap / munmap / mprotect ──────────────────────────────────────────────
+
+/// True when `[start, start + pages * 4 KiB)` is inside the `mmap` window and
+/// neither the region table nor the live page tables claim any page of it.
+///
+/// The page-table check is what keeps a hint from landing on an image segment
+/// that happens to be inside the window: the loader's pages are not in
+/// `mmap_regions`, but they are mapped, and mapping over them would leave the
+/// running program executing someone else's memory.
+fn mmap_range_free(run: &RunState, start: usize, pages: usize) -> bool {
+    let Some(length) = pages.checked_mul(FRAME_SIZE) else {
+        return false;
+    };
+    let Some(end) = start.checked_add(length) else {
+        return false;
+    };
+    if start < USER_MMAP_BASE || end > USER_MMAP_TOP {
+        return false;
+    }
+    if run.mmap_regions[..run.mmap_count]
+        .iter()
+        .any(|region| start < region.end() && region.start < end)
+    {
+        return false;
+    }
+    let mut page = start;
+    while page < end {
+        if paging::flags(page).is_some() {
+            return false;
+        }
+        page += FRAME_SIZE;
+    }
+    true
+}
+
+/// Record one new region; adjacent extents are coalesced.
+///
+/// The caller has already reserved capacity, so a full table is impossible here.
+fn insert_mmap_region(run: &mut RunState, start: usize, pages: usize) {
+    run.mmap_regions[run.mmap_count] = MmapRegion { start, pages };
+    run.mmap_count += 1;
+    coalesce_mmap_regions(run);
+}
+
+/// Sort the region list and merge every touching pair.
+fn coalesce_mmap_regions(run: &mut RunState) {
+    run.mmap_regions[..run.mmap_count].sort_unstable_by_key(|region| region.start);
+    let mut write = 0usize;
+    for read in 0..run.mmap_count {
+        let region = run.mmap_regions[read];
+        if write > 0 && run.mmap_regions[write - 1].end() == region.start {
+            run.mmap_regions[write - 1].pages += region.pages;
+        } else {
+            run.mmap_regions[write] = region;
+            write += 1;
+        }
+    }
+    run.mmap_count = write;
+}
+
+/// True when every page of `[start, end)` belongs to a tracked `mmap` region.
+fn mmap_range_covered(run: &RunState, start: usize, end: usize) -> bool {
+    let mut page = start;
+    while page < end {
+        let Some(region) = run.mmap_regions[..run.mmap_count]
+            .iter()
+            .find(|region| region.start <= page && page < region.end())
+        else {
+            return false;
+        };
+        page = region.end();
+    }
+    true
+}
+
+/// Unmap and free `[start, start + pages * 4 KiB)`.
+///
+/// Used by the rollback paths and by teardown. A page that is not mapped is
+/// skipped: the caller has already checked ownership, and refusing here would
+/// leave the frames above it leaked.
+fn release_mapping(start: usize, pages: usize) {
+    for page in 0..pages {
+        if let Ok(frame) = paging::unmap(start + page * FRAME_SIZE) {
+            pmm::free_frame(frame);
+        }
+    }
+}
+
+/// `mmap` for the running program: reserve a free window range and map zeroed
+/// frames into it.
+///
+/// `addr` is a hint (0 = none); it is honoured only when page-aligned, inside
+/// the window and completely free. Otherwise the first free run from
+/// [`USER_MMAP_BASE`] wins. Frames are allocated eagerly and zeroed, because this
+/// kernel has no demand-paging fault path: a lazily absent user page would kill
+/// the task on first touch instead of populating it.
+///
+/// On any failure the pages already mapped by this call are unmapped and freed,
+/// so the PMM ledger and the region table are exactly as they were.
+pub(crate) fn mmap(addr: usize, pages: usize, bits: u64) -> Result<usize, MmapError> {
+    if pages == 0 || pages > USER_MMAP_PAGES {
+        return Err(MmapError::Invalid);
+    }
+    let length = pages * FRAME_SIZE;
+    let flags = Flags::from_bits(bits);
+    let mut slot = RUN.lock();
+    let Some(run) = slot.as_mut() else {
+        return Err(MmapError::Invalid);
+    };
+    if run.mmap_count == MAX_MMAP_REGIONS {
+        return Err(MmapError::NoMemory);
+    }
+
+    let hinted =
+        (addr != 0 && addr % FRAME_SIZE == 0 && mmap_range_free(run, addr, pages)).then_some(addr);
+    let base = match hinted {
+        Some(base) => base,
+        None => {
+            let mut cursor = USER_MMAP_BASE;
+            loop {
+                let Some(end) = cursor.checked_add(length) else {
+                    return Err(MmapError::NoMemory);
+                };
+                if end > USER_MMAP_TOP {
+                    return Err(MmapError::NoMemory);
+                }
+                if mmap_range_free(run, cursor, pages) {
+                    break cursor;
+                }
+                cursor += FRAME_SIZE;
+            }
+        }
+    };
+
+    let mut mapped = 0usize;
+    while mapped < pages {
+        let Some(frame) = pmm::alloc_frame() else {
+            release_mapping(base, mapped);
+            return Err(MmapError::NoMemory);
+        };
+        let va = base + mapped * FRAME_SIZE;
+        if paging::map(va, frame, flags).is_err() {
+            pmm::free_frame(frame);
+            release_mapping(base, mapped);
+            return Err(MmapError::NoMemory);
+        }
+        // SAFETY: `frame` is a fresh PMM frame (RAM, identity-mapped supervisor
+        // RW) that was just mapped into the mmap window. Writing through the
+        // physical address cannot fault and keeps `SUM` off; zeroing means a
+        // user program never sees the heap or page-table contents that used the
+        // frame before it.
+        unsafe { core::ptr::write_bytes(frame as *mut u8, 0, FRAME_SIZE) };
+        mapped += 1;
+    }
+    insert_mmap_region(run, base, pages);
+    Ok(base)
+}
+
+/// `munmap`: unmap whole pages and forget the range.
+///
+/// `addr` must be page-aligned and `pages` non-zero (the caller rounded the
+/// byte length up). Every page of the range must currently belong to a tracked
+/// `mmap` mapping; a page of the image, the stack or an unmapped hole is
+/// `Invalid`, so a program cannot free memory it does not own. The tracker is
+/// rebuilt before anything is unmapped, which is what makes a full region table
+/// a clean `-ENOMEM` rather than a half-freed mapping.
+pub(crate) fn munmap(addr: usize, pages: usize) -> Result<(), MmapError> {
+    if pages == 0 || addr % FRAME_SIZE != 0 {
+        return Err(MmapError::Invalid);
+    }
+    let length = pages * FRAME_SIZE;
+    let Some(end) = addr.checked_add(length) else {
+        return Err(MmapError::Invalid);
+    };
+    if addr < USER_MMAP_BASE || end > USER_MMAP_TOP {
+        return Err(MmapError::Invalid);
+    }
+    let mut slot = RUN.lock();
+    let Some(run) = slot.as_mut() else {
+        return Err(MmapError::Invalid);
+    };
+    if !mmap_range_covered(run, addr, end) {
+        return Err(MmapError::Invalid);
+    }
+
+    let mut next = [MmapRegion::empty(); MAX_MMAP_REGIONS];
+    let mut next_count = 0usize;
+    for index in 0..run.mmap_count {
+        let region = run.mmap_regions[index];
+        let region_end = region.end();
+        if region_end <= addr || region.start >= end {
+            if next_count == MAX_MMAP_REGIONS {
+                return Err(MmapError::NoMemory);
+            }
+            next[next_count] = region;
+            next_count += 1;
+            continue;
+        }
+        if region.start < addr {
+            if next_count == MAX_MMAP_REGIONS {
+                return Err(MmapError::NoMemory);
+            }
+            next[next_count] = MmapRegion {
+                start: region.start,
+                pages: (addr - region.start) / FRAME_SIZE,
+            };
+            next_count += 1;
+        }
+        if region_end > end {
+            if next_count == MAX_MMAP_REGIONS {
+                return Err(MmapError::NoMemory);
+            }
+            next[next_count] = MmapRegion {
+                start: end,
+                pages: (region_end - end) / FRAME_SIZE,
+            };
+            next_count += 1;
+        }
+    }
+
+    // The page tables are consistent with the tracker by construction (this
+    // layer is the only writer), so an `unmap` failure here would mean a broken
+    // table, not a user error; ignoring it keeps the tracker and the frames in
+    // agreement instead of leaking everything above the first surprise.
+    release_mapping(addr, pages);
+    run.mmap_regions = next;
+    run.mmap_count = next_count;
+    coalesce_mmap_regions(run);
+    Ok(())
+}
+
+/// `mprotect`: rewrite the permission bits of every mapped user page in the
+/// range, keeping the frames in place.
+///
+/// The range must lie in the user window and every page must be a live user leaf
+/// (`U=1`, `R=1`) before the first entry is touched, so a bad argument changes
+/// nothing. The caller has already validated `bits` (W^X is enforced there).
+pub(crate) fn mprotect(addr: usize, pages: usize, bits: u64) -> Result<(), MmapError> {
+    if pages == 0 || addr % FRAME_SIZE != 0 {
+        return Err(MmapError::Invalid);
+    }
+    let Some(length) = pages.checked_mul(FRAME_SIZE) else {
+        return Err(MmapError::Invalid);
+    };
+    let Some(end) = addr.checked_add(length) else {
+        return Err(MmapError::Invalid);
+    };
+    if addr < elf::USER_BASE || end > USER_TOP {
+        return Err(MmapError::Invalid);
+    }
+
+    let mut page = addr;
+    while page < end {
+        let Some(flags) = paging::flags(page) else {
+            return Err(MmapError::Invalid);
+        };
+        if flags.bits() & (PTE_U | PTE_R) != PTE_U | PTE_R {
+            return Err(MmapError::Invalid);
+        }
+        page += FRAME_SIZE;
+    }
+
+    let flags = Flags::from_bits(bits);
+    page = addr;
+    while page < end {
+        paging::protect(page, flags).map_err(|_| MmapError::Invalid)?;
+        page += FRAME_SIZE;
+    }
+    Ok(())
+}
+
+/// Unmap and free every page the program mapped with `mmap`.
+///
+/// Called by the runner after the task is gone, next to [`release_heap`]. The
+/// page tables are walked by `paging::unmap`, so the frames come back even if a
+/// program unmapped part of a region without the tracker noticing (it cannot:
+/// `munmap` is the only path, and it updates both).
+fn release_mmap(run: &mut RunState) {
+    for index in 0..run.mmap_count {
+        let region = run.mmap_regions[index];
+        release_mapping(region.start, region.pages);
+        run.mmap_regions[index] = MmapRegion::empty();
+    }
+    run.mmap_count = 0;
 }
 
 /// Unmap the user stack pages and return the contiguous run to the PMM.

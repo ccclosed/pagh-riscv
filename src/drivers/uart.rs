@@ -243,6 +243,19 @@ pub fn put_byte(byte: u8) {
     });
 }
 
+/// True when [`try_get_byte`] would return a byte, without consuming it.
+///
+/// `poll` needs readiness without stealing the byte the next `read` is supposed
+/// to deliver; both the interrupt-fed ring and the pre-PLIC line-status path
+/// answer the same question.
+pub fn rx_ready() -> bool {
+    if RX_IRQ_ENABLED.load(Ordering::Acquire) {
+        !RX.is_empty()
+    } else {
+        read(LSR) & LSR_DATA_READY != 0
+    }
+}
+
 /// Read one byte if one has arrived, without blocking.
 ///
 /// Once receive interrupts are enabled this consumes the ring and nothing else:

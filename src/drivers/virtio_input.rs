@@ -721,6 +721,17 @@ pub fn try_key() -> Option<u8> {
     KEYBOARD.lock().as_mut().and_then(|keyboard| keyboard.pop())
 }
 
+/// True when [`try_key`] would return a byte, without consuming it.
+///
+/// `poll` uses this so a readiness scan never eats the byte the program's next
+/// `read(0)` expects.
+pub fn key_ready() -> bool {
+    KEYBOARD
+        .lock()
+        .as_ref()
+        .is_some_and(|keyboard| keyboard.tail != keyboard.head)
+}
+
 /// Drain both device queues: pointer events move the cursor, key events fill the
 /// keyboard ring. Called from the shell's idle loop.
 pub fn poll() -> usize {
