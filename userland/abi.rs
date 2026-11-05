@@ -669,7 +669,12 @@ fn thread_section() -> usize {
     }
     GATE.store(1, Ordering::SeqCst);
     let woken = futex_wake_word(GATE.as_ptr() as usize, 2);
-    check((0..=2).contains(&woken), 192, "futex wake count");
+    // Eight voluntary turns after both children announced READY are two full
+    // rounds of the four runnable tasks (shell, main, two children), so both
+    // children are parked in FUTEX_WAIT before the gate is set; the wake must
+    // therefore report both. If this ever races, the event is a real scheduler
+    // bug, not a timing assumption to paper over.
+    check(woken == 2, 192, "futex wake count");
 
     wait_until(
         || FINISHED.load(Ordering::SeqCst) == 2,
