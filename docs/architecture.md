@@ -547,7 +547,7 @@ User-страницы кладутся в **ту же** Sv39-карту с `U=1`
 | 80 | `fstat` | нативный `Stat` (24 B): mode/kind/size/ino; синтетика — 0o755/0o644 |
 | 61 | `getdents64` | снимок детей на `openat`; `Dirent` = 12 B заголовок + имя, выравнивание 8; курсор двигается только за скопированные записи |
 | 78 | `readlinkat` | цель ссылки без NUL (`lookup_path`, последняя ссылка не разыменовывается); не ссылка — `-EINVAL` |
-| 101 | `nanosleep` | `Timespec` проверяется, округляется вверх до тика; ждёт `timer::sleep_ticks` с временно разрешёнными прерываниями (иначе тики не идут), `rem` игнорируется |
+| 101 | `nanosleep` | `Timespec` проверяется, округляется вверх до тика; ждёт `timer::sleep_ticks` с временно разрешёнными прерываниями (иначе тики не идут), `rem` игнорируется; deliverable-сигнал прерывает сон по одному тику за раз и возвращает `-EINTR` |
 | 113 | `clock_gettime` | id 0/1 — тиковое время (`Timespec`, 10 ms); иначе `-EINVAL` |
 | 160 | `uname` | 5×16 B: `pagh`, `pagh-riscv`, `0.10.0`, версия пакета, `riscv64` |
 | 214 | `brk` | окно 1 MiB в `0x2000_0000..0x2010_0000`, постранично из PMM, кадры в `RunState`; за окном — `-ENOMEM`, частичный рост откатывается |
@@ -559,6 +559,11 @@ User-страницы кладутся в **ту же** Sv39-карту с `U=1`
 | 172 | `getpid` | id главного потока прогона |
 | 178 | `gettid` | id вызывающего потока |
 | 220 | `clone` | `clone(flags, stack, entry, arg)`: `CLONE_VM|CLONE_THREAD` обязательны, `CLONE_SETTLS` — `-ENOTSUP`; ребёнок стартует на `entry(arg)` и не возвращается из syscall |
+| 129 | `kill` | `pid > 0` — tid потока прогона, `0`/`-1` — все живые потоки; `SIGSTOP`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU` — `-ENOSYS` (job control нет); `sig = 0` — проверка существования; иначе `-ESRCH`/`-EINVAL` (9.3) |
+| 131 | `tgkill` | `tgid == getpid()`, `tid` — живой поток прогона; иначе `-ESRCH`; доставка как у `kill` |
+| 134 | `rt_sigaction` | `struct sigaction { handler, flags, mask, restorer }` (32 B), `sigsetsize = 8`; `SIG_DFL`/`SIG_IGN`/функция+`SA_RESTORER`; SIGKILL/SIGSTOP — `-EINVAL`; таблица 1..31 на прогон |
+| 135 | `rt_sigprocmask` | `SIG_BLOCK`/`UNBLOCK`/`SETMASK`, маска 8 B (бит `n-1`), per-thread; SIGKILL/SIGSTOP не блокируются; `oldset` до установки |
+| 139 | `rt_sigreturn` | проверка кадра `U|R`, magic и активного указателя; восстановление `TrapFrame`, маски и безопасного `sstatus`; `sepc` не сдвигается; без кадра — `-EINVAL`, плохой указатель — `-EFAULT` |
 | 34 | `mkdirat` | `dirfd`/`mode` игнорируются; `create_dir` родителя; 0o755 — дефолт VFS |
 | 35 | `unlinkat` | 0 — файл/ссылка (`lookup_path`, без разыменования последней ссылки), `0x200` — пустой каталог; тип проверяется до мутации: `-EISDIR`/`-ENOTDIR`, непустой — `-ENOTEMPTY` |
 | 36 | `symlinkat` | `a0` — цель (сырые байты, не резолвится), `a2` — путь; `create_symlink` |
@@ -623,7 +628,7 @@ User-страницы кладутся в **ту же** Sv39-карту с `U=1`
 `run <path>` читает файл **потоково** (заголовок, program headers, сегменты по
 ≤ 512 B) и не грузит его целиком в heap, поэтому работает и на 100 KiB, и на
 1 MiB — но одновременно исполняется один user-образ; нет `fork`/`exec`,
-сигналов, динамического ELF и per-process page table. 16 fd (не более одного —
+динамического ELF и per-process page table; сигналы — §9.3. 16 fd (не более одного —
 сокет), ровно один TCP-клиент без `listen`/`accept`/UDP/DNS/TLS, heap ровно
 1 MiB, `getdents64` без места в буфере отдаёт 0 (неотличимо от конца каталога —
 буфер на 264 B покрывает имя ext2), `openat`/`mkdirat` игнорируют `mode`,
@@ -721,6 +726,92 @@ wait/wake-rendezvous, `exit` не-главного потока и `exit_group` 
 его и run возвращает код главного». Кернел-часть `SELFTEST user-abi-syscalls`
 требует роста счётчиков `clones`/`futex_waits`/`futex_wakes` (и `exit_groups` с
 диском) и нулевого числа ожидающих после прогона. Маркер — `abi: threads ok`.
+
+### 9.3 Сигналы (POSIX-подобные)
+
+Реализация — `src/user/signal.rs`; это **не** Linux-сигналы: структуры и порядок
+полей свои, и документированы здесь. Один прогон — один процесс: таблица
+обработчиков (1..=31) живёт в прогоне и сбрасывается в `run_source`
+(`signal::begin_run`) и после teardown (`signal::clear_run`); pending-биты и
+blocked-маски — у каждого потока (`ThreadSignal`, до `MAX_TASKS` записей).
+
+**Syscall'ы** `kill` (129), `tgkill` (131), `rt_sigaction` (134),
+`rt_sigprocmask` (135), `rt_sigreturn` (139). `struct sigaction` —
+`{ handler, flags, mask, restorer }` (32 B, порядок pagh, не Linux). Для
+функции-обработчика обязателен `SA_RESTORER=0x04000000` и restorer в
+user-странице `U|X`; другие биты `flags` — `-EINVAL` (нет `SA_RESTART`,
+`SA_NODEFER`, `SA_RESETHAND`, `SA_SIGINFO`). `SIG_DFL=0`, `SIG_IGN=1`.
+`rt_sigprocmask` принимает `sigsetsize = 8`; сигнал `n` — бит `n-1`; биты
+SIGKILL/SIGSTOP отбрасываются; `oldset` пишется до изменения маски.
+
+**Доставка.** `kill`/`tgkill` только помечают pending (и `wake_task`, если
+`pending & !blocked` непусто); обработчик ставится на границе kernel→user —
+после syscall'а или после trap'а из U-mode (включая тик). Отсюда два следствия:
+работающий поток получает сигнал не позже одного тика, а `futex`-ожидание
+прерывается (`-EINTR`), потому что woken-поток проверяет pending сразу после
+`block_current`. `nanosleep` сам проверяет pending раз в тик и тоже возвращает
+`-EINTR`; `read(0)` неблокирующий, поэтому его сигнал не «прерывает» — он и так
+возвращает `-EAGAIN`. Заблокированный сигнал остаётся pending и доставляется
+после `rt_sigprocmask(SIG_UNBLOCK)`.
+
+**Кадр сигнала** — user-память ниже текущего `sp`, 16-выровнена, 432 B:
+
+| offset | поле |
+|---:|---|
+| 0 | сохранённый `TrapFrame` (264 B, ровно тот, что собрал `trap_entry`) |
+| 264 | blocked-маска, которую восстановит `rt_sigreturn` |
+| 272 | magic (`0x7061_6768_7369_6700`) |
+| 280 | restorer |
+| 288 | `siginfo` (128 B: signo, errno, code, затем `si_pid`/`si_uid` или `si_addr`) |
+| 416 | указатель на предыдущий кадр (для вложенных обработчиков) |
+| 424 | signum |
+
+Перед записью проверяется каждая страница `[frame, frame+432)` на `U|R|W`;
+плохой `sp` — это `[user] … killed: bad signal stack`, а не kernel fault.
+Обработчик входит с `a0 = signum`, `a1 = &frame.siginfo`, `ra = restorer`,
+`sp = frame`; его `ret` попадает в restorer, а тот делает `ecall 139`.
+`rt_sigreturn` проверяет `U|R` диапазон, magic, `signum` и что `sp` равен
+активному кадру этого потока, затем копирует сохранённый `TrapFrame` обратно и
+**не** сдвигает `sepc`. `sstatus` при этом не берётся из user-памяти, а
+пересобирается (`SPP=0`, `SIE=0`, `SUM=0`, `SPIE=1`), поэтому подделанный кадр
+не может запросить S-mode. Маска и указатель на предыдущий кадр
+восстанавливаются в том же trap-контексте (`SIE=0`), то есть атомарно
+относительно планировщика.
+
+**Default actions.** `SIG_DFL` для SIGTERM/SIGINT/SIGQUIT/SIGABRT/SIGSEGV/SIGILL/
+SIGFPE/SIGBUS/SIGKILL и остальных «фатальных» завершает **прогон**
+(`on_signal_death`: `kill_group` + `threads = 0`, как fault); SIGCHLD/SIGCONT/
+SIGURG/SIGWINCH игнорируются. Остановки (SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU) не
+реализованы: `kill` отвечает `-ENOSYS`, а SIGKILL/SIGSTOP нельзя поймать
+(`rt_sigaction` — `-EINVAL`) или заблокировать. `SIG_IGN` просто сбрасывает
+pending.
+
+**Синхронные fault'ы.** `deliver_fault` в `trap_dispatch`: illegal instruction →
+SIGILL, breakpoint → SIGTRAP, instruction/load/store page fault → SIGSEGV. Если
+для сигнала установлен реальный обработчик, кадр строится как обычно, и
+`sepc` сохранённого кадра указывает на faulting-инструкцию; без обработчика
+остаётся прежний `user::on_fault` (убить прогон с диагностикой). `SIG_IGN` для
+синхронного сигнала не делает инструкцию успешной, поэтому тоже уходит в
+`on_fault`.
+
+**Lock order.** `RUN → signal table` (id прогона читается до лока), а
+`scheduler → signal table` не бывает: цели `kill` резолвятся под
+scheduler-локом до взятия signal-лока, `wake_task` вызывается после его
+отпускания. Signal-лок никогда не удерживается через `copy_to_user`/`wake_task`;
+все его взятия маскируют прерывания, потому что `signal::interrupted` зовётся из
+`nanosleep` с `SIE = 1`.
+
+**Тесты.** `userland/abi.rs`, секция signals: установка обработчика с
+asm-символом `abi_sigrestorer`, `kill(getpid(), SIGUSR1)` и ровно один инкремент
+после `rt_sigreturn`; `kill(0)`/`kill(-1)`/`tgkill`; `SIG_IGN`; block → kill →
+unblock; `SIGKILL`/`SIGSTOP`/битый signum/sigsetsize →
+`-EINVAL`/`-ENOSYS`; неверный pid → `-ESRCH`; плохой указатель кадра →
+`-EFAULT`, вызов без кадра → `-EINVAL`; отдельный поток, заблокированный в
+futex, получает SIGUSR2 и видит `-EINTR`; отдельный поток с synchronous SIGSEGV
+завершается обработчиком, а прогон продолжается. Маркер — `abi: signals ok`;
+`SELFTEST user-abi-syscalls` требует роста счётчиков
+`actions`/`procmasks`/`kills`/`sigreturns`/`delivered`/`ignored` и нулевых
+`live_handlers`/`live_threads`/`live_pending` после прогона.
 
 ---
 
@@ -823,6 +914,7 @@ wait/wake-rendezvous, `exit` не-главного потока и `exit_group` 
   Отдельного VMM, mprotect, разделяемых страниц и per-process `satp` нет.
   Историческая справка: до этого лендинга `satp` не писался и адрес был физическим
   «по совпадению»; теперь это следствие identity-карты, а не отсутствия трансляции.
+  Сигналы есть (§9.3), но они per-run/per-thread и не меняют это утверждение.
 * **Планировщик есть, но политика одна**: round-robin по тику, без приоритетов,
   deadline wakeup-очереди и SMP; `Blocked`/`block_current`/`wake_task` есть только
   ради futex (9.2), блокирующего I/O и `sleep`-очереди поверх них нет; `sleep` в
@@ -833,8 +925,8 @@ wait/wake-rendezvous, `exit` не-главного потока и `exit_group` 
   и OpenPGP-проверка Debian-метаданных — следующий майлстоун, и `apt` до него не
   подключается (fail-closed важнее «поставить хоть что-нибудь»). User mode,
   syscall'ы, ELF и native ABI есть (M6b, раздел 9.1); userland — пять
-  ассемблерных/Rust-фикстур, libc/динамического ELF нет; `mmap`/`fork`/`exec` и
-  сигналов нет.
+  ассемблерных/Rust-фикстур, libc/динамического ELF нет; `mmap`/`fork`/`exec`
+  нет, а сигналы — узкое подмножество §9.3, не Linux-совместимый слой.
 * **Планировщик — только round-robin по таймеру**: нет приоритетов, sleep/wakeup-
   очереди, блокирующего I/O, SMP; слотов 16 (14 user-потоков на прогон), стек
   16 KiB, из них два системных. TLS/PI/requeue, `join`/`waitid` и `CLONE_SETTLS`

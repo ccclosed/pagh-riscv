@@ -92,6 +92,13 @@ const SYS_EXIT: usize = 93;
 const SYS_EXIT_GROUP: usize = 94;
 const SYS_SET_TID_ADDRESS: usize = 96;
 const SYS_FUTEX: usize = 98;
+// POSIX-style signals. Numbers are the RISC-V generic table; the structures
+// are pagh's own (see `pagh-api/docs/abi.md` and `src/user/signal.rs`).
+const SYS_KILL: usize = 129;
+const SYS_TGKILL: usize = 131;
+const SYS_RT_SIGACTION: usize = 134;
+const SYS_RT_SIGPROCMASK: usize = 135;
+const SYS_RT_SIGRETURN: usize = 139;
 const SYS_SCHED_YIELD: usize = 124;
 const SYS_GETPID: usize = 172;
 const SYS_GETTID: usize = 178;
@@ -127,6 +134,9 @@ const EIO: isize = -5;
 const EBADF: isize = -9;
 const EAGAIN: isize = -11;
 const ENOMEM: isize = -12;
+/// A blocking wait was interrupted by a deliverable signal; the handler runs
+/// before the syscall returns to the instruction after `ecall`.
+const EINTR: isize = -4;
 const EFAULT: isize = -14;
 const EEXIST: isize = -17;
 const ENOTDIR: isize = -20;
@@ -383,7 +393,7 @@ pub fn stats() -> Stats {
 }
 
 /// Count a bad user pointer and hand back the ABI's answer.
-fn fault() -> isize {
+pub(crate) fn fault() -> isize {
     FAULTS.fetch_add(1, Ordering::Relaxed);
     EFAULT
 }
@@ -942,6 +952,22 @@ pub fn dispatch(frame: &mut TrapFrame) {
             crate::user::exit_group(frame.a0 as u32)
         }
         SYS_SET_TID_ADDRESS => crate::user::thread_id() as isize,
+        SYS_KILL => crate::user::signal::kill(frame.a0 as isize, frame.a1 as isize),
+        SYS_TGKILL => crate::user::signal::tgkill(frame.a0, frame.a1, frame.a2 as isize),
+        SYS_RT_SIGACTION => {
+            crate::user::signal::rt_sigaction(frame.a0, frame.a1, frame.a2, frame.a3)
+        }
+        SYS_RT_SIGPROCMASK => {
+            crate::user::signal::rt_sigprocmask(frame.a0, frame.a1, frame.a2, frame.a3)
+        }
+        // `rt_sigreturn` replaces the whole trap frame and resumes the
+        // interrupted instruction: it must not fall through to the `sepc + 4`
+        // bump below. On an error nothing was restored, so the ordinary
+        // returning path applies.
+        SYS_RT_SIGRETURN => match crate::user::signal::sigreturn(frame) {
+            Ok(()) => return,
+            Err(error) => error,
+        },
         SYS_FUTEX => futex(frame.a0, frame.a1, frame.a2, frame.a3),
         SYS_CLONE => clone(frame.a0, frame.a1, frame.a2, frame.a3, frame.gp, frame.tp),
         SYS_SCHED_YIELD => {
@@ -1145,7 +1171,21 @@ fn futex(uaddr: usize, op: usize, val: usize, timeout: usize) -> isize {
             if deadline.is_some() && !crate::arch::riscv64::timer::running() {
                 return ETIMEDOUT;
             }
-            match crate::user::futex::wait(run_id, uaddr, deadline) {
+            // A signal that is already deliverable must not put this thread to
+            // sleep: the syscall is interruptible by contract, and the trap
+            // boundary delivers the handler right after this returns.
+            if crate::user::signal::interrupted() {
+                return EINTR;
+            }
+            let outcome = crate::user::futex::wait(run_id, uaddr, deadline);
+            // `kill` wakes a blocked waiter and marks the signal pending. The
+            // scheduler cannot tell a signal wake from a futex wake, so the
+            // pending mask is the witness; the handler still runs at the trap
+            // boundary, not here.
+            if crate::user::signal::interrupted() {
+                return EINTR;
+            }
+            match outcome {
                 Ok(crate::user::futex::WaitOutcome::Woken) => 0,
                 Ok(crate::user::futex::WaitOutcome::TimedOut) => ETIMEDOUT,
                 Err(crate::user::futex::WaitError::Full) => EAGAIN,
@@ -3098,10 +3138,27 @@ fn nanosleep(pointer: usize, remaining: usize) -> isize {
     }
     let was = csr::read_sstatus();
     csr::write_sstatus(was | csr::SSTATUS_SIE);
-    crate::arch::riscv64::timer::sleep_ticks(ticks);
+    // One tick at a time, so a signal that arrives mid-sleep is noticed within
+    // one tick period instead of after the whole duration. `sleep_ticks(1)` is
+    // the same wait loop the one-shot call used, with the same absolute tick
+    // deadline semantics summed over the requested count.
+    let mut left = ticks;
+    let mut interrupted = false;
+    while left > 0 {
+        crate::arch::riscv64::timer::sleep_ticks(1);
+        left -= 1;
+        if crate::user::signal::interrupted() {
+            interrupted = true;
+            break;
+        }
+    }
     csr::write_sstatus(was);
     SLEEPS.fetch_add(1, Ordering::Relaxed);
-    0
+    if interrupted {
+        EINTR
+    } else {
+        0
+    }
 }
 
 /// `struct Uname` from the ABI: five 16-byte fields.
@@ -3193,7 +3250,7 @@ fn read_path<'a>(pointer: usize, out: &'a mut [u8; PATH_CAPACITY]) -> Result<&'a
 /// because `SUM` only lifts the U-permission check — a store to a read-only
 /// user page (`.text`, `.rodata`) would otherwise become an S-mode page fault
 /// and halt the machine.
-fn user_range_valid(start: usize, end: usize, write: bool) -> bool {
+pub(crate) fn user_range_valid(start: usize, end: usize, write: bool) -> bool {
     if end < start {
         return false;
     }
@@ -3222,7 +3279,7 @@ fn user_range_valid(start: usize, end: usize, write: bool) -> bool {
 /// Validates the whole range before setting `SUM`, and restores `sstatus` from
 /// the value it entered with on every path — there is no early return between
 /// the two CSR writes.
-fn copy_from_user(dst: &mut [u8], src: usize) -> Result<(), isize> {
+pub(crate) fn copy_from_user(dst: &mut [u8], src: usize) -> Result<(), isize> {
     if dst.is_empty() {
         return Ok(());
     }
@@ -3264,7 +3321,7 @@ fn copy_from_user(dst: &mut [u8], src: usize) -> Result<(), isize> {
 
 /// Copy `src` to the user address `dst`. The write counterpart of
 /// [`copy_from_user`], with `W=1` added to the page validation.
-fn copy_to_user(dst: usize, src: &[u8]) -> Result<(), isize> {
+pub(crate) fn copy_to_user(dst: usize, src: &[u8]) -> Result<(), isize> {
     if src.is_empty() {
         return Ok(());
     }

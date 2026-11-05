@@ -9,9 +9,10 @@
 //! `getdents64("/")`. Any real failure returns a distinct non-zero code (and
 //! prints a diagnostic), which the selftest maps to FAIL.
 //!
-//! The thread section (`abi: threads ok`) runs before the filesystem split, so
-//! both the disk and the serial-only boot exercise `clone`/`gettid`/futex and
-//! thread exit. With `/mnt` the fixture ends with `exit_group(0)` while a thread
+//! The thread section (`abi: threads ok`) and the signal section
+//! (`abi: signals ok`) run before the filesystem split, so both the disk and
+//! the serial-only boot exercise `clone`/`gettid`/futex/thread exit and the
+//! POSIX signal path (handler, restorer, `rt_sigreturn`, masks). With `/mnt` the fixture ends with `exit_group(0)` while a thread
 //! is blocked in `FUTEX_WAIT`; without it, main exits 77 first and a tail thread
 //! with a 30 ms futex deadline must keep the run alive — the run still returns
 //! 77, main's code.
@@ -33,8 +34,41 @@ _start:
     li      a7, 93
     ecall
 1:  j       1b
+
+    /* The libpagh-style restorer: the kernel enters a signal handler with
+       `ra = abi_sigrestorer` and `sp` at the signal frame, so the handler's
+       ordinary `ret` lands here. `rt_sigreturn` (139) restores the interrupted
+       context; it must never return. If it did, the only honest answer is a
+       distinct exit code. */
+    .align  2
+    .globl  abi_sigrestorer
+abi_sigrestorer:
+    li      a7, 139
+    ecall
+    li      a7, 93
+    li      a0, 1
+    ecall
+2:  j       2b
+
+    /* Call rt_sigreturn with an arbitrary frame pointer and restore the real
+       `sp` afterwards, which only happens on the error path (a successful
+       sigreturn replaces the whole trap frame and never resumes here). */
+    .align  2
+    .globl  abi_bad_sigreturn
+abi_bad_sigreturn:
+    mv      t0, sp
+    mv      sp, a0
+    li      a7, 139
+    ecall
+    mv      sp, t0
+    ret
 "#
 );
+
+extern "C" {
+    fn abi_sigrestorer();
+    fn abi_bad_sigreturn(pointer: usize) -> isize;
+}
 
 // ─── syscall wrapper ───────────────────────────────────────────────────────
 
@@ -141,6 +175,11 @@ const SYS_FUTEX: usize = 98;
 const SYS_SCHED_YIELD: usize = 124;
 const SYS_GETTID: usize = 178;
 const SYS_CLONE: usize = 220;
+const SYS_KILL: usize = 129;
+const SYS_TGKILL: usize = 131;
+const SYS_RT_SIGACTION: usize = 134;
+const SYS_RT_SIGPROCMASK: usize = 135;
+const SYS_RT_SIGRETURN: usize = 139;
 
 const CLONE_VM: usize = 0x100;
 const CLONE_FS: usize = 0x200;
@@ -155,6 +194,20 @@ const FUTEX_WAKE: usize = 1;
 const FUTEX_PRIVATE_FLAG: usize = 128;
 const FUTEX_WAKE_OP: usize = 5;
 const FUTEX_REQUEUE: usize = 3;
+
+// ─── signals ───────────────────────────────────────────────────────────────
+const SA_RESTORER: usize = 0x0400_0000;
+const SIG_DFL: usize = 0;
+const SIG_IGN: usize = 1;
+const SIGKILL: usize = 9;
+const SIGUSR1: usize = 10;
+const SIGSEGV: usize = 11;
+const SIGUSR2: usize = 12;
+const SIGCHLD: usize = 17;
+const SIGSTOP: usize = 19;
+const SIG_BLOCK: usize = 0;
+const SIG_UNBLOCK: usize = 1;
+const SIG_SETMASK: usize = 2;
 
 /// Tag in the low 16 bits of a thread's `arg`, so the entry can prove it got
 /// exactly the value the parent passed.
@@ -187,6 +240,8 @@ const POLLOUT: i16 = 0x4;
 const POLLHUP: i16 = 0x10;
 
 const ENOENT: isize = -2;
+const ESRCH: isize = -3;
+const EINTR: isize = -4;
 const EBADF: isize = -9;
 const EAGAIN: isize = -11;
 const EFAULT: isize = -14;
@@ -222,6 +277,14 @@ struct Stat {
 struct Timespec {
     seconds: i64,
     nanos: i64,
+}
+
+#[repr(C)]
+struct SigAction {
+    handler: usize,
+    flags: usize,
+    mask: u64,
+    restorer: usize,
 }
 
 #[repr(C)]
@@ -462,6 +525,29 @@ fn wait_until(mut condition: impl FnMut() -> bool, code: i32, what: &str) {
         }
         let _ = syscall1(SYS_SCHED_YIELD, 0);
         turns += 1;
+    }
+    fail(code, what);
+}
+
+/// Like `wait_until`, but with a real deadline so a setup failure cannot spin
+/// the whole selftest: sleeps 10 ms per turn (the signal tests need a blocked
+/// thread, which only a sleeping main thread reliably gives it time to reach).
+fn wait_millis(mut condition: impl FnMut() -> bool, millis: usize, code: i32, what: &str) {
+    let mut waited = 0usize;
+    while waited <= millis {
+        if condition() {
+            return;
+        }
+        let pause = Timespec {
+            seconds: 0,
+            nanos: 10_000_000,
+        };
+        let _ = syscall2(
+            SYS_NANOSLEEP,
+            &pause as *const Timespec as usize,
+            0,
+        );
+        waited += 10;
     }
     fail(code, what);
 }
@@ -765,6 +851,404 @@ fn exit_group_case(stack: usize) {
     print("abi: exit_group ok\n");
     let _ = syscall1(SYS_EXIT_GROUP, 0);
     loop {}
+}
+
+// ─── signals ───────────────────────────────────────────────────────────────
+
+/// Hits recorded by the SIGUSR1 handler. A signal is only proved by user code
+/// observing its effect after `rt_sigreturn`, not by `kill` returning 0.
+static SIGUSR1_HITS: AtomicUsize = AtomicUsize::new(0);
+static SIGSEGV_HITS: AtomicUsize = AtomicUsize::new(0);
+static WAKE_GATE: AtomicU32 = AtomicU32::new(0);
+static WAKE_READY: AtomicUsize = AtomicUsize::new(0);
+static WAKE_RESULT: AtomicUsize = AtomicUsize::new(0);
+static WAKE_HITS: AtomicUsize = AtomicUsize::new(0);
+
+extern "C" fn sigusr1_handler(_signum: usize, _info: usize) {
+    SIGUSR1_HITS.fetch_add(1, Ordering::SeqCst);
+}
+
+/// SIGSEGV handler for a child thread that deliberately loads address 0.
+///
+/// Returning through `rt_sigreturn` would re-execute the faulting load forever,
+/// so the handler proves synchronous delivery and then ends *its thread*
+/// (`exit`, syscall 93): the run's other threads must survive.
+extern "C" fn sigsegv_handler(_signum: usize, _info: usize) {
+    SIGSEGV_HITS.fetch_add(1, Ordering::SeqCst);
+    let _ = syscall1(SYS_EXIT, 0);
+    loop {}
+}
+
+extern "C" fn sigsegv_child(_arg: usize) -> ! {
+    // SAFETY: the load is deliberate: address 0 is unmapped, and the kernel
+    // must deliver SIGSEGV to the installed handler instead of killing the run.
+    unsafe { core::ptr::read_volatile(0 as *const u64) };
+    let _ = syscall1(SYS_EXIT, 3);
+    loop {}
+}
+
+/// SIGUSR2 handler for the futex-wake test (runs in the blocked child).
+extern "C" fn sigusr2_handler(_signum: usize, _info: usize) {
+    WAKE_HITS.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Block in `FUTEX_WAIT` on a word nobody wakes. A `kill` must interrupt the
+/// wait with `-EINTR`, run this thread's handler, and only then resume the code
+/// after the syscall.
+extern "C" fn wake_child(_arg: usize) -> ! {
+    WAKE_READY.store(1, Ordering::SeqCst);
+    let timeout = Timespec {
+        seconds: 2,
+        nanos: 0,
+    };
+    let result = futex_wait_word(
+        WAKE_GATE.as_ptr() as usize,
+        0,
+        &timeout as *const Timespec as usize,
+    );
+    WAKE_RESULT.store(result as usize, Ordering::SeqCst);
+    let _ = syscall1(SYS_EXIT, 0);
+    loop {}
+}
+
+fn rt_sigaction(signum: usize, action: *const SigAction, old: *mut SigAction) -> isize {
+    syscall4(
+        SYS_RT_SIGACTION,
+        signum,
+        action as usize,
+        old as usize,
+        8,
+    )
+}
+
+fn rt_sigprocmask(how: usize, set: *const u64, old: *mut u64) -> isize {
+    syscall4(SYS_RT_SIGPROCMASK, how, set as usize, old as usize, 8)
+}
+
+fn kill(pid: isize, signal: usize) -> isize {
+    syscall2(SYS_KILL, pid as usize, signal)
+}
+
+fn tgkill(tgid: usize, tid: usize, signal: usize) -> isize {
+    syscall3(SYS_TGKILL, tgid, tid, signal)
+}
+
+/// The signal acceptance section (runs with or without `/mnt`).
+///
+/// It proves the handler path end to end: the kernel enters the Rust handler at
+/// the syscall boundary, the handler's `ret` reaches the assembly restorer, and
+/// `rt_sigreturn` resumes the instruction after `kill` with `SIGUSR1_HITS`
+/// incremented exactly once. The ordering around the mask is the other half:
+/// a blocked signal stays pending, `sched_yield` cannot consume it, and
+/// clearing the block delivers it. All the negative cases (`-EINVAL`,
+/// `-ESRCH`, `-ENOSYS`, `-EFAULT`) are checked with the same wrappers.
+fn signal_section(stack: usize) {
+    let pid = syscall1(172, 0);
+    let tid = syscall1(SYS_GETTID, 0);
+    check(pid > 0 && tid > 0, 210, "getpid/gettid for signals");
+
+    let mut action = SigAction {
+        handler: sigusr1_handler as *const () as usize,
+        flags: SA_RESTORER,
+        mask: 0,
+        restorer: abi_sigrestorer as *const () as usize,
+    };
+    let mut old = SigAction {
+        handler: 0,
+        flags: 0,
+        mask: 0,
+        restorer: 0,
+    };
+
+    // ── invalid arguments ──
+    check(rt_sigaction(0, &action, core::ptr::null_mut()) == EINVAL, 211, "sigaction 0");
+    check(
+        rt_sigaction(32, &action, core::ptr::null_mut()) == EINVAL,
+        212,
+        "sigaction 32",
+    );
+    check(
+        rt_sigaction(SIGKILL, &action, core::ptr::null_mut()) == EINVAL,
+        213,
+        "sigaction SIGKILL",
+    );
+    check(
+        rt_sigaction(SIGSTOP, &action, core::ptr::null_mut()) == EINVAL,
+        214,
+        "sigaction SIGSTOP",
+    );
+    check(
+        syscall4(SYS_RT_SIGACTION, SIGUSR1, &action as *const _ as usize, 0, 7) == EINVAL,
+        215,
+        "sigaction sigsetsize",
+    );
+    check(
+        syscall4(SYS_RT_SIGACTION, SIGUSR1, 0xdead_0000, 0, 8) == EFAULT,
+        216,
+        "sigaction bad pointer",
+    );
+    check(
+        syscall4(SYS_RT_SIGPROCMASK, SIG_BLOCK, 0, 0, 7) == EINVAL,
+        217,
+        "sigprocmask sigsetsize",
+    );
+    check(
+        syscall4(SYS_RT_SIGPROCMASK, 9, 0, 0, 8) == EINVAL,
+        218,
+        "sigprocmask how",
+    );
+
+    // The initial disposition is SIG_DFL, including the returned oldact.
+    check(rt_sigaction(SIGUSR1, core::ptr::null(), &mut old) == 0, 219, "query SIGUSR1");
+    check(
+        old.handler == SIG_DFL && old.flags == 0 && old.mask == 0 && old.restorer == 0,
+        220,
+        "initial disposition",
+    );
+    check(rt_sigaction(SIGUSR1, &action, &mut old) == 0, 221, "install SIGUSR1");
+    check(old.handler == SIG_DFL, 222, "oldact after install");
+    // A host-handler without a restorer is refused: this kernel has no vDSO
+    // trampoline, and entering a handler whose `ret` goes to 0 would fault.
+    action.flags = 0;
+    check(rt_sigaction(SIGUSR1, &action, core::ptr::null_mut()) == EINVAL, 223, "no restorer");
+
+    // ── sending ──
+    check(kill(pid, 0) == 0, 224, "kill sig 0");
+    check(kill(pid, 32) == EINVAL, 225, "kill bad signal");
+    check(kill(pid, SIGSTOP) == ENOSYS, 226, "kill SIGSTOP");
+    check(kill(pid + 1, SIGUSR1) == ESRCH, 227, "kill unknown tid");
+    check(kill(pid, SIGUSR1) == 0, 228, "kill SIGUSR1");
+    check(
+        SIGUSR1_HITS.load(Ordering::SeqCst) == 1,
+        229,
+        "handler ran once",
+    );
+    check(kill(0, SIGUSR1) == 0, 230, "kill(0)");
+    check(
+        SIGUSR1_HITS.load(Ordering::SeqCst) == 2,
+        231,
+        "kill(0) delivered",
+    );
+    check(kill(-1, SIGUSR1) == 0, 232, "kill(-1)");
+    check(
+        SIGUSR1_HITS.load(Ordering::SeqCst) == 3,
+        233,
+        "kill(-1) delivered",
+    );
+    check(tgkill(pid as usize, tid as usize, SIGUSR1) == 0, 234, "tgkill");
+    check(
+        SIGUSR1_HITS.load(Ordering::SeqCst) == 4,
+        235,
+        "tgkill delivered",
+    );
+    check(
+        tgkill(pid as usize + 1, tid as usize, SIGUSR1) == ESRCH,
+        236,
+        "tgkill wrong tgid",
+    );
+
+    // ── SIG_IGN and the default-ignore family ──
+    let ignore = SigAction {
+        handler: SIG_IGN,
+        flags: 0,
+        mask: 0,
+        restorer: 0,
+    };
+    check(
+        rt_sigaction(SIGUSR2, &ignore, core::ptr::null_mut()) == 0,
+        237,
+        "install SIG_IGN",
+    );
+    check(kill(pid, SIGUSR2) == 0, 238, "kill ignored");
+    check(kill(pid, SIGCHLD) == 0, 239, "kill SIGCHLD (default ignore)");
+    check(
+        SIGUSR1_HITS.load(Ordering::SeqCst) == 4,
+        240,
+        "ignored signals did not run the handler",
+    );
+
+    // ── block / pending / unblock ──
+    let mask: u64 = 1 << (SIGUSR1 - 1);
+    let mut oldmask: u64 = u64::MAX;
+    check(rt_sigprocmask(SIG_BLOCK, &mask, &mut oldmask) == 0, 241, "block SIGUSR1");
+    check(oldmask == 0, 242, "old mask on block");
+    check(kill(pid, SIGUSR1) == 0, 243, "kill blocked SIGUSR1");
+    for _ in 0..100 {
+        let _ = syscall1(SYS_SCHED_YIELD, 0);
+    }
+    check(
+        SIGUSR1_HITS.load(Ordering::SeqCst) == 4,
+        244,
+        "blocked signal stayed pending",
+    );
+    let mut current: u64 = 0;
+    check(rt_sigprocmask(SIG_BLOCK, core::ptr::null(), &mut current) == 0, 245, "query mask");
+    check(current & mask == mask, 246, "blocked bit visible");
+    check(rt_sigprocmask(SIG_UNBLOCK, &mask, core::ptr::null_mut()) == 0, 247, "unblock");
+    check(
+        SIGUSR1_HITS.load(Ordering::SeqCst) == 5,
+        248,
+        "pending signal delivered on unblock",
+    );
+
+    // SIG_SETMASK and oldset.
+    let everything: u64 = u64::MAX;
+    check(
+        rt_sigprocmask(SIG_SETMASK, &everything, &mut current) == 0,
+        249,
+        "setmask everything",
+    );
+    check(current == 0, 250, "oldset before setmask");
+    check(
+        rt_sigprocmask(SIG_SETMASK, &0u64, core::ptr::null_mut()) == 0,
+        251,
+        "clear mask",
+    );
+    // SIGKILL cannot be blocked: the bit is dropped, not silently counted.
+    let kill_only: u64 = 1 << (SIGKILL - 1);
+    check(rt_sigprocmask(SIG_BLOCK, &kill_only, core::ptr::null_mut()) == 0, 252, "block SIGKILL");
+    check(rt_sigprocmask(SIG_BLOCK, core::ptr::null(), &mut current) == 0, 253, "query after SIGKILL");
+    check(current & kill_only == 0, 254, "SIGKILL not blockable");
+
+    // ── a non-main thread: kill wakes a `FUTEX_WAIT` and the handler runs ──
+    let usr2 = SigAction {
+        handler: sigusr2_handler as *const () as usize,
+        flags: SA_RESTORER,
+        mask: 0,
+        restorer: abi_sigrestorer as *const () as usize,
+    };
+    check(
+        rt_sigaction(SIGUSR2, &usr2, core::ptr::null_mut()) == 0,
+        255,
+        "install SIGUSR2",
+    );
+    WAKE_READY.store(0, Ordering::SeqCst);
+    WAKE_RESULT.store(0, Ordering::SeqCst);
+    WAKE_HITS.store(0, Ordering::SeqCst);
+    let wake_tid = spawn_thread(
+        THREAD_FLAGS,
+        stack,
+        wake_child as *const () as usize,
+        0,
+    );
+    check(wake_tid > 0, 256, "spawn futex waiter");
+    wait_millis(
+        || WAKE_READY.load(Ordering::SeqCst) == 1,
+        1000,
+        257,
+        "waiter ready",
+    );
+    // Give the child time to actually block: `wake_task` only finds `Blocked`.
+    let settle = Timespec { seconds: 0, nanos: 30_000_000 };
+    let _ = syscall2(SYS_NANOSLEEP, &settle as *const Timespec as usize, 0);
+    check(kill(wake_tid, SIGUSR2) == 0, 259, "kill blocked thread");
+    wait_millis(
+        || kill(wake_tid, 0) == ESRCH,
+        3000,
+        260,
+        "waiter exited after kill",
+    );
+    check(
+        WAKE_HITS.load(Ordering::SeqCst) == 1,
+        261,
+        "handler ran in the woken thread",
+    );
+    check(
+        WAKE_RESULT.load(Ordering::SeqCst) as isize == EINTR,
+        262,
+        "futex returned -EINTR",
+    );
+    let dfl_usr2 = SigAction {
+        handler: SIG_DFL,
+        flags: 0,
+        mask: 0,
+        restorer: 0,
+    };
+    check(
+        rt_sigaction(SIGUSR2, &dfl_usr2, core::ptr::null_mut()) == 0,
+        263,
+        "restore SIGUSR2",
+    );
+
+    // ── a synchronous fault with a handler: the run survives the child ──
+    let segv = SigAction {
+        handler: sigsegv_handler as *const () as usize,
+        flags: SA_RESTORER,
+        mask: 0,
+        restorer: abi_sigrestorer as *const () as usize,
+    };
+    check(
+        rt_sigaction(SIGSEGV, &segv, core::ptr::null_mut()) == 0,
+        264,
+        "install SIGSEGV",
+    );
+    SIGSEGV_HITS.store(0, Ordering::SeqCst);
+    let segv_tid = spawn_thread(
+        THREAD_FLAGS,
+        stack,
+        sigsegv_child as *const () as usize,
+        0,
+    );
+    check(segv_tid > 0, 265, "spawn faulting thread");
+    wait_millis(
+        || SIGSEGV_HITS.load(Ordering::SeqCst) == 1,
+        1000,
+        266,
+        "SIGSEGV handler ran",
+    );
+    wait_millis(
+        || kill(segv_tid, 0) == ESRCH,
+        1000,
+        267,
+        "faulting thread exited",
+    );
+    check(
+        SIGSEGV_HITS.load(Ordering::SeqCst) == 1,
+        268,
+        "SIGSEGV delivered once",
+    );
+    let dfl_segv = SigAction {
+        handler: SIG_DFL,
+        flags: 0,
+        mask: 0,
+        restorer: 0,
+    };
+    check(
+        rt_sigaction(SIGSEGV, &dfl_segv, core::ptr::null_mut()) == 0,
+        269,
+        "restore SIGSEGV",
+    );
+
+    // ── rt_sigreturn without a frame / with a bad frame pointer ──
+    check(
+        syscall1(SYS_RT_SIGRETURN, 0) == EINVAL,
+        270,
+        "sigreturn without a frame",
+    );
+    // SAFETY: the assembly helper saves the real `sp`, calls the syscall with
+    // an unmapped frame pointer (which must return `-EFAULT`, not restore a
+    // frame), and then restores `sp` before `ret`.
+    check(
+        unsafe { abi_bad_sigreturn(0xdead_0000) } == EFAULT,
+        256,
+        "sigreturn bad frame pointer",
+    );
+
+    // Leave SIGUSR1 at SIG_DFL: the run's handler table is torn down with the
+    // run, but a passing fixture should not rely on that teardown.
+    let dfl = SigAction {
+        handler: SIG_DFL,
+        flags: 0,
+        mask: 0,
+        restorer: 0,
+    };
+    check(rt_sigaction(SIGUSR1, &dfl, core::ptr::null_mut()) == 0, 272, "restore SIG_DFL");
+    check(
+        SIGUSR1_HITS.load(Ordering::SeqCst) == 5,
+        273,
+        "signal count at the end",
+    );
+    print("abi: signals ok\n");
 }
 
 // ─── the fixture ───────────────────────────────────────────────────────────
@@ -1762,6 +2246,11 @@ pub extern "C" fn abi_main() -> i32 {
 
     // ── native threads: clone/gettid/futex/thread exit (runs with or without /mnt) ──
     let thread_stack = thread_section();
+
+    // ── signals: handlers, masks, pending delivery, rt_sigreturn (runs with or
+    //    without /mnt; the child threads above have all exited, so kill(0) and
+    //    kill(-1) address exactly the main thread) ──
+    signal_section(thread_stack);
 
     // ── the filesystem half: skip when the selftest could not provide /mnt ──
     let path = b"/mnt/abi-syscalls.txt\0";

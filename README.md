@@ -206,11 +206,11 @@ SELFTEST SUMMARY: 7/7 passed
 | Файловая система (ext2) | готово | чтение/запись файлов (direct + single/double indirect), truncate, каталоги, create/unlink/mkdir/rmdir/rename, симлинки; совместимо с образом хостового `mkfs.ext2 -t ext2`; форматируется только пустое устройство (MBR/GPT/чужие данные — отказ с причиной); журнала/WAL нет | `src/fs/ext2/`, `src/fs/format_policy.rs` |
 | VFS | готово | `VfsNode`, синтетический корень, монтирование в `/mnt`, два примитива разрешения путей (`lookup_path` без последней симлинки / `walk` с переходом и бюджетом) | `src/vfs/mod.rs` |
 | Планировщик, потоки ядра (M6a) | готово | контекстный switch (callee-saved ABI), до 16 слотов (14 user-потоков на прогон), round-robin, квант 8 тиков, стек 16 KiB + guard из PMM, состояния `Ready/Running/Blocked/Exited`, `block_current`/`wake_task` с тиковым дедлайном, вытеснение тиком таймера из trap-контекста (включая вытеснение U-mode), `tasks`/`spawn`/`yield`; exit возвращает кадры | `src/arch/riscv64/switch.rs`, `src/task/` |
-| User mode, syscalls, ELF, native ABI (M6b) | готово | `sret` в U-mode (`SPP=0`, `SPIE=1`, `SUM=0`, `sscratch`-контракт); нативные потоки `clone`/`gettid`/`set_tid_address`/`exit`/`exit_group`/`futex` (общие RunState, файловая таблица, heap и mmap; своё ядро-стек и user-стек вызывающего), фьютексы `WAIT`/`WAKE`; вход `a0=argc`, `a1=argv`, SysV-кадр `argc/argv/envp` с `argv[0]` как набран и `PWD=<cwd>`; `ecall`-диспетчер: `read`/`write`/`openat`/`close`/`lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/`readlinkat`/`exit`/`sched_yield`/`getpid` + `mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`/`ftruncate` (мутации через `parent_and_leaf` + `walk(parent, true)`, per-run режим для `fstat`), `sepc+4`, таблица 16 fd на прогон, `copy_from_user`/`copy_to_user` с проверкой `U/R/W` и `SUM` вокруг копии, heap-окно 1 MiB с возвратом кадров; ELF64-загрузчик с откатом кадров и **потоковым чтением** `ImageSource` (сегменты кусками ≤ 512 B, без буфера размером с файл), `run <path> [args...]` до 1 MiB и фикстуры `demo`/`fault`/`spin`/`argv`/`abi`; BSD-сокеты `socket`/`connect`/`sendto`/`recvfrom`/`setsockopt`/`getsockopt`/`shutdown` (один TCP-клиент, IPv4-литералы) и маршрутизация `read`/`write`/`close` на сокет; fault из U убивает только задачу; таймер вытесняет U-mode | `src/user/`, `userland/` |
+| User mode, syscalls, ELF, native ABI (M6b) | готово | `sret` в U-mode (`SPP=0`, `SPIE=1`, `SUM=0`, `sscratch`-контракт); нативные потоки `clone`/`gettid`/`set_tid_address`/`exit`/`exit_group`/`futex` (общие RunState, файловая таблица, heap и mmap; своё ядро-стек и user-стек вызывающего), фьютексы `WAIT`/`WAKE`; вход `a0=argc`, `a1=argv`, SysV-кадр `argc/argv/envp` с `argv[0]` как набран и `PWD=<cwd>`; `ecall`-диспетчер: `read`/`write`/`openat`/`close`/`lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/`readlinkat`/`exit`/`sched_yield`/`getpid` + `mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`/`ftruncate` (мутации через `parent_and_leaf` + `walk(parent, true)`, per-run режим для `fstat`), `sepc+4`, таблица 16 fd на прогон, `copy_from_user`/`copy_to_user` с проверкой `U/R/W` и `SUM` вокруг копии, heap-окно 1 MiB с возвратом кадров; ELF64-загрузчик с откатом кадров и **потоковым чтением** `ImageSource` (сегменты кусками ≤ 512 B, без буфера размером с файл), `run <path> [args...]` до 1 MiB и фикстуры `demo`/`fault`/`spin`/`argv`/`abi`; BSD-сокеты `socket`/`connect`/`sendto`/`recvfrom`/`setsockopt`/`getsockopt`/`shutdown` (один TCP-клиент, IPv4-литералы) и маршрутизация `read`/`write`/`close` на сокет; POSIX-подобные сигналы `kill`/`tgkill`/`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn` (обработчики на прогон, pending/blocked на поток, user-кадр 432 B с restorer'ом, synchronous SIGSEGV/SIGILL/SIGTRAP при установленном обработчике); fault из U без обработчика убивает задачу; таймер вытесняет U-mode | `src/user/`, `src/user/signal.rs`, `userland/` |
 | Сеть (M7) | готово | virtio-net (modern, polled) + свой стек: Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP-клиент, DNS-резолвер, `net`/`dhcp`/`ping`/`dns`/`http`; без smoltcp и внешних крейтов. Для userland — один active-open TCP-сокет (`AF_INET`/`SOCK_STREAM`, IPv4-литерал), syscall'ы которого сами опрашивают NIC; `read`/`write` работают на сокете | `src/net/`, `src/drivers/virtio_net.rs`, `src/user/syscall.rs` |
 | Пакеты (`pkg`) | MVP | нативный установщик (не apt): плоский `index` и `.ppkg` с репозитория по **plain HTTP** (`http://IP:port/`, в QEMU хост — `10.0.2.2`), потоковая загрузка в `/mnt/pkg` кусками 4 KiB, шлюз «размер + SHA-256 из индекса» **до** разбора `PPKG0001`; `kind=app` → `/mnt/bin/<name>`, `applet-bundle` → `/mnt/bin/paghbox` + симлинки; манифест в `/mnt/pkg/<name>.manifest`; TLS/OpenPGP/apt по-прежнему нет | `src/pkg/` |
 | apt / TLS / OpenPGP | **нет** | apt намеренно не подключён, пока нет vendored TLS + проверки подписей Debian; `pkg` — отдельный нативный путь для портов | — |
-| Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 4 блока/указателя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 10 user-mode (ABI-фикстуры `argv`/`abi` с секцией потоков и фьютексов; 10/10 с диском, 8/10 + 2 SKIP без `/mnt`) + 11 сети (идемпотентность по ledger'у), QEMU-smoke в шести режимах (serial, ramfb, диск-fresh, диск-existing, net, keyboard), установка пакета проверяется отдельным тестом `pkg`, живой сокетный прогон — `tools/test_sockets.py` (не в CI); проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/net/selftest.rs`, `src/pkg/`, `.github/smoke.py`, `tools/` |
+| Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 4 блока/указателя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 10 user-mode (ABI-фикстуры `argv`/`abi` с секциями потоков/фьютексов и сигналов — обработчик, restorer, `rt_sigreturn`, pending/blocked, SIG_IGN, EINTR на futex, synchronous SIGSEGV, негативные коды; 10/10 с диском, 8/10 + 2 SKIP без `/mnt`) + 11 сети (идемпотентность по ledger'у), QEMU-smoke в шести режимах (serial, ramfb, диск-fresh, диск-existing, net, keyboard), установка пакета проверяется отдельным тестом `pkg`, живой сокетный прогон — `tools/test_sockets.py` (не в CI); проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/net/selftest.rs`, `src/pkg/`, `.github/smoke.py`, `tools/` |
 | CI | готово | `fmt`, debug/release build, QEMU-smoke в шести режимах: serial, ramfb, диск-fresh (формат/монтирование/запись), диск-existing (повторная загрузка читает файл), net (DHCP + ping шлюза), keyboard (virtio-keyboard печатает `help`/`halt` через монитор QEMU); во всех приложен virtio-tablet, в keyboard — ещё и virtio-keyboard | `.github/workflows/ci.yml` |
 
 ---
@@ -317,6 +317,11 @@ selftest        # + SELFTEST user-*: 10/10 с /mnt (без диска 8/10 + 2 S
 | 94 | `exit_group` | завершает все потоки прогона (готовые и заблокированные) и возвращает код главного, если он уже вышел, иначе код вызывающего; не возвращается |
 | 220 | `clone` | нативный `clone(flags, stack, entry, arg)`: `CLONE_VM|CLONE_THREAD` обязательны, `CLONE_FS/FILES/SIGHAND` принимаются (общие и так), `CLONE_SETTLS` — `-ENOTSUP`, неизвестный бит — `-EINVAL`; дочерний поток стартует в U-mode на `entry(arg)` со `sp=stack` и не возвращается из syscall (и `entry` не должен возвращаться — трамплина нет); родитель получает tid (>0) |
 | 98 | `futex` | `uaddr, op, val, timeout, uaddr2, val3`: `FUTEX_WAIT` (0) проверяет `*uaddr == val` и блокирует до `FUTEX_WAKE`/тикового дедлайна; `FUTEX_WAKE` (1) будит не больше `val`; `FUTEX_PRIVATE_FLAG` принимается; `WAKE_OP`/requeue/PI — `-ENOSYS`; `-EAGAIN`/`-ETIMEDOUT`/`-ENOMEM`, как в POSIX |
+| 129 | `kill` | `pid > 0` — tid потока прогона, `0`/`-1` — все живые потоки; `sig = 0` — только проверка существования; неизвестный pid — `-ESRCH`, signum вне 0..31 — `-EINVAL`; SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU — `-ENOSYS` (job control нет); сигнал помечается pending, а заблокированный `FUTEX_WAIT` будится (wait вернёт `-EINTR`) |
+| 131 | `tgkill` | `tgid` обязан совпадать с `getpid()`, `tid` — живой поток прогона; иначе `-ESRCH`; доставка как у `kill` |
+| 134 | `rt_sigaction` | `struct sigaction { handler, flags, mask, restorer }` (32 B), `sigsetsize = 8`; `SIG_DFL=0`, `SIG_IGN=1`; для функции обязательны `SA_RESTORER=0x04000000` и restorer в user-exec странице, другие биты flags — `-EINVAL`; SIGKILL/SIGSTOP — `-EINVAL`; таблица 1..31 на прогон |
+| 135 | `rt_sigprocmask` | `how` 0/1/2 (`SIG_BLOCK`/`SIG_UNBLOCK`/`SIG_SETMASK`), маска 8 B, сигнал `n` — бит `n-1`; маска per-thread; биты SIGKILL/SIGSTOP отбрасываются; `oldset` пишется до установки новой маски; `sigsetsize != 8` — `-EINVAL` |
+| 139 | `rt_sigreturn` | вызывается restorer'ом при `sp` на кадр сигнала; проверяет `U|R` весь кадр, magic и активный кадр потока, восстанавливает `TrapFrame` (`sepc/sp/regs`), blocked-маску и `sstatus` (`SPP=0`, `SUM=0`, `SPIE=1`); без кадра/чужой кадр — `-EINVAL`, плохой указатель — `-EFAULT`; `sepc` не сдвигается |
 | 34 | `mkdirat` | создать каталог; `dirfd` игнорируется, `mode` принимается и **игнорируется** (в VFS нет `set_mode`, ext2 даёт 0o755) |
 | 35 | `unlinkat` | `flags = 0` — удалить файл или ссылку (каталог — `-EISDIR`); `0x200` (`AT_REMOVEDIR`) — пустой каталог (не пустой — `-ENOTEMPTY`, файл — `-ENOTDIR`) |
 | 36 | `symlinkat` | создать ссылку: `a0` — цель (сырая строка, **не** резолвится), `a1` — `dirfd` (игнорируется), `a2` — путь |
@@ -339,7 +344,12 @@ selftest        # + SELFTEST user-*: 10/10 с /mnt (без диска 8/10 + 2 S
 (главный + 13 `clone`; 16 слотов планировщика минус `shell` и `idle`); у каждого
 свой kernel-стек 16 KiB + guard из PMM, user-стек передаёт вызывающий и ядро его
 не освобождает; futex-таблица — 32 ожидающих на 16 адресов; TLS/PI/requeue и
-`fork`/`exec`/сигналов нет.
+`fork`/`exec` нет. Сигналы — узкое POSIX-подмножество: 31 номер, один pending-бит
+на сигнал и один кадр 432 B на активный обработчик (вложенность допустима), без
+`sigaltstack`, `SA_RESTART`, `SA_SIGINFO` (полезная нагрузка `siginfo` — только
+signo/errno/code и `si_pid`/`si_uid` либо `si_addr`), без job control: SIGSTOP и
+родственные `kill` отклоняет `-ENOSYS`, а SIGKILL/SIGSTOP нельзя поймать или
+заблокировать.
 Мутации каталога (`mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`)
 идут через `parent_and_leaf` + `walk(parent, true)` и одну VFS-транзакцию:
 ошибка не оставляет полусостояния, а неудачный `openat(O_CREAT)` (кончились fd)
@@ -359,6 +369,27 @@ selftest        # + SELFTEST user-*: 10/10 с /mnt (без диска 8/10 + 2 S
 пока исполняется user-программа. `listen`/`accept`, UDP, IPv6, `sendmsg`/
 `recvmsg`, `poll`/`select` и TLS отсутствуют и отвечают `-ENOSYS`. Программа,
 вышедшая с открытым сокетом, закрывает его при teardown прогона.
+
+Сигналы (129/131/134/135/139) — нативные, не Linux-совместимые по структурам:
+`struct sigaction` — это `handler, flags, mask, restorer`. Обработчики и
+`SIG_IGN` живут в таблице прогона (сбрасывается вместе с ним), pending-биты и
+blocked-маски — у каждого потока. Доставка происходит на границе kernel→user:
+конец syscall'а или конец любого trap'а из U-mode (включая тик), поэтому
+работающий поток получает сигнал не позже чем через тик, а заблокированный в
+`futex` — сразу после `wake_task` (его wait возвращает `-EINTR`, затем
+обработчик). `nanosleep` проверяет pending каждый тик и тоже возвращает
+`-EINTR`. Кадр сигнала кладётся ниже `sp` (выравнивание 16) и содержит
+сохранённый `TrapFrame`, маску, restorer, 128-байтный `siginfo`, указатель на
+предыдущий кадр и signum; каждая страница проверяется `U|R|W` до записи, плохой
+`sp` — это смерть прогона, а не kernel fault. Обработчик входит с `a0=signum`,
+`a1=&siginfo`, `ra=restorer`, `sp=кадр`; restorer делает `ecall 139`, который
+восстанавливает прерванную инструкцию и маску. `SIG_DFL` для
+SIGTERM/SIGINT/SIGQUIT/SIGABRT/SIGSEGV/SIGILL/SIGFPE/SIGBUS/SIGKILL и остальных
+«фатальных» завершает прогон (один процесс — один run), SIGCHLD/SIGCONT/SIGURG/
+SIGWINCH игнорируются; ошибка в самом кадре (плохой `sp`) печатает
+`[user] … killed: bad signal stack`. Синхронный SIGSEGV/SIGILL/SIGTRAP при
+установленном обработчике доставляется вместо убийства прогона; без обработчика
+сохраняется прежнее поведение `user::on_fault`.
 
 ### Как управлять шеллом
 
@@ -535,12 +566,12 @@ IPv4, ICMP и UDP, а `dhcp`/`dns`/`tcp` — маленькие клиенты. 
   `satp.ASID = 0`, VMM/mprotect/разделяемых страниц нет; два user-процесса друг
   от друга не защищены — только юзер от ядра. `run_image` держит «одна программа
   за раз».
-* **Нет `mmap`, `mprotect`, `fork`/`exec`, сигналов и динамического ELF.**
+* **Нет `mmap`, `mprotect`, `fork`/`exec` и динамического ELF.**
   `brk` есть, но это одно фиксированное окно 1 MiB (`0x2000_0000`), а не общий
   менеджер памяти; `read(0)` неблокирующий (`-EAGAIN`), `getdents64` отдаёт
   снимок каталога на момент `openat`, `openat(... O_CREAT)` игнорирует `mode`
   (в VFS нет `set_mode`).
-* **Нет `fork`/`exec`, сигналов и динамического ELF.** Загрузчик понимает только
+* **Нет `fork`/`exec` и динамического ELF.** Загрузчик понимает только
   статические `ET_EXEC`/`ET_DYN` без интерпретатора; userland — голые `ecall`.
   `run <path>` читает файл *ядром* потоково, частями не больше 512 B, и грузит
   его в user-окно; предел образа — 1 MiB (`MAX_IMAGE_BYTES`), одновременно
@@ -548,10 +579,18 @@ IPv4, ICMP и UDP, а `dhcp`/`dns`/`tcp` — маленькие клиенты. 
   отображения `/mnt` в него нет.
 * **Потоки — MVP, не POSIX threads.** `clone` создаёт поток только с явным
   `entry(arg)` и `CLONE_VM|CLONE_THREAD`; TLS (`CLONE_SETTLS` — `-ENOTSUP`),
-  `fork`/`exec`, сигналы, `join`/`waitid`, приоритеты и priority-inheritance
+  `fork`/`exec`, `join`/`waitid`, приоритеты и priority-inheritance
   фьютексы отсутствуют. Максимум — 14 живых потоков на прогон; user-стек
   выделяет и освобождает вызывающий; код не-главного потока при `exit`
   отбрасывается. Планировщик по-прежнему round-robin без приоритетов.
+* **Сигналы — узкое подмножество POSIX, не Linux.** Один кадр на обработчик
+  (432 B, вложенность через `prev_frame`), нет `sigaltstack`, `SA_RESTART`,
+  `SA_NODEFER`, `SA_RESETHAND` и `SA_SIGINFO`; `siginfo` минимальный (signo,
+  errno, code, `si_pid`/`si_uid` или `si_addr`). SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU
+  не реализованы (job control нет): `kill` отвечает `-ENOSYS`, SIGKILL/SIGSTOP
+  нельзя поймать или заблокировать. Синхронный fault доставляется установленному
+  обработчику, но вернуться из него можно только изменив сохранённый кадр или
+  завершив поток; автоматического «пропустить инструкцию» нет.
 * **Нет журнала/WAL в ext2.** Сбой между двумя записями может оставить операцию
   недоделанной; crash-consistency не заявляется.
 * **Один блочный слот, нет разделов/hot-plug.** Второй диск — изменение дизайна.

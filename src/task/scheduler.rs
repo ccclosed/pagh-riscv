@@ -1484,6 +1484,56 @@ pub fn current_id() -> u64 {
     unsafe { (*task(current)).id }
 }
 
+/// Group tag of a live thread, or `None` when `id` is not a thread of this
+/// boot or has already exited.
+///
+/// The signal layer uses this to validate `kill`/`tgkill` targets without
+/// trusting the caller's id: a thread id is a scheduling identity, and an id
+/// from an older run is never reused, so `None` is the honest `-ESRCH`.
+pub fn thread_group(id: u64) -> Option<u64> {
+    let _mask = InterruptsOff::new();
+    let _sched = SCHED.lock();
+    for slot in 0..MAX_TASKS {
+        let t = task(slot);
+        // SAFETY: `slot` is in range and the scheduler lock is held.
+        unsafe {
+            if (*t).id == id && matches!((*t).state, State::Ready | State::Running | State::Blocked)
+            {
+                return Some((*t).group);
+            }
+        }
+    }
+    None
+}
+
+/// Ids of every live thread tagged with `group`, copied into `out`.
+///
+/// Returns the number written. The scan is bounded by [`MAX_TASKS`] and takes
+/// the scheduler lock for exactly that scan; the caller (`kill(0)` / `kill(-1)`
+/// in the signal layer) releases it before touching the signal table, so the
+/// two locks are never nested.
+pub fn group_threads(group: u64, out: &mut [u64]) -> usize {
+    let _mask = InterruptsOff::new();
+    let _sched = SCHED.lock();
+    let mut count = 0usize;
+    for slot in 0..MAX_TASKS {
+        if count == out.len() {
+            break;
+        }
+        let t = task(slot);
+        // SAFETY: `slot` is in range and the scheduler lock is held.
+        unsafe {
+            if (*t).group == group
+                && matches!((*t).state, State::Ready | State::Running | State::Blocked)
+            {
+                out[count] = (*t).id;
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
 /// Add one to the running thread's work counter (the demo/selftest body does
 /// this; the scheduler never touches it).
 pub(crate) fn bump_counter() {

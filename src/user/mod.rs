@@ -59,6 +59,7 @@
 pub mod elf;
 pub mod futex;
 pub mod selftest;
+pub mod signal;
 pub mod syscall;
 
 use core::fmt;
@@ -601,6 +602,11 @@ fn run_source<S: ImageSource + ?Sized>(
             mmap_count: 0,
         });
     }
+    // Handlers and pending/blocked masks belong to this run. Resetting here,
+    // before the main task can issue an `ecall`, is what makes a stale entry from
+    // a killed run invisible to this one (the signal analogue of the futex
+    // queue's run key).
+    signal::begin_run(run_id);
 
     let mut loaded = match elf::load(source, 0) {
         Ok(loaded) => loaded,
@@ -707,8 +713,11 @@ fn run_source<S: ImageSource + ?Sized>(
     if let Some(run) = run.as_mut() {
         // `exit_group` and faults retire threads without them returning through
         // `futex_wait`'s removal path; dropping the run's queue entries here is
-        // what keeps the next program from inheriting them.
+        // what keeps the next program from inheriting them. The signal table is
+        // scoped the same way: handlers, pending bits and blocked masks die with
+        // the run, never with the next one.
         futex::clear_run(run.id);
+        signal::clear_run(run.id);
         release_mmap(run);
         release_heap(run);
     }
@@ -1429,6 +1438,47 @@ pub(crate) fn exit_group(code: u32) -> ! {
     if let Some(run) = RUN.lock().as_mut() {
         run.threads = 0;
         run.exit = Some(Exit::Code(final_code));
+    }
+    scheduler::exit()
+}
+
+/// A run's default action for a signal: print one line and end every thread.
+///
+/// The run is the process here, so a fatal default action is process-fatal even
+/// when the signal was addressed to one thread id. Survivors (including threads
+/// blocked in `futex`) are retired with [`scheduler::kill_group`], the runner
+/// then does the one teardown of the address space/fd table/heap, and the shell
+/// sees [`Exit::Fault`] with the signal's name as the reason. This deliberately
+/// mirrors [`on_fault`] rather than `exit_thread`: a half-dead process whose
+/// other threads keep running is not a state this kernel's shared state can
+/// describe.
+pub(crate) fn on_signal_death(signal: usize, sepc: usize, reason: &'static str) -> ! {
+    let mut name = RunName::new("user");
+    let mut run_id = 0u64;
+    {
+        let mut slot = RUN.lock();
+        if let Some(run) = slot.as_mut() {
+            name = run.name;
+            run_id = run.id;
+            run.exit = Some(Exit::Fault {
+                reason,
+                cause: 0,
+                sepc,
+            });
+        }
+    }
+    crate::kprintln!(
+        "[user] {} killed: {} (signal={}, sepc={:#x})",
+        name.as_str(),
+        reason,
+        signal,
+        sepc
+    );
+    if run_id != 0 {
+        let _ = scheduler::kill_group(run_id);
+    }
+    if let Some(run) = RUN.lock().as_mut() {
+        run.threads = 0;
     }
     scheduler::exit()
 }

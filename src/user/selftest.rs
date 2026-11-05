@@ -436,6 +436,7 @@ fn user_abi_syscalls(_buf: &mut Vec<u8>) -> Outcome {
     let (used_before, mapped_before, _) = crate::heap_stats();
     let frames_before = frames();
     let stats_before = syscall::stats();
+    let signals_before = crate::user::signal::stats();
     let mut ok = true;
     if let Some(dir) = dir.as_ref() {
         if let Err(reason) = create_abi_files(dir) {
@@ -550,6 +551,50 @@ fn user_abi_syscalls(_buf: &mut Vec<u8>) -> Outcome {
         crate::kprintln!(
             "[selftest] user: the ABI run left {} futex waiter(s) registered",
             crate::user::futex::live_waiters()
+        );
+        ok = false;
+    }
+
+    // The signal section is filesystem-independent: it must have run on every
+    // boot. The counters are the kernel-side witness that the fixture really
+    // installed a handler, entered it through `kill`, and returned through
+    // `rt_sigreturn`; the zero live counts prove the run-scoped table was torn
+    // down with the run.
+    let signals = crate::user::signal::stats();
+    if signals.actions <= signals_before.actions
+        || signals.procmasks <= signals_before.procmasks
+        || signals.kills <= signals_before.kills
+        || signals.sigreturns <= signals_before.sigreturns
+        || signals.delivered <= signals_before.delivered
+        || signals.ignored <= signals_before.ignored
+    {
+        crate::kprintln!(
+            "[selftest] user: signal counters did not move as expected (before {:?}, after {:?})",
+            signals_before,
+            signals
+        );
+        ok = false;
+    }
+    // `faults` counts synchronous SIGSEGV/SIGILL *deliveries*; the fixture
+    // deliberately installs a handler and takes one, which is success, not the
+    // run ending. Only a default action (terminated) is a failure here.
+    if signals.terminated != signals_before.terminated {
+        crate::kprintln!(
+            "[selftest] user: the ABI run ended through a default signal action (before {:?}, after {:?})",
+            signals_before,
+            signals
+        );
+        ok = false;
+    }
+    if crate::user::signal::live_handlers() != 0
+        || crate::user::signal::live_threads() != 0
+        || crate::user::signal::live_pending() != 0
+    {
+        crate::kprintln!(
+            "[selftest] user: the ABI run left signal state ({} handler(s), {} thread(s), {} pending)",
+            crate::user::signal::live_handlers(),
+            crate::user::signal::live_threads(),
+            crate::user::signal::live_pending()
         );
         ok = false;
     }
