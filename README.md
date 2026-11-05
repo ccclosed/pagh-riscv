@@ -1,3 +1,5 @@
+![pkg install + applets](docs/demo-pkg.gif)
+
 <h1 align="center">pagh-riscv</h1>
 
 <p align="center">
