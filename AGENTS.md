@@ -390,7 +390,7 @@ fuzzing. That is a gap, not a policy — the rule stands:
 
 ## Versioning
 
-Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.16.0`,
+Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.16.1`,
 which `Cargo.lock` mirrors. **The two move together in one commit**: CI builds with
 `--locked`, and cargo refuses to rewrite the lock (`cannot update the lock file …
 because --locked was passed`), so a `Cargo.toml`-only bump fails the build job in
@@ -430,7 +430,9 @@ seconds. Verify locally with `cargo build --locked` after any version change.
   native processes: fork(1000)/execve(221)/wait4(260)/getppid(173), a per-process
   Sv39 root and 16-bit ASID with `satp` switching, deep-copy fork, fd/pipe
   inheritance (sockets become `-ENOTSUP` in the child), signal handling across
-  fork/exec, wait status and the orphan policy, without changing the 0.15 signal
+  fork/exec, wait status and the orphan policy, without changing the 0.15 signal;
+  `0.16.1` bounds the execve path C-string read (a missing NUL no longer walks
+  past the 256-byte buffer) and finishes the process docs
   frame or job-control semantics. The same rule applies
   to both: the tag equals the manifest and the `Cargo.lock` entry, and the
   release is not optional.
