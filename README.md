@@ -16,6 +16,15 @@
 
 ---
 
+
+## C и dynamic linking
+
+Нативный ABI теперь используется не только Rust-пользователем: 
+[pagh-libc](https://github.com/ccclosed/pagh-libc) даёт C-рантайм (crt0, malloc,
+FILE, pthreads/futex, сигналы, fork/exec/wait) и **userland dynamic loader**
+`ld-pagh` (multi-`DT_NEEDED`, relocation, constructors). Подробности и точные
+команды — [`docs/userland-c.md`](docs/userland-c.md).
+
 ## English summary
 
 `pagh-riscv` is the 64-bit RISC-V port of the [pagh](https://github.com/ccclosed/Pagh-OS)
