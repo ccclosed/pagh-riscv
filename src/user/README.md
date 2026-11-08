@@ -17,7 +17,7 @@ syscall'ов заморожен в `pagh-api/docs/abi.md`; ниже — как �
 | `signal.rs` | POSIX-подобные сигналы: per-process таблица `sigaction` (1..=31, строка привязана к слоту процесса), per-thread `pending`/`blocked`/`altstack`/активный кадр; `fork_process` копирует обработчики/blocked/altstack, `exec_process` сбрасывает обработчики в `SIG_DFL`, гасит pending и alt-стек, `clear_process` освобождает строку, `kill`/`tgkill` (129/131), `sigaltstack` (132), `rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn` (134/135/139), кадр 736 B в user-памяти с 128-байтным `siginfo_t` и 288-байтным `ucontext_t`, `SA_SIGINFO`/`SA_ONSTACK`/`SA_NODEFER`/`SA_RESETHAND`/`SA_RESTART`, `deliver_pending` на границе kernel→user, `deliver_fault` для SIGILL/SIGSEGV/SIGBUS/SIGTRAP и job control через `scheduler::stop_current`/`continue_task`; счётчики и `live_handlers`/`live_threads`/`live_pending` для selftest |
 | `futex.rs` | статическая очередь ожидающих `(run, uaddr) -> tid`: 32 слота на 16 адресов, `wait` (регистрация → `scheduler::block_current` → снятие), `wake` (`wake_task`, не больше N), `clear_run` на teardown; лок очереди маскирует прерывания и **не** держится через блокировку; порядок `futex → scheduler` |
 | `elf.rs` | ELF64-загрузчик: `ImageSource` (`len` + `read_at`) и потоковое чтение — заголовок, таблица program headers (≤ 8) и сегменты кусками ≤ 512 B в уже замапленные страницы, **без буфера размером с образ**; `load` — в активный root, `load_in(root, …)` — в root процесса; валидация заголовка/сегментов до первого кадра, `PT_LOAD`-страницы `U=1`, нулевой `.bss`-хвост, откат кадров при любой ошибке; `Loaded { root, entry, pages(), release() }` (Vec, не inline-массив), `from_pages` для fork; типизированные `ElfError`/`SourceError` |
-| `syscall.rs` | `dispatch(frame)`: `read(63)`, `write(64)`, `openat(56)`, `close(57)`, `lseek(62)`, `fstat(80)`, `getdents64(61)`, `brk(214)`, `clock_gettime(113)`, `nanosleep(101)`, `uname(160)`, `readlinkat(78)`, `exit(93)`, `exit_group(94)`, `set_tid_address(96)`, `futex(98)`, `sched_yield(124)`, `getpid(172)`, `getppid(173)`, `gettid(178)`, `clone(220)`, `fork(1000)`, `execve(221)`, `wait4(260)`, сигналы `kill(129)`, `tgkill(131)`, `sigaltstack(132)`, `rt_sigaction(134)`, `rt_sigprocmask(135)`, `rt_sigreturn(139)` + мутации `mkdirat(34)`, `unlinkat(35)`, `symlinkat(36)`, `linkat(37)`, `fchmodat(53)`, `ftruncate(46)`, `renameat2(276)` + сокеты `socket(198)`, `connect(203)`, `sendto(206)`, `recvfrom(207)`, `setsockopt(208)`, `getsockopt(209)`, `shutdown(210)`; per-process таблица 16 fd (`FdTables`; `fork` копирует, `execve` сохраняет), per-process таблица режимов для `fchmodat`/`fstat`, `copy_from_user`/`copy_to_user` (проверка `U/R/W` по PTE, `SUM` только вокруг копии), `-errno`/`-ENOSYS`, `ecall → sepc + 4`, счётчики для selftest |
+| `syscall.rs` | `dispatch(frame)`: `read(63)`, `write(64)`, `openat(56)`, `close(57)`, `lseek(62)`, `fstat(80)`, `getdents64(61)`, `brk(214)`, `clock_gettime(113)`, `nanosleep(101)`, `uname(160)`, `readlinkat(78)`, `exit(93)`, `exit_group(94)`, `set_tid_address(96)`, `futex(98)`, `sched_yield(124)`, `getpid(172)`, `getppid(173)`, `gettid(178)`, `clone(220)`, `fork(1000)`, `execve(221)`, `wait4(260)`, сигналы `kill(129)`, `tgkill(131)`, `sigaltstack(132)`, `rt_sigaction(134)`, `rt_sigprocmask(135)`, `rt_sigreturn(139)` + мутации `mkdirat(34)`, `unlinkat(35)`, `symlinkat(36)`, `linkat(37)`, `fchmodat(53)`, `ftruncate(46)`, `renameat2(276)` + сокеты `socket(198)`, `bind(200)`, `connect(203)`, `sendto(206)`, `recvfrom(207)`, `setsockopt(208)`, `getsockopt(209)`, `shutdown(210)`; per-process таблица 16 fd (`FdTables`; `fork` копирует, `execve` сохраняет), per-process таблица режимов для `fchmodat`/`fstat`, `copy_from_user`/`copy_to_user` (проверка `U/R/W` по PTE, `SUM` только вокруг копии), `-errno`/`-ENOSYS`, `ecall → sepc + 4`, счётчики для selftest |
 | `selftest.rs` | десять проверок для `selftest`: `user-abi-argv` (точная строка из фикстуры), `user-abi-syscalls` (все вызовы + секции потоков/фьютексов, сигналов и процессов + мутационная половина: mkdir/rmdir, rename, link, symlink, chmod, ftruncate, unlink; маркеры `abi: fork ok`/`wait ok`/`exec ok`/`exec wait ok`, с диском exit 0 и «все имена убраны», без `/mnt` — SKIP после no-fs половины), accept фикстуры, reject-матрица (14 мутаций заголовка/сегментов), отказ `run_image` на битом ELF, round-trip `hello`, fault-изоляция, запуск после fault, таймер-in-U и `user-run-large-file` (100 KiB образ с нулевым хвостом через `run_file`) |
 
 ## Вход в U-mode и начальный стек
@@ -126,20 +126,29 @@ S-mode page fault (тот напечатал бы и остановил hart). �
   `O_TRUNC` выполняет после установки fd и откатывает её при ошибке.
 * `clock_gettime` и `nanosleep` работают от 100 Гц тика: разрешение 10 ms,
   `nsec` всегда кратен миллиону.
-* **Сокеты — один TCP-клиент.** `socket` принимает только `AF_INET` +
-  `SOCK_STREAM` + 0, второй сокет при открытом первом — `-ENOSPC`. `connect`
-  валидирует 16-байтный `sockaddr_in` через `copy_from_user` (length, family,
-  port BE) и внутри `net::tcp::connect` крутит `net::poll()` до handshake.
-  `send` синхронный (ждёт ACK), `recv` **неблокирующий** (`-EAGAIN` — повтор,
-  0 — EOF). `connect`/`send`/`shutdown`/`close` на время ожидания включают
-  прерывания — иначе в trap-контексте тики стоят, дедлайн не работает и
-  планировщик не может вытеснить застрявшую программу; `net::poll()` при этом
-  вызывается на каждом шаге, потому что шелл в это время не в idle-цикле.
-  `read`/`write`/`close` на socket fd идут теми же путями. `shutdown` закрывает
-  оба направления, но оставляет fd (последующий `read` → 0, `write` →
-  `-EPIPE`); `close` освобождает слот. `listen`/`accept`/`bind`, UDP, IPv6,
-  DNS-вызов и TLS отсутствуют. Программа, вышедшая с открытым сокетом, закрывает
-  его в `release_fds` при teardown прогона.
+* **Сокеты — один TCP-клиент и UDP.** `socket` принимает `AF_INET` + 0;
+  `SOCK_STREAM` — один TCP-клиент (второй при открытом первом — `-ENOSPC`),
+  `SOCK_DGRAM` — UDP-сокет (можно несколько, `SOCK_NONBLOCK` — бит типа).
+  `connect` валидирует 16-байтный `sockaddr_in` через `copy_from_user`
+  (length, family, port BE) и внутри `net::tcp::connect` крутит `net::poll()`
+  до handshake; на UDP — `-ENOTSUP`. TCP `send` синхронный (ждёт ACK), `recv`
+  **неблокирующий** (`-EAGAIN` — повтор, 0 — EOF). UDP: `bind(200)` даёт
+  локальный порт (`0.0.0.0` или lease, port 0 — эфемерный; занятый —
+  `-EADDRINUSE`), `sendto` требует адрес и payload ≤ 1024 B (иначе
+  `-EMSGSIZE`), `recvfrom` без `MSG_DONTWAIT` блокируется на опросе NIC с
+  бюджетом ~10 s и заполняет `src`; per-port очередь — 4 дейтаграммы,
+  старая вытесняется. `connect`/`send`/`shutdown`/`close`/блокирующий
+  `recvfrom` на время ожидания включают прерывания — иначе в trap-контексте
+  тики стоят, дедлайн не работает и планировщик не может вытеснить застрявшую
+  программу; `net::poll()` при этом вызывается на каждом шаге, потому что шелл
+  в это время не в idle-цикле. `read`/`write`/`close`/`poll` на socket fd идут
+  теми же путями (`read` на UDP — `recv` без source, `write` — `-EDESTADDRREQ`).
+  `shutdown` закрывает TCP оба направления, но оставляет fd (последующий
+  `read` → 0, `write` → `-EPIPE`); `close` освобождает слот, UDP — ещё и порт.
+  `listen`/`accept`, UDP-`connect`, IPv6, DNS-вызов и TLS отсутствуют.
+  Программа, вышедшая с открытым сокетом, закрывает его (и освобождает UDP-порт)
+  в `release_fds` при teardown прогона; `fork`/`dup` дают ребёнку/копии
+  `-ENOTSUP` (второй владелец bind-а не создаётся).
 
 ## Процессы, потоки и фьютексы
 
@@ -514,9 +523,12 @@ root: тег — пространство имён TLB, а не обещание
   `exit_group` снимает `Ready` и `Blocked`, но не может прервать поток, который
   в этот момент исполняется (на одном hart его нет — это текущий syscall);
 - ровно одно TCP-соединение на ядро и не больше одного `FdEntry::Socket` в
-  живом процессе (`AF_INET`/`SOCK_STREAM`, IPv4-литерал, без
-  `listen`/`accept`/`bind`, UDP, DNS и TLS); `recv` неблокирующий, `shutdown`
-  без half-close; ребёнок после `fork` видит сокет как `-ENOTSUP`.
+  живом процессе (`AF_INET`/`SOCK_STREAM`, IPv4-литерал); UDP — до 8 bind,
+  4 дейтаграммы на порт, payload ≤ 1024 B, один интерфейс; без
+  `listen`/`accept`, UDP-`connect`, IPv6, DNS и TLS. TCP `recv` неблокирующий,
+  UDP `recvfrom` блокируется (бюджет ~10 s) или `-EAGAIN` с `MSG_DONTWAIT`;
+  `shutdown` без half-close; ребёнок после `fork`/`dup` видит сокет как
+  `-ENOTSUP`.
 
 ## Как проверяется
 
@@ -555,13 +567,19 @@ futex-wait, synchronous SIGSEGV в отдельном потоке, плохой
 (`EISDIR`/`ENOTDIR`/`ENOTEMPTY`), `renameat2`, `linkat` (+`EISDIR`/`EINVAL`),
 `symlinkat`, `readlinkat`, `fchmodat` (+`ENOTSUP`), `ftruncate`
 (+`EINVAL`/`EBADF`/`EISDIR`), уборку всех имён и `ENAMETOOLONG` на 300-байтном
-пути. Сокетная секция фикстуры всегда проверяет bad args (`AF_UNIX`,
-`SOCK_DGRAM`, protocol 6 → `-EAFNOSUPPORT`; второй `socket` → `-ENOSPC`;
-`connect` с плохим указателем/длиной/family; `read`/`write`/`shutdown` до
-connect → `-ENOTCONN`; `setsockopt`/`getsockopt`; `EBADF` после `close`) и
-пытается подключиться к `10.0.2.2:8000`: без сервера это `SKIP` (не FAIL), с
-сервером — send/recv, `shutdown`, `read` → 0 и `write` → `-EPIPE`. Без `/mnt`
-фикстура проходит no-fs половину и выходит 77, что selftest считает SKIP.
+пути. Сокетная секция фикстуры всегда проверяет TCP bad args (`AF_UNIX`,
+protocol 6 → `-EAFNOSUPPORT`; второй `socket` → `-ENOSPC`; `connect` с плохим
+указателем/длиной/family; `read`/`write`/`shutdown` до connect → `-ENOTCONN`;
+`setsockopt`/`getsockopt`; `EBADF` после `close`) и UDP: `SOCK_DGRAM` +
+`SOCK_NONBLOCK`, `bind` (bad pointer/len/family, занятый порт `-EADDRINUSE`,
+чужой адрес `-EADDRNOTAVAIL`, повторный `-EINVAL`), `recvfrom` с
+`MSG_DONTWAIT` → `-EAGAIN`, `SO_TYPE` → `SOCK_DGRAM`, `sendto` без адреса
+`-EDESTADDRREQ`, oversize `-EMSGSIZE`, `close` освобождает порт. Затем
+фикстура пытается подключиться к `10.0.2.2:8000`: без сервера это `SKIP` (не
+FAIL), с сервером — send/recv, `shutdown`, `read` → 0 и `write` → `-EPIPE`.
+Без `/mnt` фикстура проходит no-fs половину и выходит 77, что selftest считает
+SKIP. Живой UDP-прогон — `tools/test_udp.py` (`libpagh::net::UdpSocket`,
+host-эхо, `docs/live-udp.txt`).
 
 Два `selftest` подряд печатают одинаковые ledger'ы — это и есть доказательство,
 что не течёт ни образ, ни стек, ни стек задачи, ни heap-кадры, ни fd-узлы.

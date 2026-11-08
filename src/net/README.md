@@ -8,7 +8,7 @@
 
 | Файл | Роль |
 |---|---|
-| `mod.rs` | состояние стека: MAC, конфигурация DHCP, ARP-кэш, `poll()`, диспетчер кадров (ARP/IPv4/ICMP/UDP/TCP), `ping`, `wait_udp`, сборка кадров |
+| `mod.rs` | состояние стека: MAC, конфигурация DHCP, ARP-кэш, `poll()`, диспетчер кадров (ARP/IPv4/ICMP/UDP/TCP), `ping`, `wait_udp` для DHCP/DNS и per-port очередь userland-UDP (`udp_bind`/`udp_take_into`/`udp_wait_into`), сборка кадров |
 | `wire.rs` | чистые форматы: Ethernet, ARP, IPv4, ICMP, UDP, TCP, DHCP, DNS; контрольные суммы (RFC 1071 + pseudo-header) и текстовые помощники. Не знает ни устройства, ни часов — поэтому тестируется без QEMU |
 | `dhcp.rs` | DHCP-клиент: DISCOVER/OFFER/REQUEST/ACK, опции 1/3/6/50/51/53/54 |
 | `dns.rs` | stub-резолвер: A-запрос по UDP, разбор ответа с компрессией имён |
@@ -67,18 +67,28 @@ out-of-order reassembly, нет congestion control — это HTTP/1.0-клие�
 замена Linux TCP. Ошибки типизированы (`tcp::Error`), а не «молча пусто».
 
 **Сокетный ABI для userland.** `src/user/syscall.rs` даёт минимальный BSD-набор
-поверх этого клиента: `socket` (только `AF_INET`/`SOCK_STREAM`, второй сокет при
-открытом первом — `-ENOSPC`), `connect` (16-байтный `sockaddr_in`, IPv4-литерал,
-ошибки `-ENETUNREACH`/`-EHOSTUNREACH`/`-ECONNREFUSED`/`-ETIMEDOUT`),
+поверх этого клиента и UDP: `socket` (`AF_INET`/`SOCK_STREAM`, второй TCP-сокет
+при открытом первом — `-ENOSPC`; `AF_INET`/`SOCK_DGRAM` — UDP-сокет, можно
+много, `SOCK_NONBLOCK` — бит типа), `bind(200)` (16-байтный `sockaddr_in`,
+`0.0.0.0` или lease, port 0 — эфемерный, занятый порт — `-EADDRINUSE`),
+`connect` (16-байтный `sockaddr_in`, IPv4-литерал, ошибки
+`-ENETUNREACH`/`-EHOSTUNREACH`/`-ECONNREFUSED`/`-ETIMEDOUT`; UDP — `-ENOTSUP`),
 `sendto`/`recvfrom` (их же форма — `send`/`recv`; `read`/`write` на socket fd
 маршрутизируются сюда), `setsockopt`/`getsockopt` (типовые опции принимаются и
-игнорируются) и `shutdown` (оба направления, fd остаётся). `recv`
-неблокирующий: `-EAGAIN` — «опять нет данных», 0 — peer закрылся. Соединение
-одно; `FdEntry::Socket { id, connected }` живёт в per-process таблице и закрывается
-при teardown. Пока user-программа работает, шелл не в idle-цикле, поэтому
-`connect`/`send`/`shutdown`/`close` включают прерывания на время ожидания и сами
-вызывают `net::poll()` на каждом шаге — иначе тики бы стояли, а NIC остался бы
-без опроса.
+игнорируются) и `shutdown` (оба направления, fd остаётся). TCP `recv`
+неблокирующий: `-EAGAIN` — «опять нет данных», 0 — peer закрылся. UDP
+`recvfrom` без `MSG_DONTWAIT` блокируется: он крутит `net::poll()` до
+дейтаграммы или тикового бюджета (`UDP_RECV_TICKS = 1000`, ~10 s), затем
+`-EAGAIN`; `MSG_DONTWAIT`/`SOCK_NONBLOCK` — один poll. Дейтаграмма
+копируется в per-port очередь из `handle_udp`: 8 портов по 4 слота, payload
+≤ 1024 B, при переполнении вытесняется самая старая (UDP semantics). Очередь
+защищена отдельным `Spinlock`, лок не держится через `copy_to_user`/`poll`.
+TCP-соединение одно; `FdEntry::Socket`/`FdEntry::UdpSocket` живут в per-process
+таблице и закрываются при teardown (UDP `close` освобождает порт). Пока
+user-программа работает, шелл не в idle-цикле, поэтому
+`connect`/`send`/`shutdown`/`close` и блокирующий `recvfrom` включают
+прерывания на время ожидания и сами вызывают `net::poll()` на каждом шаге —
+иначе тики бы стояли, а NIC остался бы без опроса.
 
 ## Команды шелла
 
@@ -95,7 +105,9 @@ out-of-order reassembly, нет congestion control — это HTTP/1.0-клие�
 - `selftest` → `SELFTEST net-* 11/11`: контрольные суммы (вектор RFC 1071),
   Ethernet/IPv4/UDP/ICMP/ARP/TCP round-trip + отказ на испорченном байте,
   DHCP-парсер на «серверном» сообщении, DNS-ответ с compression pointer,
-  текст/подсети. Без NIC — набор работает на любой машине.
+  текст/подсети. `net-udp` дополнительно биндит порт, заливает в
+  `handle_udp` на одну дейтаграмму больше глубины очереди и проверяет FIFO с
+  вытеснением старшей. Без NIC — набор работает на любой машине.
 - Живой прогон: `run.sh` (сеть включена по умолчанию) → в логе
   `virtio-net: virtio-net0 … MAC …` и `net         DHCP ip 10.0.2.15/24 …`;
   `ping 10.0.2.2` → 4/4 reply; `dns example.com`; `http` к серверу на хосте
@@ -103,6 +115,10 @@ out-of-order reassembly, нет congestion control — это HTTP/1.0-клие�
 - Живой сокетный прогон: `python3 tools/test_sockets.py` (сервер на
   `127.0.0.1:8000`, `http_get` на диске, `selftest` с реальным connect/recv/
   shutdown и `run /mnt/http_get`); транскрипт — `docs/live-sockets.txt`.
+- Живой UDP-прогон: `python3 tools/test_udp.py` — `tools/run.py` форматирует
+  ext2, `debugfs` кладёт libpagh `udp_echo`, host-эхо на `127.0.0.1:PORT`
+  отвечает гостю (`10.0.2.2:PORT`); фикстура печатает bind/sent/recv и
+  выходит 0. Транскрипт — `docs/live-udp.txt`.
 - CI: `python3 .github/smoke.py <elf> --net` — загрузка, DHCP, `net`, ping
   шлюза, `halt` (QEMU's slirp, без зависимости от интернета раннера).
 - Скриншот `docs/net.png` (`tools/run.py --net --keys "net\nping 10.0.2.2\n"`).
@@ -112,11 +128,13 @@ out-of-order reassembly, нет congestion control — это HTTP/1.0-клие�
 - Нет TLS и apt: и то и другое — следующий майлстоун, требует крипто-слоя
   (vendored `embedded-tls` + OpenPGP-проверка, как на x86). Сейчас `http`, а не
   `https`.
-- IPv6, фрагментация, ICMP redirect/unreachable, UDP-сокеты как API (только
-  внутренние клиенты DHCP/DNS), `bind`/`listen`/`accept`, несколько соединений,
-  keepalive, Nagle/окна больше фиксированного. `setsockopt`/`getsockopt`
-  принимают типовые опции, но ничего не настраивают; DNS из userland вызывается
-  только shell-командой `dns`, не сокетным syscall'ом; TLS нет.
+- IPv6, фрагментация, ICMP redirect/unreachable, UDP-`connect`/`sendmsg`/
+  `recvmsg`, `listen`/`accept`, несколько TCP-соединений, keepalive,
+  Nagle/окна больше фиксированного. UDP ограничен 8 bind, 4 дейтаграммами на
+  порт и payload ≤ 1024 B; блокирующий `recvfrom` не прерывается сигналом и
+  отвечает `-EAGAIN` по ~10 s бюджету. `setsockopt`/`getsockopt` принимают
+  типовые опции, но ничего не настраивают; DNS из userland вызывается только
+  shell-командой `dns`, не сокетным syscall'ом; TLS нет.
 - Прерывания NIC: всё polled, `wfi`-idle шелла просыпается на тик и сам
   опрашивает сеть.
 - DHCP renewal по таймеру: `dhcp` — ручная команда; lease не обновляется сам.

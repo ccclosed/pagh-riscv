@@ -95,7 +95,43 @@ fn udp_roundtrip() -> bool {
     corrupt[4] ^= 0xff; // length field
     let corrupted_rejected = !wire::udp_checksum_ok(src, dst, &corrupt[..length])
         || wire::parse_udp(&corrupt[..length]).is_none();
-    parsed && checksum_ok && corrupted_rejected
+    if !(parsed && checksum_ok && corrupted_rejected) {
+        return false;
+    }
+
+    // The userland queue: bind a port, feed `handle_udp` one more datagram
+    // than the queue holds, and require FIFO delivery with the oldest dropped.
+    // Every path here is static state and is released before returning.
+    let port = 45678u16;
+    if super::udp_bind(port).is_err() {
+        return false;
+    }
+    let mut first = 0u8;
+    for index in 0..=super::UDP_SLOTS {
+        let mut segment = [0u8; 64];
+        let payload = [index as u8];
+        let Some(length) = wire::build_udp(&mut segment, 0, src, dst, port, port, &payload) else {
+            super::udp_unbind(port);
+            return false;
+        };
+        super::handle_udp(src, dst, &segment[..length]);
+        if index == 1 {
+            first = index as u8;
+        }
+    }
+    let mut delivered = true;
+    for expected in first..=super::UDP_SLOTS as u8 {
+        match super::udp_take(port) {
+            Some(datagram) => {
+                delivered &=
+                    datagram.dst_port == port && datagram.len == 1 && datagram.data[0] == expected;
+            }
+            None => delivered = false,
+        }
+    }
+    delivered &= super::udp_take(port).is_none();
+    super::udp_unbind(port);
+    delivered
 }
 
 fn icmp_roundtrip() -> bool {

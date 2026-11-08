@@ -42,11 +42,24 @@ use wire::*;
 pub const MAX_FRAME: usize = ETH_HEADER + 1500;
 
 /// Payload bytes kept from one received UDP datagram: enough for a DHCP message
-/// (300 bytes) or a DNS response (512 bytes typical maximum) with headroom.
-const UDP_PAYLOAD_MAX: usize = 1024;
+/// (300 bytes), a DNS response (512 bytes typical maximum) or a small userland
+/// datagram, with headroom. This is also the largest payload `sendto` accepts;
+/// a bigger datagram is `-EMSGSIZE` rather than a silent truncation.
+pub const UDP_DATAGRAM_MAX: usize = 1024;
+const UDP_PAYLOAD_MAX: usize = UDP_DATAGRAM_MAX;
 /// Received datagrams kept for consumers (a DHCP offer and a DNS answer can be
 /// in flight at the same time).
 const UDP_SLOTS: usize = 4;
+/// Userland sockets that may hold a bound UDP port at once. Each slot owns a
+/// [`UDP_SLOTS`]-deep queue, so the table is a fixed 32 KiB of static RAM; a
+/// ninth `bind` is `-ENOSPC` rather than a heap allocation on the receive path.
+const UDP_BINDINGS: usize = 8;
+/// First and last port tried by `bind(0)` / the first `sendto` on an unbound
+/// socket. The range is above the Linux ephemeral floor QEMU's host stack uses
+/// and below the TCP client's 49152, so the two allocators cannot collide by
+/// accident.
+const UDP_EPHEMERAL_FIRST: u16 = 32768;
+const UDP_EPHEMERAL_LAST: u16 = 60999;
 /// Echo replies kept for the ping command.
 const ICMP_SLOTS: usize = 4;
 /// Echo data echoed back and kept in a reply (the ping probe payload).
@@ -108,6 +121,7 @@ struct EchoReply {
 
 /// A fixed-capacity datagram queue. Oldest entries are dropped when full: a slow
 /// consumer loses a packet, which is exactly what UDP promises.
+#[derive(Clone, Copy)]
 struct DatagramQueue {
     slots: [Datagram; UDP_SLOTS],
     head: usize,
@@ -138,6 +152,45 @@ impl DatagramQueue {
         let slot = (self.head + self.count) % UDP_SLOTS;
         self.slots[slot] = datagram;
         self.count += 1;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Forget every queued datagram without constructing a 4 KiB queue
+    /// temporary on the caller's stack (a debug-build `x = Queue::new()`
+    /// spills the whole struct, which overflowed the 16 KiB kernel stack).
+    fn clear(&mut self) {
+        self.head = 0;
+        self.count = 0;
+    }
+
+    /// Pop the first datagram for `dst_port`, copying at most `out.len()`
+    /// payload bytes into `out` and returning `(source, original_len)`.
+    ///
+    /// This is the receive path's no-large-stack-copy shape: the queue slot is
+    /// read in place, and the caller only needs a buffer as large as the bytes
+    /// it is willing to accept, not a [`Datagram`] temporary.
+    fn pop_into(&mut self, dst_port: u16, out: &mut [u8]) -> Option<(Ipv4, u16, usize)> {
+        for index in 0..self.count {
+            let slot = (self.head + index) % UDP_SLOTS;
+            let candidate = &self.slots[slot];
+            if candidate.dst_port != dst_port {
+                continue;
+            }
+            let take = candidate.len.min(out.len());
+            out[..take].copy_from_slice(&candidate.data[..take]);
+            let source = (candidate.src_ip, candidate.src_port, candidate.len);
+            for offset in index..self.count - 1 {
+                let from = (self.head + offset + 1) % UDP_SLOTS;
+                let to = (self.head + offset) % UDP_SLOTS;
+                self.slots[to] = self.slots[from];
+            }
+            self.count -= 1;
+            return Some(source);
+        }
+        None
     }
 
     fn pop_matching(
@@ -175,6 +228,40 @@ impl DatagramQueue {
         None
     }
 }
+
+/// One userland port binding and the datagrams received for it.
+///
+/// The queue is per port, so a datagram for port A can never be consumed by a
+/// socket bound to port B, and a full queue drops only that port's oldest
+/// datagram. `handle_udp` fills it from the poll path; `udp_take` drains it.
+#[derive(Clone, Copy)]
+struct UdpBinding {
+    used: bool,
+    port: u16,
+    queue: DatagramQueue,
+}
+
+impl UdpBinding {
+    const fn empty() -> Self {
+        UdpBinding {
+            used: false,
+            port: 0,
+            queue: DatagramQueue::new(),
+        }
+    }
+}
+
+/// Why `udp_bind` refused a port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpBindError {
+    /// Another socket already owns the port.
+    AddressInUse,
+    /// All [`UDP_BINDINGS`] slots are taken (or no ephemeral port is free).
+    NoSlots,
+}
+
+static UDP_BOUND: Spinlock<[UdpBinding; UDP_BINDINGS]> =
+    Spinlock::new([UdpBinding::empty(); UDP_BINDINGS]);
 
 /// ARP cache entry.
 #[derive(Clone, Copy)]
@@ -430,7 +517,133 @@ fn handle_udp(src_ip: Ipv4, dst_ip: Ipv4, segment: &[u8]) {
         data: [0; UDP_PAYLOAD_MAX],
     };
     datagram.data[..keep].copy_from_slice(&payload[..keep]);
+    // The kernel's own clients (DHCP, DNS) keep their queue; a userspace
+    // binding gets its own copy, so draining one never steals from the other.
     UDP_RX.lock().push(datagram);
+    let mut bindings = UDP_BOUND.lock();
+    for binding in bindings.iter_mut() {
+        if binding.used && binding.port == datagram.dst_port {
+            binding.queue.push(datagram);
+        }
+    }
+}
+
+/// Bind a userland UDP port.
+///
+/// `port == 0` allocates the first free port in
+/// [`UDP_EPHEMERAL_FIRST`]..=[`UDP_EPHEMERAL_LAST`]; an explicit port is
+/// refused with [`UdpBindError::AddressInUse`] when another binding owns it.
+/// The binding starts with an empty queue, so a port reused after `close`
+/// cannot deliver a datagram addressed to its previous owner.
+pub fn udp_bind(port: u16) -> Result<u16, UdpBindError> {
+    let mut bindings = UDP_BOUND.lock();
+    let free = bindings.iter().position(|binding| !binding.used);
+    let Some(slot) = free else {
+        return Err(UdpBindError::NoSlots);
+    };
+    let port = if port != 0 {
+        if bindings
+            .iter()
+            .any(|binding| binding.used && binding.port == port)
+        {
+            return Err(UdpBindError::AddressInUse);
+        }
+        port
+    } else {
+        let mut candidate = UDP_EPHEMERAL_FIRST;
+        loop {
+            if !bindings
+                .iter()
+                .any(|binding| binding.used && binding.port == candidate)
+            {
+                break candidate;
+            }
+            if candidate == UDP_EPHEMERAL_LAST {
+                return Err(UdpBindError::NoSlots);
+            }
+            candidate = candidate.saturating_add(1);
+        }
+    };
+    let binding = &mut bindings[slot];
+    binding.used = true;
+    binding.port = port;
+    binding.queue.clear();
+    Ok(port)
+}
+
+/// Release a userland UDP port. Unknown ports are ignored: `close` may race a
+/// process teardown, and there is no state to corrupt either way.
+pub fn udp_unbind(port: u16) {
+    let mut bindings = UDP_BOUND.lock();
+    for binding in bindings.iter_mut() {
+        if binding.used && binding.port == port {
+            binding.used = false;
+            binding.queue.clear();
+            return;
+        }
+    }
+}
+
+/// Pop one datagram received on a bound port, without polling the NIC.
+pub fn udp_take(port: u16) -> Option<Datagram> {
+    let mut bindings = UDP_BOUND.lock();
+    for binding in bindings.iter_mut() {
+        if binding.used && binding.port == port {
+            return binding.queue.pop_matching(port, None, None);
+        }
+    }
+    None
+}
+
+/// Pop one datagram into `out`, returning `(source address, source port,
+/// original payload length)`. The copy is bounded by `out.len()`; a larger
+/// datagram is truncated exactly as `recvfrom` would truncate it.
+pub fn udp_take_into(port: u16, out: &mut [u8]) -> Option<(Ipv4, u16, usize)> {
+    let mut bindings = UDP_BOUND.lock();
+    for binding in bindings.iter_mut() {
+        if binding.used && binding.port == port {
+            return binding.queue.pop_into(port, out);
+        }
+    }
+    None
+}
+
+/// Wait for a datagram and copy it into `out`; the no-large-temporary receive
+/// path used by `recvfrom`. Same bounded-poll contract as the other waits.
+pub fn udp_wait_into(port: u16, out: &mut [u8], budget_ticks: u64) -> Option<(Ipv4, u16, usize)> {
+    let deadline = timer::ticks().saturating_add(budget_ticks);
+    let mut iterations = 0u64;
+    loop {
+        poll();
+        if let Some(datagram) = udp_take_into(port, out) {
+            return Some(datagram);
+        }
+        if budget_ticks == 0 || timer::ticks() >= deadline || iterations >= POLL_ITERATIONS {
+            return None;
+        }
+        iterations += 1;
+        core::hint::spin_loop();
+    }
+}
+
+/// Whether a bound port has a datagram queued (the `poll(POLLIN)` half).
+pub fn udp_pending(port: u16) -> bool {
+    let bindings = UDP_BOUND.lock();
+    bindings
+        .iter()
+        .any(|binding| binding.used && binding.port == port && !binding.queue.is_empty())
+}
+
+/// Send a userland UDP datagram from the lease address.
+///
+/// `false` means "could not send": no DHCP lease, an ARP/next-hop failure, or
+/// a datagram that does not fit one frame. The caller maps it to the closest
+/// ABI errno; there is no partial datagram.
+pub fn udp_send_from(src_port: u16, dst_ip: Ipv4, dst_port: u16, payload: &[u8]) -> bool {
+    let Some(config) = config() else {
+        return false;
+    };
+    udp_send_raw(config.ip, dst_ip, src_port, dst_port, payload)
 }
 
 /// Wait for a datagram addressed to `dst_port` (and, when given, from a specific

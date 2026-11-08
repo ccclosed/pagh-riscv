@@ -1,7 +1,7 @@
 # C runtime and dynamic linking on pagh-riscv
 
 The kernel loads static ELF64 programs. Two userland projects build on the native
-ABI and are tested against **0.16.1+**:
+ABI and are tested against **0.17.0+**:
 
 ## pagh-libc
 

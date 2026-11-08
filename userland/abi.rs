@@ -162,6 +162,7 @@ const SYS_FCHMODAT: usize = 53;
 const SYS_FTRUNCATE: usize = 46;
 const SYS_RENAMEAT2: usize = 276;
 const SYS_SOCKET: usize = 198;
+const SYS_BIND: usize = 200;
 const SYS_CONNECT: usize = 203;
 const SYS_SENDTO: usize = 206;
 const SYS_RECVFROM: usize = 207;
@@ -236,6 +237,8 @@ const THREAD_MAGIC: usize = 0x7a11;
 
 const AF_INET: usize = 2;
 const SOCK_STREAM: usize = 1;
+const SOCK_DGRAM: usize = 2;
+const MSG_DONTWAIT: usize = 0x40;
 const SOL_SOCKET: usize = 1;
 const SO_REUSEADDR: usize = 2;
 const SO_TYPE: usize = 3;
@@ -283,6 +286,10 @@ const ENOPROTOOPT: isize = -92;
 const EAFNOSUPPORT: isize = -97;
 const ENETUNREACH: isize = -101;
 const ENOSPC: isize = -28;
+const EMSGSIZE: isize = -90;
+const EADDRINUSE: isize = -98;
+const EADDRNOTAVAIL: isize = -99;
+const EDESTADDRREQ: isize = -89;
 const ENOTCONN: isize = -107;
 const ETIMEDOUT: isize = -110;
 const ECONNREFUSED: isize = -111;
@@ -3117,16 +3124,227 @@ pub extern "C" fn abi_main() -> i32 {
         140,
         "socket(AF_UNIX)",
     );
+    // SOCK_DGRAM is a real UDP socket now. The negative half below covers
+    // bind/recvfrom/sendto without needing a NIC or a host listener, so it
+    // runs on a serial-only boot too.
+    let udp = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+    check(udp >= 3, 141, "socket(SOCK_DGRAM)");
+    let udp_nonblocking = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM | 0x800, 0);
+    check(udp_nonblocking >= 3, 400, "socket(SOCK_DGRAM|SOCK_NONBLOCK)");
     check(
-        syscall3(SYS_SOCKET, AF_INET, 2, 0) == EAFNOSUPPORT,
-        141,
-        "socket(SOCK_DGRAM)",
+        syscall1(SYS_CLOSE, udp_nonblocking as usize) == 0,
+        401,
+        "close non-blocking UDP socket",
     );
     check(
         syscall3(SYS_SOCKET, AF_INET, SOCK_STREAM as usize, 6) == EAFNOSUPPORT,
         142,
         "socket(protocol 6)",
     );
+
+    // UDP bind: 0.0.0.0:45679 is deliberately in the ephemeral range but an
+    // explicit port, so the same number is testable twice in one boot.
+    let mut udp_address = [0u8; 16];
+    udp_address[0..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+    udp_address[2..4].copy_from_slice(&45679u16.to_be_bytes());
+    check(
+        syscall3(SYS_BIND, udp as usize, 0x10, 16) == EFAULT,
+        402,
+        "bind bad pointer",
+    );
+    check(
+        syscall3(SYS_BIND, udp as usize, udp_address.as_ptr() as usize, 8) == EINVAL,
+        403,
+        "bind addrlen",
+    );
+    let mut bad_family = udp_address;
+    bad_family[0] = 1;
+    check(
+        syscall3(
+            SYS_BIND,
+            udp as usize,
+            bad_family.as_ptr() as usize,
+            16,
+        ) == EAFNOSUPPORT,
+        404,
+        "bind family",
+    );
+    check(
+        syscall3(SYS_BIND, 99, udp_address.as_ptr() as usize, 16) == EBADF,
+        405,
+        "bind bad fd",
+    );
+    check(
+        syscall3(SYS_BIND, 1, udp_address.as_ptr() as usize, 16) == ENOTSOCK,
+        406,
+        "bind non-socket fd",
+    );
+    check(
+        syscall3(
+            SYS_BIND,
+            udp as usize,
+            udp_address.as_ptr() as usize,
+            16,
+        ) == 0,
+        407,
+        "bind UDP port",
+    );
+    check(
+        syscall3(
+            SYS_BIND,
+            udp as usize,
+            udp_address.as_ptr() as usize,
+            16,
+        ) == EINVAL,
+        408,
+        "bind twice",
+    );
+
+    let udp2 = syscall3(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0);
+    check(udp2 >= 3, 409, "second UDP socket");
+    check(
+        syscall3(
+            SYS_BIND,
+            udp2 as usize,
+            udp_address.as_ptr() as usize,
+            16,
+        ) == EADDRINUSE,
+        410,
+        "bind duplicate port",
+    );
+    let mut foreign_address = udp_address;
+    foreign_address[4..8].copy_from_slice(&[10u8, 0, 2, 2]);
+    check(
+        syscall3(
+            SYS_BIND,
+            udp2 as usize,
+            foreign_address.as_ptr() as usize,
+            16,
+        ) == EADDRNOTAVAIL,
+        422,
+        "bind foreign address",
+    );
+
+    let mut udp_buffer = [0u8; 8];
+    check(
+        syscall6(
+            SYS_RECVFROM,
+            udp as usize,
+            udp_buffer.as_mut_ptr() as usize,
+            udp_buffer.len(),
+            MSG_DONTWAIT,
+            0,
+            0,
+        ) == EAGAIN,
+        411,
+        "nonblocking recvfrom",
+    );
+    let mut udp_option: u32 = 0;
+    let mut udp_option_len: u32 = 4;
+    check(
+        syscall5(
+            SYS_GETSOCKOPT,
+            udp as usize,
+            SOL_SOCKET,
+            SO_TYPE,
+            (&mut udp_option as *mut u32) as usize,
+            (&mut udp_option_len as *mut u32) as usize,
+        ) == 0,
+        412,
+        "UDP getsockopt SO_TYPE",
+    );
+    check(
+        udp_option == SOCK_DGRAM as u32 && udp_option_len == 4,
+        413,
+        "UDP SO_TYPE value",
+    );
+
+    let udp_neighbour = [10u8, 0, 2, 2];
+    let mut destination = udp_address;
+    destination[2..4].copy_from_slice(&9u16.to_be_bytes());
+    destination[4..8].copy_from_slice(&udp_neighbour);
+    check(
+        syscall6(
+            SYS_SENDTO,
+            udp as usize,
+            udp_buffer.as_ptr() as usize,
+            4,
+            0,
+            0,
+            0,
+        ) == EDESTADDRREQ,
+        414,
+        "sendto without destination",
+    );
+    check(
+        syscall6(
+            SYS_SENDTO,
+            udp as usize,
+            udp_buffer.as_ptr() as usize,
+            4,
+            0,
+            destination.as_ptr() as usize,
+            8,
+        ) == EINVAL,
+        415,
+        "sendto addrlen",
+    );
+    let mut wrong_destination = destination;
+    wrong_destination[0] = 1;
+    check(
+        syscall6(
+            SYS_SENDTO,
+            udp as usize,
+            udp_buffer.as_ptr() as usize,
+            4,
+            0,
+            wrong_destination.as_ptr() as usize,
+            16,
+        ) == EAFNOSUPPORT,
+        416,
+        "sendto family",
+    );
+    let big = [0u8; 1025];
+    check(
+        syscall6(
+            SYS_SENDTO,
+            udp as usize,
+            big.as_ptr() as usize,
+            big.len(),
+            0,
+            destination.as_ptr() as usize,
+            16,
+        ) == EMSGSIZE,
+        417,
+        "sendto oversized datagram",
+    );
+    check(
+        syscall6(
+            SYS_SENDTO,
+            udp as usize,
+            0x10,
+            4,
+            0,
+            destination.as_ptr() as usize,
+            16,
+        ) == EFAULT,
+        418,
+        "sendto bad buffer",
+    );
+    // Closing the owner releases the port; the second socket can then bind it.
+    check(syscall1(SYS_CLOSE, udp as usize) == 0, 419, "close UDP socket");
+    check(
+        syscall3(
+            SYS_BIND,
+            udp2 as usize,
+            udp_address.as_ptr() as usize,
+            16,
+        ) == 0,
+        420,
+        "bind released port",
+    );
+    check(syscall1(SYS_CLOSE, udp2 as usize) == 0, 421, "close second UDP socket");
+
     let sock = syscall3(SYS_SOCKET, AF_INET, SOCK_STREAM as usize, 0);
     check(sock >= 3, 143, "socket");
     check(

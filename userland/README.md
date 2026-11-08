@@ -65,8 +65,9 @@ toolchain: `TOOLCHAIN=nightly-... ./userland/build.sh`. `strip=debuginfo`
   `mcounteren.TM = 1`; это свойство фикстуры, а не обещание ABI ядра.
 - Пределы: 16 fd, путь ≤ 256 B, heap ровно 1 MiB (`brk`), `read(0)` неблокирующий
   (`-EAGAIN`), `getdents64` — снимок на `openat`; один TCP-сокет
-  (`AF_INET`/`SOCK_STREAM`, IPv4-литерал), `recv` неблокирующий, без
-  `listen`/`accept`/UDP/DNS/TLS. Потоков ≤ 14 на процесс, у каждого 16 KiB
+  (`AF_INET`/`SOCK_STREAM`, IPv4-литерал), `recv` неблокирующий, плюс UDP
+  (`AF_INET`/`SOCK_DGRAM`, 8 bind × 4 дейтаграммы × 1024 B), без
+  `listen`/`accept`/DNS/TLS. Потоков ≤ 14 на процесс, у каждого 16 KiB
   kernel-стека + guard; одновременно живых процессов ≤ 6, у каждого своё Sv39
   root/ASID. TLS/`CLONE_SETTLS`, PI/requeue-фьютексы и `join`/`waitid`
   отсутствуют; futex-таблица 32 ожидающих на 16 адресов; user-стек выделяет
