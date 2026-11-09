@@ -12,7 +12,7 @@
 | `wire.rs` | чистые форматы: Ethernet, ARP, IPv4, ICMP, UDP, TCP, DHCP, DNS; контрольные суммы (RFC 1071 + pseudo-header) и текстовые помощники. Не знает ни устройства, ни часов — поэтому тестируется без QEMU |
 | `dhcp.rs` | DHCP-клиент: DISCOVER/OFFER/REQUEST/ACK, опции 1/3/6/50/51/53/54 |
 | `dns.rs` | stub-резолвер: A-запрос по UDP, разбор ответа с компрессией имён |
-| `tcp.rs` | минимальный active-open TCP-клиент для HTTP/1.0: handshake, seq/ack, приём данных, FIN; одно соединение. `recv_nonblocking` — один `poll()` и `WouldBlock` для socket-ABI, `peer()` — адрес для `recvfrom` |
+| `tcp.rs` | TCP: один active-open клиент для HTTP/1.0, пассивный open (`bind`/`listen`/`accept`) с очередью на 4, таблица из 8 соединений (seq/ack, 4 KiB приёма, FIN); `recv_nonblocking[_id]` — один `poll()` и `WouldBlock`, `peer[_id]` — адрес для `recvfrom`/`accept` |
 | `selftest.rs` | 11 проверок для `selftest`: контрольные суммы, round-trip всех заголовков, разбор DHCP/DNS из фиксированных байт, TCP-сегмент |
 
 Драйвер — `src/drivers/virtio_net.rs`; его контракт с этим модулем: `mac()`,
@@ -53,25 +53,37 @@ limited-broadcast (`255.255.255.255`) кадры — именно так при�
 `ping`; `ping` шлёт до 4 проб с идентификатором `0x5041` и печатает RTT в мс
 (тик = 10 мс).
 
-**TCP.** Одно соединение, только active open; `SYN → SYN-ACK → ACK`, данные с
-`PSH|ACK`, приём в буфер 4 KiB, `FIN` от peer'а переводит в `Closing`. Окно,
-которое клиент объявляет в каждом ACK, — это **свободное место в буфере**, а
-после вычитывания данных `recv` присылает window update: иначе 13 КиБ пакета
-застревали после первых 4 КиБ (sender заливал окно, лишнее терялось, и
-восстановление ждало RTO). Пропуск в последовательности получает duplicate ACK
-— это fast-retransmit у отправителя, а не полный тайм-аут. Локальный порт —
-свежий на каждое соединение (`49152+`), иначе повторный `pkg install` после
-закрытия попадал в 4-tuple, который слой user-network ещё держал, и SYN
-терялся. Нет retransmission-таймера (кроме двух попыток SYN), нет
-out-of-order reassembly, нет congestion control — это HTTP/1.0-клиент, а не
-замена Linux TCP. Ошибки типизированы (`tcp::Error`), а не «молча пусто».
+**TCP.** Один active-open клиент и один listener. `SYN → SYN-ACK → ACK`,
+данные с `PSH|ACK`, приём в буфер 4 KiB на соединение, `FIN` от peer'а
+переводит в `Closing` (отправка после peer FIN разрешена — это echo-сервер).
+Окно в каждом ACK — **свободное место в буфере**, а после вычитывания данных
+`recv` присылает window update: иначе 13 КиБ пакета застревали после первых
+4 КиБ (sender заливал окно, лишнее терялось, и восстановление ждало RTO).
+Пропуск в последовательности получает duplicate ACK — это fast-retransmit у
+отправителя, а не полный тайм-аут. Активный локальный порт — свежий на каждое
+соединение (`49152+`), иначе повторный `pkg install` после закрытия попадал в
+4-tuple, который слой user-network ещё держал, и SYN терялся. Пассивное
+состояние: `bind_port` резервирует **единственный** listener-порт, `listen`
+включает приём и зажимает backlog в `1..=4`, SYN создаёт соединение в
+`SynReceived`, третий ACK переводит в `Established` и кладёт id в очередь;
+`accept` забирает старейшее. Очередь переполнена — RST. Таблица — 8 слотов
+(клиент + принятые/ждущие), поэтому принятые соединения живут одновременно;
+`close_listener` сбрасывает только непринятые, `close_id` шлёт FIN (RST для
+половинного passive). Нет retransmission-таймера (кроме двух попыток SYN), нет
+out-of-order reassembly, congestion control, keepalive, TIME_WAIT и half-close
+— это HTTP/1.0-клиент и маленький сервер, а не замена Linux TCP. Ошибки
+типизированы (`tcp::Error`), а не «молча пусто».
 
 **Сокетный ABI для userland.** `src/user/syscall.rs` даёт минимальный BSD-набор
-поверх этого клиента и UDP: `socket` (`AF_INET`/`SOCK_STREAM`, второй TCP-сокет
-при открытом первом — `-ENOSPC`; `AF_INET`/`SOCK_DGRAM` — UDP-сокет, можно
-много, `SOCK_NONBLOCK` — бит типа), `bind(200)` (16-байтный `sockaddr_in`,
-`0.0.0.0` или lease, port 0 — эфемерный, занятый порт — `-EADDRINUSE`),
-`connect` (16-байтный `sockaddr_in`, IPv4-литерал, ошибки
+поверх этого клиента, listener'а и UDP: `socket` (`AF_INET`/`SOCK_STREAM` —
+один активный клиент, второй активный — `-ENOSPC`; listener — `FdEntry::Listener`,
+принятые — `FdEntry::TcpConn`; `AF_INET`/`SOCK_DGRAM` — UDP-сокет, можно много;
+`SOCK_NONBLOCK` — бит типа для UDP `recvfrom` и stream `accept`), `bind(200)`
+(16-байтный `sockaddr_in`, `0.0.0.0` или lease, port 0 — эфемерный; UDP —
+занятый порт `-EADDRINUSE`, TCP — резерв под `listen`), `listen(201)`
+(backlog `1..=4`, один listener), `accept(202)` (peer `sockaddr_in`, новый fd,
+блокирующий опрос до 30 s или `-EAGAIN` с `SOCK_NONBLOCK`), `connect`
+(16-байтный `sockaddr_in`, IPv4-литерал, ошибки
 `-ENETUNREACH`/`-EHOSTUNREACH`/`-ECONNREFUSED`/`-ETIMEDOUT`; UDP — `-ENOTSUP`),
 `sendto`/`recvfrom` (их же форма — `send`/`recv`; `read`/`write` на socket fd
 маршрутизируются сюда), `setsockopt`/`getsockopt` (типовые опции принимаются и
@@ -83,10 +95,10 @@ out-of-order reassembly, нет congestion control — это HTTP/1.0-клие�
 копируется в per-port очередь из `handle_udp`: 8 портов по 4 слота, payload
 ≤ 1024 B, при переполнении вытесняется самая старая (UDP semantics). Очередь
 защищена отдельным `Spinlock`, лок не держится через `copy_to_user`/`poll`.
-TCP-соединение одно; `FdEntry::Socket`/`FdEntry::UdpSocket` живут в per-process
-таблице и закрываются при teardown (UDP `close` освобождает порт). Пока
-user-программа работает, шелл не в idle-цикле, поэтому
-`connect`/`send`/`shutdown`/`close` и блокирующий `recvfrom` включают
+`FdEntry::Socket`/`Listener`/`TcpConn`/`UdpSocket` живут в per-process таблице и
+закрываются при teardown (UDP `close` освобождает порт, listener — очередь).
+Пока user-программа работает, шелл не в idle-цикле, поэтому
+`connect`/`send`/`shutdown`/`close`/`accept` и блокирующий `recvfrom` включают
 прерывания на время ожидания и сами вызывают `net::poll()` на каждом шаге —
 иначе тики бы стояли, а NIC остался бы без опроса.
 
@@ -119,6 +131,11 @@ user-программа работает, шелл не в idle-цикле, по
   ext2, `debugfs` кладёт libpagh `udp_echo`, host-эхо на `127.0.0.1:PORT`
   отвечает гостю (`10.0.2.2:PORT`); фикстура печатает bind/sent/recv и
   выходит 0. Транскрипт — `docs/live-udp.txt`.
+- Живой TCP-сервер: `python3 tools/test_tcp_server.py` собирает ext2-образ
+  `mke2fs -d` с libpagh `tcp_echo` (без boot-форматирования), поднимает QEMU
+  `user` с `hostfwd=tcp:127.0.0.1:HOST-:45679`, host-клиент шлёт 1040 B и
+  получает эхо; фикстура печатает bind/listen/accept/recv/echo и выходит 0.
+  Транскрипт — `docs/live-tcp-server.txt`.
 - CI: `python3 .github/smoke.py <elf> --net` — загрузка, DHCP, `net`, ping
   шлюза, `halt` (QEMU's slirp, без зависимости от интернета раннера).
 - Скриншот `docs/net.png` (`tools/run.py --net --keys "net\nping 10.0.2.2\n"`).
@@ -129,8 +146,10 @@ user-программа работает, шелл не в idle-цикле, по
   (vendored `embedded-tls` + OpenPGP-проверка, как на x86). Сейчас `http`, а не
   `https`.
 - IPv6, фрагментация, ICMP redirect/unreachable, UDP-`connect`/`sendmsg`/
-  `recvmsg`, `listen`/`accept`, несколько TCP-соединений, keepalive,
-  Nagle/окна больше фиксированного. UDP ограничен 8 bind, 4 дейтаграммами на
+  `recvmsg`, несколько TCP-listener'ов, keepalive, Nagle/окна больше
+  фиксированного, out-of-order reassembly, congestion control, TIME_WAIT и
+  half-close. TCP-сервер ограничен одним listener'ом, backlog ≤ 4, восемью
+  слотами соединений и 4 KiB приёма. UDP ограничен 8 bind, 4 дейтаграммами на
   порт и payload ≤ 1024 B; блокирующий `recvfrom` не прерывается сигналом и
   отвечает `-EAGAIN` по ~10 s бюджету. `setsockopt`/`getsockopt` принимают
   типовые опции, но ничего не настраивают; DNS из userland вызывается только

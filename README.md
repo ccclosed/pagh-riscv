@@ -92,16 +92,25 @@ libpagh: `run <path> [args...]` передаёт `argc`/`argv`/`envp`, а `read`
 
 Native sockets (BSD subset): `socket(AF_INET, SOCK_STREAM)` → `connect` по
 IPv4-литералу → `send`/`recv` → `shutdown`/`close`; `read`/`write` на сокете
-идут теми же путями. TCP по-прежнему один active-open клиент. Рядом —
-`SOCK_DGRAM`: `socket` → `bind(200)` → `sendto`/`recvfrom`, с per-port
-bounded-очередью, блокирующим `recvfrom` и `MSG_DONTWAIT`/`SOCK_NONBLOCK`
-для `-EAGAIN`. `listen`/`accept`, DNS-syscall и TLS отсутствуют. Живые прогоны —
-`python3 tools/test_sockets.py` (HTTP) и `python3 tools/test_udp.py` (UDP-эхо);
-транскрипты — `docs/live-sockets.txt` и `docs/live-udp.txt`.
+идут теми же путями. Один active-open TCP-клиент остаётся. Для сервера:
+`socket(SOCK_STREAM)` → `bind(200)` (0.0.0.0/lease, port 0 — эфемерный) →
+`listen(201)` с backlog ≤ 4 → `accept(202)`, который отдаёт новое соединение и
+peer-адрес в `sockaddr_in`; ожидание опрашивает NIC до 30 s, `SOCK_NONBLOCK`
+даёт `-EAGAIN` сразу. Рядом — `SOCK_DGRAM`: `socket` → `bind(200)` →
+`sendto`/`recvfrom`, с per-port bounded-очередью, блокирующим `recvfrom` и
+`MSG_DONTWAIT`/`SOCK_NONBLOCK` для `-EAGAIN`. DNS-syscall и TLS отсутствуют.
+Живые прогоны — `python3 tools/test_sockets.py` (HTTP),
+`python3 tools/test_udp.py` (UDP-эхо) и `python3 tools/test_tcp_server.py`
+(TCP-сервер: `mke2fs -d` + QEMU `hostfwd`); транскрипты —
+`docs/live-sockets.txt`, `docs/live-udp.txt`, `docs/live-tcp-server.txt`.
 
-Версия **0.17.0** добавляет именно UDP-слой: `socket(SOCK_DGRAM)`, `bind(200)`,
-per-port очередь в `net::handle_udp`, блокирующий/неблокирующий `recvfrom`,
-`libpagh::net::UdpSocket` и accepted live-прогон с host-эхом.
+Версия **0.18.0** добавляет TCP-сервер: пассивное состояние и bounded
+accept-очередь в `net::tcp`, `bind` для stream-сокета, `listen(201)`,
+`accept(202)` с корректным `sockaddr_in`, teardown listener'а/соединений,
+`fork`/`dup` — `-ENOTSUP`, как у UDP, `libpagh::net::TcpListener` и
+native-фикстуру `tcp_echo`. Попутно исправлен used-ring virtio-net: драйвер
+раньше «перепрыгивал» несколько завершений, если ACK, данные и FIN приходили
+одним пакетом, и `recv` ждал retransmit.
 
 ![user mode: run demo, run fault, run spin](docs/user.png)
 
@@ -225,7 +234,7 @@ SELFTEST SUMMARY: 7/7 passed
 | Сеть (M7) | готово | virtio-net (modern, polled) + свой стек: Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP-клиент, DNS-резолвер, `net`/`dhcp`/`ping`/`dns`/`http`; без smoltcp и внешних крейтов. Для userland — один active-open TCP-сокет (`AF_INET`/`SOCK_STREAM`, IPv4-литерал) и UDP-сокеты (`AF_INET`/`SOCK_DGRAM`, `bind`/per-port-очередь/`sendto`/`recvfrom`); syscall'ы сами опрашивают NIC; `read`/`write`/`poll` работают на сокете | `src/net/`, `src/drivers/virtio_net.rs`, `src/user/syscall.rs` |
 | Пакеты (`pkg`) | MVP | нативный установщик (не apt): плоский `index` и `.ppkg` с репозитория по **plain HTTP** (`http://IP:port/`, в QEMU хост — `10.0.2.2`), потоковая загрузка в `/mnt/pkg` кусками 4 KiB, шлюз «размер + SHA-256 из индекса» **до** разбора `PPKG0001`; `kind=app` → `/mnt/bin/<name>`, `applet-bundle` → `/mnt/bin/paghbox` + симлинки; манифест в `/mnt/pkg/<name>.manifest`; TLS/OpenPGP/apt по-прежнему нет | `src/pkg/` |
 | apt / TLS / OpenPGP | **нет** | apt намеренно не подключён, пока нет vendored TLS + проверки подписей Debian; `pkg` — отдельный нативный путь для портов | — |
-| Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 4 блока/указателя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 10 user-mode (ABI-фикстуры `argv`/`abi` с секциями потоков/фьютексов и сигналов — обработчик, restorer, `rt_sigreturn`, pending/blocked, SIG_IGN, EINTR на futex, synchronous SIGSEGV, негативные коды; 10/10 с диском, 8/10 + 2 SKIP без `/mnt`) + 11 сети (идемпотентность по ledger'у), QEMU-smoke в шести режимах (serial, ramfb, диск-fresh, диск-existing, net, keyboard), установка пакета проверяется отдельным тестом `pkg`, живые сокетные прогоны — `tools/test_sockets.py` (TCP) и `tools/test_udp.py` (UDP, libpagh-фикстура; не в CI); проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/net/selftest.rs`, `src/pkg/`, `.github/smoke.py`, `tools/` |
+| Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 4 блока/указателя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 10 user-mode (ABI-фикстуры `argv`/`abi` с секциями потоков/фьютексов, сигналов и TCP-сервера: bind/listen/nonblocking accept/EAGAIN/dup-ENOTSUP; 10/10 с диском, 8/10 + 2 SKIP без `/mnt`) + 11 сети (идемпотентность по ledger'у), QEMU-smoke в шести режимах (serial, ramfb, диск-fresh, диск-existing, net, keyboard), установка пакета проверяется отдельным тестом `pkg`, живые сокетные прогоны — `tools/test_sockets.py` (TCP-клиент), `tools/test_udp.py` (UDP) и `tools/test_tcp_server.py` (TCP-сервер: `mke2fs -d` + QEMU `hostfwd`; libpagh-фикстуры, не в CI); проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/net/selftest.rs`, `src/pkg/`, `.github/smoke.py`, `tools/` |
 | CI | готово | `fmt`, debug/release build, QEMU-smoke в шести режимах: serial, ramfb, диск-fresh (формат/монтирование/запись), диск-existing (повторная загрузка читает файл), net (DHCP + ping шлюза), keyboard (virtio-keyboard печатает `help`/`halt` через монитор QEMU); во всех приложен virtio-tablet, в keyboard — ещё и virtio-keyboard | `.github/workflows/ci.yml` |
 
 ---
@@ -357,8 +366,10 @@ selftest        # + SELFTEST user-*: 10/10 с /mnt (без диска 8/10 + 2 S
 | 222 | `mmap` | только `MAP_PRIVATE|MAP_ANONYMOUS`, `fd = -1`, `offset = 0`; `PROT_READ|WRITE|EXEC`, W^X (W и X вместе — `-EINVAL`), `PROT_NONE` — `-EINVAL`; `addr` — подсказка, окно `USER_MMAP_BASE..TOP`; кадры выделяются и обнуляются сразу, ошибка откатывает всё; предел 256 страниц/регионов 8 |
 | 215 | `munmap` | только страницы, созданные `mmap` этого процесса; `addr` выровнен, `length > 0`; частичный unmap делит регион; чужая страница/дырка — `-EINVAL` |
 | 226 | `mprotect` | `PROT_*` как у `mmap`; все страницы диапазона обязаны быть живыми user-leaf (`U|R`) до первой записи PTE; W^X; смена прав сохраняет кадр и делает `fence.i` |
-| 198 | `socket` | `AF_INET` (2), protocol 0: `SOCK_STREAM` (1) — один TCP-клиент (второй — `-ENOSPC`); `SOCK_DGRAM` (2) — UDP-сокет, можно много, `SOCK_NONBLOCK` (`0x800`) допустим только для DGRAM; иначе `-EAFNOSUPPORT`; fd ≥ 3 |
-| 200 | `bind` | UDP: 16-байтный `sockaddr_in`; `addrlen = 16`, family 2; адрес `0.0.0.0` или текущий lease, иначе `-EADDRNOTAVAIL`; port 0 — эфемерный; занятый порт — `-EADDRINUSE`, повторный bind — `-EINVAL`; TCP-дескриптор — `-ENOTSUP` |
+| 198 | `socket` | `AF_INET` (2), protocol 0: `SOCK_STREAM` (1) — один активный TCP-клиент (второй — `-ENOSPC`; listener и принятые соединения — отдельные дескрипторы); `SOCK_DGRAM` (2) — UDP-сокет, можно много; `SOCK_NONBLOCK` (`0x800`) допустим для обоих (UDP `recvfrom`, stream `accept`); иначе `-EAFNOSUPPORT`; fd ≥ 3 |
+| 200 | `bind` | 16-байтный `sockaddr_in`; `addrlen = 16`, family 2; адрес `0.0.0.0` или текущий lease, иначе `-EADDRNOTAVAIL`; port 0 — эфемерный. UDP: занятый порт — `-EADDRINUSE`, повторный bind — `-EINVAL`. TCP: порт резервируется для `listen`, второй listener-резерв — `-EADDRINUSE`, bind connected/listener — `-EINVAL` |
+| 201 | `listen` | TCP: `fd` после `bind(200)`, `backlog` зажимается в `1..=4` (один listener, фиксированная очередь на 4); повторный `listen` меняет backlog; unbound/connected — `-EINVAL`, UDP — `-ENOTSUP` |
+| 202 | `accept` | TCP listener: `*sockaddr_in` (можно NULL) и `*socklen_t` (ёмкость ≥ 16); новое соединение — fd ≥ 3, peer-адрес и `*addrlen = 16`; блокирующее ожидание опрашивает NIC до 30 s и даёт `-EAGAIN`, `SOCK_NONBLOCK` — сразу `-EAGAIN`; `-EINVAL`/`-ENOTSUP`/`-EFAULT` |
 | 203 | `connect` | TCP: `a1` — 16-байтный `sockaddr_in` (family u16 LE, port u16 BE, addr[4], padding), `a2 = 16`; указатель и family валидируются, ошибки — `-EFAULT`/`-EINVAL`/`-EAFNOSUPPORT`/`-ENETUNREACH`/`-EHOSTUNREACH`/`-ECONNREFUSED`/`-ETIMEDOUT`; внутри опрашивает NIC до готовности handshake; UDP — `-ENOTSUP` |
 | 206 | `sendto` | TCP: `send` на connected-сокете, `flags = 0`, `dest` опционален (валидируется и игнорируется), синхронный (ждёт ACK); UDP: `dest` обязателен, `flags` 0/`MSG_DONTWAIT`, payload ≤ 1024 B (иначе `-EMSGSIZE`), первый send авто-привязывает порт; ошибки — `-ENOTCONN`/`-EDESTADDRREQ`/`-EPIPE`/`-ECONNRESET`/`-ETIMEDOUT`/`-EHOSTUNREACH` |
 | 207 | `recvfrom` | TCP: `flags = 0`, `src/src_len` опциональны (peer), **неблокирующий**: `-EAGAIN` — повторить, 0 — peer закрылся. UDP: блокируется до дейтаграммы (опрос NIC с прерываниями, бюджет ~10 s), `MSG_DONTWAIT`/`SOCK_NONBLOCK` — один poll и `-EAGAIN`; `src` заполняется отправителем; очередь на порт — 4 дейтаграммы, старая вытесняется |
@@ -430,19 +441,25 @@ sibling-потоки снимаются. На успехе `dispatch` не пи�
 буфер на 264 байта покрывает самое длинное имя ext2. Неизвестный номер —
 `-ENOSYS`; плохой указатель — `-EFAULT`, а не page fault.
 
-Сокетный ABI — один active-open TCP-клиент и UDP-сокеты. Второй TCP
-`socket()` при открытом первом — `-ENOSPC`; `connect` принимает только
-IPv4-литерал (DNS-вызова нет), `recv` неблокирующий, `shutdown` закрывает оба
-направления. UDP-сокет создаётся без порта, `bind(200)` даёт его (0 — эфемерный
-из 32768..60999), `sendto` без bind привязывает сам; дейтаграммы лежат в
-per-port очереди (4 слота, старейшая вытесняется), `recvfrom` без
-`MSG_DONTWAIT` блокируется на опросе NIC. `connect`/`send`/`close`/
-`recvfrom` включают прерывания на время ожидания (как `nanosleep`), чтобы тики
-шли и дедлайн работал, и крутят `net::poll()` — иначе NIC некому опрашивать,
-пока исполняется user-программа. `listen`/`accept`, UDP-`connect`, IPv6,
-`sendmsg`/`recvmsg` и TLS отсутствуют; `sendmsg`/`recvmsg` отвечают `-ENOSYS`.
-Программа, вышедшая с открытым сокетом, закрывает его (и освобождает порт) при
-teardown прогона.
+Сокетный ABI — один active-open TCP-клиент, TCP-сервер и UDP-сокеты. Второй
+**активный** TCP `socket()` при открытом первом — `-ENOSPC`; listener и
+принятые соединения — отдельные виды дескриптора, поэтому у сервера их может
+быть несколько. `connect` принимает только IPv4-литерал (DNS-вызова нет),
+`recv` неблокирующий, `shutdown` закрывает оба направления. TCP-сервер:
+`bind(200)` резервирует порт (0 — эфемерный), `listen(201)` кладёт backlog в
+`1..=4`, `accept(202)` отдаёт старейшее полностью установленное соединение и
+peer `sockaddr_in`; при переполнении очереди handshake сбрасывается RST.
+Один listener и один bind-резерв на ядро; восемь слотов соединений (клиент +
+принятые), по 4 KiB приёма на соединение. UDP-сокет создаётся без порта,
+`bind(200)` даёт его (0 — эфемерный из 32768..60999), `sendto` без bind
+привязывает сам; дейтаграммы лежат в per-port очереди (4 слота, старейшая
+вытесняется), `recvfrom` без `MSG_DONTWAIT` блокируется на опросе NIC.
+`connect`/`send`/`close`/`recvfrom`/`accept` включают прерывания на время
+ожидания (как `nanosleep`), чтобы тики шли и дедлайн работал, и крутят
+`net::poll()` — иначе NIC некому опрашивать, пока исполняется user-программа.
+UDP-`connect`, IPv6, `sendmsg`/`recvmsg` и TLS отсутствуют;
+`sendmsg`/`recvmsg` отвечают `-ENOSYS`. Программа, вышедшая с открытым
+сокетом, закрывает его (и освобождает порт) при teardown прогона.
 
 Сигналы (129/131/132/134/135/139) — нативные, не Linux-совместимые по
 структурам: `struct sigaction` — это `handler, flags, mask, restorer`, а
@@ -705,19 +722,20 @@ IPv4, ICMP и UDP, а `dhcp`/`dns`/`tcp` — маленькие клиенты. 
   аутентификация источника. TLS-стек и OpenPGP-проверка подписей — следующий
   майлстоун; `apt` намеренно не подключается, пока их нет: «скачали и поставили
   без проверки» — это ровно то, чего fail-closed apt не делает.
-* **TCP-клиент минимальный.** Одно active-open соединение, без
-  retransmission-таймера (кроме двух SYN), out-of-order reassembly, congestion
-  control и прослушивания портов; IPv6, фрагментация и несколько интерфейсов не
-  поддерживаются.
-* **Сокетный ABI узкий.** `AF_INET`/`SOCK_STREAM` (одно соединение) и
-  `AF_INET`/`SOCK_DGRAM` (UDP: `bind`/`sendto`/`recvfrom`, per-port очередь
-  4×1024 B, IPv4-литералы); `listen`/`accept`, UDP-`connect`,
+* **TCP минимальный.** Один active-open клиент, один listener и восемь слотов
+  соединений; без retransmission-таймера (кроме двух SYN), out-of-order
+  reassembly, congestion control, keepalive, TIME_WAIT и half-close; backlog ≤ 4,
+  один 4 KiB-буфер на соединение; IPv6, фрагментация и несколько интерфейсов не
+  поддерживаются. Один listener и один bind-резерв на ядро.
+* **Сокетный ABI узкий.** `AF_INET`/`SOCK_STREAM` (активный клиент, listener и
+  принятые соединения) и `AF_INET`/`SOCK_DGRAM` (UDP: `bind`/`sendto`/
+  `recvfrom`, per-port очередь 4×1024 B, IPv4-литералы); UDP-`connect`,
   `sendmsg`/`recvmsg`, `select`, DNS/getaddrinfo и TLS отсутствуют. `recv`
   на TCP неблокирующий (`-EAGAIN`), `shutdown` без half-close. UDP ограничен
   8 одновременными bind, одним интерфейсом и дейтаграммой ≤ 1024 B; блокирующий
   `recvfrom` имеет бюджет ~10 s и не прерывается сигналом (возвращает `-EAGAIN`
-  по дедлайну). Этого достаточно HTTP/1.0-клиенту (`examples/http_get`) и
-  простому UDP-эху, но не Python-рантайму целиком.
+  по дедлайну). Этого достаточно HTTP/1.0-клиенту (`examples/http_get`),
+  простому UDP-эху и TCP-эху, но не Python-рантайму целиком.
 * **Нет SMP.** Один hart, остальные запаркованы в `_start`; планировщик и локи
   это предполагают.
 * **Нет восстановления после S-mode исключения.** Сбой в ядре — печать и
@@ -748,7 +766,7 @@ src/memory/selftest.rs         in-QEMU self-tests памяти (selftest)
 src/user/mod.rs                run_image: root/ASID -> ELF -> user-стек -> задача -> sret; fork/execve/wait4, очистка сирот
 src/user/process.rs            таблица процессов: root/satp/asid, threads/exit/wait, image/heap-списки
 src/user/elf.rs                ELF64-загрузчик: load_in(root), PT_LOAD с U=1, откат кадров
-src/user/syscall.rs            ecall-диспетчер: 52 номера — файлы/ФС, mmap/munmap/mprotect, pipe/dup/poll, сигналы, сокеты, clone/fork/execve/wait4/getppid
+src/user/syscall.rs            ecall-диспетчер: 55 номеров — файлы/ФС, mmap/munmap/mprotect, pipe/dup/poll, сигналы, сокеты, clone/fork/execve/wait4/getppid
 src/user/futex.rs              статическая futex-очередь (32 ожидающих / 16 адресов) поверх block_current/wake_task
 src/user/selftest.rs           in-QEMU self-tests user mode (10 проверок)
 src/net/mod.rs                 сетевой стек: poll, ARP-кэш, диспетчер кадров, ping

@@ -335,7 +335,10 @@ def run(args: argparse.Namespace) -> None:
         transcript.append("RESULT: PASS — selftest 10/10 with a live socket, http_get exit 0")
 
         args.transcript.parent.mkdir(parents=True, exist_ok=True)
-        args.transcript.write_text("\n".join(transcript) + "\n", encoding="utf-8")
+        # Serial text carries the guest's CR characters; the committed
+        # transcript uses plain LF so `git diff --check` stays quiet.
+        text = ("\n".join(transcript) + "\n").replace("\r\n", "\n").replace("\r", "")
+        args.transcript.write_text(text, encoding="utf-8")
         print(f"transcript: {args.transcript}")
         print("LIVE SOCKETS: PASS")
     finally:

@@ -163,6 +163,8 @@ const SYS_FTRUNCATE: usize = 46;
 const SYS_RENAMEAT2: usize = 276;
 const SYS_SOCKET: usize = 198;
 const SYS_BIND: usize = 200;
+const SYS_LISTEN: usize = 201;
+const SYS_ACCEPT: usize = 202;
 const SYS_CONNECT: usize = 203;
 const SYS_SENDTO: usize = 206;
 const SYS_RECVFROM: usize = 207;
@@ -3212,6 +3214,24 @@ pub extern "C" fn abi_main() -> i32 {
         410,
         "bind duplicate port",
     );
+    check(
+        syscall2(SYS_LISTEN, udp2 as usize, 1) == ENOTSUP,
+        423,
+        "listen on UDP socket",
+    );
+    let mut udp_peer = [0u8; 16];
+    let mut udp_peer_len = 16u32;
+    check(
+        syscall3(
+            SYS_ACCEPT,
+            udp2 as usize,
+            udp_peer.as_mut_ptr() as usize,
+            &mut udp_peer_len as *mut u32 as usize,
+        ) == ENOTSUP,
+        424,
+        "accept on UDP socket",
+    );
+
     let mut foreign_address = udp_address;
     foreign_address[4..8].copy_from_slice(&[10u8, 0, 2, 2]);
     check(
@@ -3549,6 +3569,122 @@ pub extern "C" fn abi_main() -> i32 {
         syscall1(SYS_CLOSE, sock2 as usize) == 0,
         165,
         "close second socket",
+    );
+
+    // ── TCP passive open: bind(200) on a stream socket, listen(201),
+    //    non-blocking accept(202), the accept queue and its teardown. No host
+    //    connection is needed: the listener is created with SOCK_NONBLOCK, so
+    //    an empty queue answers EAGAIN immediately instead of polling 30 s. ──
+    let mut server_address = [0u8; 16];
+    server_address[0..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+    server_address[2..4].copy_from_slice(&45680u16.to_be_bytes());
+    let server = syscall3(SYS_SOCKET, AF_INET, (SOCK_STREAM | 0x800) as usize, 0);
+    check(server >= 3, 430, "socket(SOCK_STREAM|SOCK_NONBLOCK)");
+    check(
+        syscall2(SYS_LISTEN, server as usize, 4) == EINVAL,
+        431,
+        "listen before bind",
+    );
+    check(
+        syscall3(SYS_BIND, server as usize, server_address.as_ptr() as usize, 16) == 0,
+        432,
+        "bind TCP port",
+    );
+    check(
+        syscall2(SYS_LISTEN, server as usize, 4) == 0,
+        433,
+        "listen TCP port",
+    );
+    check(
+        syscall2(SYS_LISTEN, server as usize, 8) == 0,
+        434,
+        "listen updates backlog",
+    );
+    check(
+        syscall3(SYS_BIND, server as usize, server_address.as_ptr() as usize, 16) == EINVAL,
+        435,
+        "bind a listener",
+    );
+    let mut peer = [0u8; 16];
+    let mut peer_len = 16u32;
+    check(
+        syscall3(
+            SYS_ACCEPT,
+            server as usize,
+            0x10,
+            &mut peer_len as *mut u32 as usize,
+        ) == EFAULT,
+        437,
+        "accept bad address",
+    );
+    check(
+        syscall3(
+            SYS_ACCEPT,
+            server as usize,
+            peer.as_mut_ptr() as usize,
+            &mut peer_len as *mut u32 as usize,
+        ) == EAGAIN,
+        438,
+        "accept empty queue",
+    );
+    check(
+        syscall3(SYS_ACCEPT, server as usize, 0, 0) == EAGAIN,
+        439,
+        "accept empty queue without address",
+    );
+    let mut listener_poll = [0u8; 8];
+    listener_poll[0..4].copy_from_slice(&(server as i32).to_le_bytes());
+    listener_poll[4..6].copy_from_slice(&1i16.to_le_bytes()); // POLLIN
+    check(
+        syscall3(SYS_POLL, listener_poll.as_mut_ptr() as usize, 1, 0) == 0,
+        450,
+        "poll listener with an empty accept queue",
+    );
+    let listener_dup = syscall1(SYS_DUP, server as usize);
+    check(listener_dup >= 3, 440, "dup listener descriptor");
+    check(
+        syscall3(
+            SYS_WRITE,
+            listener_dup as usize,
+            b"x".as_ptr() as usize,
+            1,
+        ) == ENOTSUP,
+        441,
+        "dup of a listener is ENOTSUP",
+    );
+    check(
+        syscall1(SYS_CLOSE, listener_dup as usize) == 0,
+        442,
+        "close dup listener",
+    );
+    check(
+        syscall1(SYS_CLOSE, server as usize) == 0,
+        443,
+        "close listener",
+    );
+    let server2 = syscall3(SYS_SOCKET, AF_INET, SOCK_STREAM as usize, 0);
+    check(server2 >= 3, 444, "socket after listener close");
+    check(
+        syscall3(SYS_BIND, server2 as usize, server_address.as_ptr() as usize, 16) == 0,
+        445,
+        "rebind released TCP port",
+    );
+    check(
+        syscall1(SYS_CLOSE, server2 as usize) == 0,
+        446,
+        "close pre-listen stream socket",
+    );
+    let unbound = syscall3(SYS_SOCKET, AF_INET, SOCK_STREAM as usize, 0);
+    check(unbound >= 3, 447, "socket for unbound accept");
+    check(
+        syscall3(SYS_ACCEPT, unbound as usize, 0, 0) == EINVAL,
+        448,
+        "accept on an unbound stream socket",
+    );
+    check(
+        syscall1(SYS_CLOSE, unbound as usize) == 0,
+        449,
+        "close unbound stream socket",
     );
 
     // ── native threads: clone/gettid/futex/thread exit (runs with or without /mnt) ──

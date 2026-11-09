@@ -59,7 +59,7 @@
 | `net/wire.rs` | чистые форматы Ethernet/ARP/IPv4/ICMP/UDP/TCP/DHCP/DNS и контрольные суммы (без устройства и часов) |
 | `net/dhcp.rs` | DHCP-клиент DISCOVER/OFFER/REQUEST/ACK |
 | `net/dns.rs` | stub-резолвер A-записей через UDP |
-| `net/tcp.rs` | минимальный active-open TCP-клиент для HTTP/1.0; `recv_nonblocking` для socket `recv`, `peer()` для `recvfrom` |
+| `net/tcp.rs` | TCP: active-open клиент для HTTP/1.0 и пассивный open (`bind`/`listen`/`accept`, очередь ≤ 4, 8 слотов); `recv_nonblocking[_id]` для socket `recv`, `peer[_id]` для `recvfrom`/`accept` |
 | `net/selftest.rs` | одиннадцать проверок сети для `selftest` (без NIC) |
 | `pkg/mod.rs` | нативный установщик `pkg`: `repo`/`index`/`list`/`install`/`remove`/`installed`, HTTP поверх `net::tcp`, индекс в фиксированных массивах, шлюз «размер + SHA-256» до разбора `PPKG0001`, `/mnt/pkg/<name>.manifest` |
 | `pkg/sha256.rs` | потоковый SHA-256 (FIPS 180-4) без аллокаций; `selftest()` для `pkg selftest` и `cfg(test)`-векторы |

@@ -589,8 +589,10 @@ PLIC, virtio-окна), а `elf::load_in` добавляет поверх тол
 | 276 | `renameat2` | `vfs::rename` после проверки источника и родителя назначения; одна транзакция ext2 |
 | 53 | `fchmodat` | `mode & 0o7777` в per-process таблицу по `fs_ino`; `fstat` её читает, inode не меняется; синтетика — `-ENOTSUP`; fork таблицу не наследует |
 | 46 | `ftruncate` | `VfsNode::truncate`; 0/1/2 — `-EINVAL`, каталог — `-EISDIR`, read-only fd — `-EBADF` |
-| 198 | `socket` | `AF_INET`/0: `SOCK_STREAM` — `FdEntry::Socket { id, connected }`, второе соединение при открытом первом — `-ENOSPC`; `SOCK_DGRAM` — `FdEntry::UdpSocket { port, nonblocking }`, можно несколько, `SOCK_NONBLOCK` — бит типа |
-| 200 | `bind` | UDP: 16-байтный `sockaddr_in`; `addrlen = 16`, family 2; `0.0.0.0`/lease, иначе `-EADDRNOTAVAIL`; port 0 — эфемерный (32768..60999), занятый — `-EADDRINUSE`, повторный — `-EINVAL`; TCP — `-ENOTSUP`; `net::udp_bind` |
+| 198 | `socket` | `AF_INET`/0: `SOCK_STREAM` — один активный `FdEntry::Socket { id, connected, bound, nonblocking }` (второй активный — `-ENOSPC`); listener — `FdEntry::Listener`, принятые — `FdEntry::TcpConn { id }`; `SOCK_DGRAM` — `FdEntry::UdpSocket { port, nonblocking }`, можно несколько; `SOCK_NONBLOCK` — бит типа (UDP `recvfrom`, stream `accept`) |
+| 200 | `bind` | 16-байтный `sockaddr_in`; `addrlen = 16`, family 2; `0.0.0.0`/lease, иначе `-EADDRNOTAVAIL`; port 0 — эфемерный. UDP: 32768..60999, занятый — `-EADDRINUSE`, повторный — `-EINVAL`; `net::udp_bind`. TCP: резерв порта для `listen` в единственном listener-слоте (`net::tcp::bind_port`), второй резерв — `-EADDRINUSE`, connected/listener — `-EINVAL` |
+| 201 | `listen` | TCP: включает пассивный приём для зарезервированного порта, backlog зажимается в `1..=4`; повторный вызов меняет backlog; unbound — `-EINVAL`, UDP — `-ENOTSUP`; `net::tcp::listen` |
+| 202 | `accept` | TCP listener: валидирует `*sockaddr_in`/`*socklen_t` до ожидания, забирает старейшее соединение из очереди, ставит `FdEntry::TcpConn`, пишет peer-адрес и `*addrlen = 16`; блокирующий опрос NIC до 30 s (`net::tcp::accept`), `SOCK_NONBLOCK` — один poll и `-EAGAIN` |
 | 203 | `connect` | TCP: 16-байтный `sockaddr_in` через `copy_from_user`; family/port/addr проверяются, вызов идёт в `net::tcp::connect` и опрашивает NIC до handshake или дедлайна; ошибки — `-ENETUNREACH`/`-EHOSTUNREACH`/`-ECONNREFUSED`/`-ETIMEDOUT`; UDP — `-ENOTSUP` |
 | 206 | `sendto` | TCP: `send` на connected-сокете; `write` на socket fd идёт сюда же; `tcp::send` синхронный (ждёт ACK). UDP: `dest` обязателен, payload ≤ 1024 B, первый send авто-привязывает порт, `net::udp_send_from`; `-ENOTCONN`/`-EDESTADDRREQ`/`-EMSGSIZE`/`-EHOSTUNREACH`/`-EPIPE`/`-ECONNRESET`/`-ETIMEDOUT` |
 | 207 | `recvfrom` | TCP: `recv` на connected-сокете; `read` на socket fd идёт сюда же; `tcp::recv_nonblocking` опрашивает NIC один раз, `-EAGAIN` — повторить, 0 — EOF; опциональный `src` заполняется peer'ом. UDP: `net::udp_wait_into`/`udp_take_into`, блокирующий опрос до 1000 тиков или `MSG_DONTWAIT`/`SOCK_NONBLOCK` → `-EAGAIN`; `src` заполняется отправителем; очередь порта — 4×1024 B |
@@ -621,29 +623,38 @@ TCP-соединения и UDP-порта остаётся один владе�
 сохраняет; offset файла копируется, а не делится (отличие от POSIX
 open-file-description). Блокировка таблицы не держится через VFS/block-вызов:
 `Arc` и offset копируются, I/O идёт без лока, новый offset публикуется после.
-`release_fds` собирает pipe-ссылки, TCP-признак и UDP-порты под локом,
-отпускает ссылки, закрывает TCP и вызывает `udp_unbind` уже без него.
+`release_fds` собирает pipe-ссылки, listener, id принятых TCP-соединений,
+bind-резервы и UDP-порты под локом, отпускает ссылки, закрывает соединения,
+listener и вызывает `udp_unbind` уже без него.
 
 **Сокеты** — единственный сетевой API для userland, и он намеренно узкий.
-`FdEntry::Socket { id, connected }` (TCP) и `FdEntry::UdpSocket { port,
-nonblocking }` живут в per-process таблице; один статический TCP-клиент
-(`net::tcp`) допускает одно соединение, поэтому второй TCP `socket()` —
-`-ENOSPC`, а `close`/`shutdown` освобождают слот. UDP-сокетов можно много;
-`bind(200)` резервирует порт в статической таблице (8 слотов), `handle_udp`
-кладёт дейтаграммы в его очередь (4 × 1024 B, старейшая вытесняется), `close`
+`FdEntry::Socket { id, connected, bound, nonblocking }` (активный клиент),
+`FdEntry::Listener` (единственный listener), `FdEntry::TcpConn { id }`
+(принятые соединения) и `FdEntry::UdpSocket { port, nonblocking }` живут в
+per-process таблице. Второй **активный** TCP `socket()` при открытом первом —
+`-ENOSPC`; listener и принятые соединения не считаются, поэтому сервер может
+держать listener и несколько `TcpConn`. `net::tcp` владеет таблицей из восьми
+слотов (клиент + пассивные), одним listener-слотом с accept-очередью на 4 и
+4 KiB приёма на соединение. `bind(200)` на stream-сокете резервирует порт,
+`listen(201)` включает приём, `accept(202)` забирает соединение и заполняет
+peer `sockaddr_in`; переполненная очередь отвечает RST. `close` listener'а
+сбрасывает непринятые соединения и не трогает принятые; `close` соединения
+шлёт FIN (RST для половинного passive). UDP-сокетов можно много; `bind(200)`
+резервирует порт в статической таблице (8 слотов), `handle_udp` кладёт
+дейтаграммы в его очередь (4 × 1024 B, старейшая вытесняется), `close`
 освобождает порт. `connect` валидирует 16-байтный `sockaddr_in`
 (`copy_from_user`, family, port big-endian) и крутит `net::poll()` до
 handshake; `send` синхронный (ждёт ACK), `recv` неблокирующий и возвращает
-`-EAGAIN`. UDP `recvfrom` без `MSG_DONTWAIT` блокируется на том же опросе с
-бюджетом 1000 тиков, затем `-EAGAIN`; `MSG_DONTWAIT`/`SOCK_NONBLOCK` — один
-poll. Все ожидания идут через `with_network_interrupts`: syscall приходит с
-`SIE = 0`, и без временно разрешённых прерываний тики стояли бы, дедлайн не
-наступал бы, а планировщик не мог бы вытеснить программу, застрявшую в
-`connect`/`send`/`recvfrom`. Локов на это время не удерживается;
-`net::poll()` вызывается внутри каждого шага ожидания, поэтому NIC не остаётся
-без опроса, пока шелл не в idle-цикле. `read`/`write`/`close`/`poll` на сокете
-маршрутизируются в те же функции; teardown прогона закрывает сокет (и
-освобождает UDP-порт), оставленный программой открытым, до следующего `run`.
+`-EAGAIN`. TCP `accept` без `SOCK_NONBLOCK` — такой же ограниченный опрос, до
+30 s; UDP `recvfrom` без `MSG_DONTWAIT` — до 10 s. Все ожидания идут через
+`with_network_interrupts`: syscall приходит с `SIE = 0`, и без временно
+разрешённых прерываний тики стояли бы, дедлайн не наступал бы, а планировщик не
+мог бы вытеснить программу, застрявшую в `connect`/`send`/`recvfrom`/`accept`.
+Локов на это время не удерживается; `net::poll()` вызывается внутри каждого шага
+ожидания, поэтому NIC не остаётся без опроса, пока шелл не в idle-цикле.
+`read`/`write`/`close`/`poll` на сокете маршрутизируются в те же функции;
+teardown прогона закрывает сокеты (и освобождает UDP-порт/bind-резерв),
+оставленные программой открытыми, до следующего `run`.
 
 **User heap** — 1 MiB в `0x2000_0000` (выше максимального образа, ниже стека, вне
 окон устройств). `brk` мапит кадры PMM в root процесса и обнуляет их;
@@ -661,12 +672,13 @@ poll. Все ожидания идут через `with_network_interrupts`: sys
 ≤ 512 B) и не грузит его целиком в heap, поэтому работает и на 100 KiB, и на
 1 MiB. `run` по-прежнему один foreground-образ, но `fork` создаёт второй
 процесс с собственным root/ASID, а `execve`/`wait4` работают (9.4); динамического
-ELF нет. 16 fd на процесс (не более одного TCP-сокета на ядро; UDP — до 8 bind,
-4 дейтаграммы на порт, ≤ 1024 B), heap ровно 1 MiB, `getdents64` без места в
+ELF нет. 16 fd на процесс (один активный TCP-клиент, один listener с очередью
+≤ 4 и восемь TCP-слотов; UDP — до 8 bind, 4 дейтаграммы на порт, ≤ 1024 B),
+heap ровно 1 MiB, `getdents64` без места в
 буфере отдаёт 0 (неотличимо от конца каталога — буфер на 264 B покрывает имя
 ext2), `openat`/`mkdirat` игнорируют `mode`, `chmod` живёт только до конца
 процесса, `uname.release` намеренно `0.10.0` (стабильная строка ABI) при
-`Cargo.toml` 0.17.0. Процессов ≤ 6, потоков ≤ 14 на процесс (16 слотов минус
+`Cargo.toml` 0.18.0. Процессов ≤ 6, потоков ≤ 14 на процесс (16 слотов минус
 `shell`/`idle`), у каждого свой kernel-стек 16 KiB + guard; user-стек — память
 вызывающего, ядро её не освобождает. TLS/PI/requeue, `join`/`waitid` и
 приоритеты отсутствуют; futex-таблица — 32 ожидающих на 16 адресов. `fork` —
@@ -1236,20 +1248,23 @@ split-очереди (RX = 0, TX = 1) и публикует `mac()/send()/recv()
 active-open-соединение, handshake/seq/ack/FIN — достаточно для HTTP/1.0).
 
 Поверх этого клиента и UDP `src/user/syscall.rs` даёт минимальный BSD-ABI
-(`socket`/`bind`/`connect`/`sendto`/`recvfrom`/`setsockopt`/`getsockopt`/
-`shutdown`). TCP-соединение одно: `FdEntry::Socket` в per-process fd-таблице,
-второй TCP `socket()` — `-ENOSPC`; `connect` принимает IPv4-литерал в
-16-байтном `sockaddr_in`, `recv` неблокирующий (`-EAGAIN`), `read`/`write` на
-сокете идут теми же путями. UDP — `FdEntry::UdpSocket`: `bind(200)` даёт
-порт (0 — эфемерный), `handle_udp` кладёт дейтаграмму в per-port очередь
-(8 портов × 4 слота × 1024 B), `sendto` отправляет через `udp_send_from`, а
-`recvfrom` без `MSG_DONTWAIT` опрашивает NIC до дейтаграммы или бюджета
-1000 тиков; `MSG_DONTWAIT`/`SOCK_NONBLOCK` — один poll и `-EAGAIN`. Пока
-user-программа работает, шелл не в idle-цикле, поэтому `connect`/`send`/
-`shutdown`/`close`/блокирующий `recvfrom` сами вызывают `net::poll()` и на
-время ожидания включают прерывания (как `nanosleep`), чтобы тики и вытеснение
-продолжали работать. `listen`/`accept`, UDP-`connect`, DNS и TLS в этот ABI не
-входят.
+(`socket`/`bind`/`listen`/`accept`/`connect`/`sendto`/`recvfrom`/`setsockopt`/
+`getsockopt`/`shutdown`). Активный TCP-клиент один (`FdEntry::Socket`), второй
+`socket()` — `-ENOSPC`; `connect` принимает IPv4-литерал в 16-байтном
+`sockaddr_in`, `recv` неблокирующий (`-EAGAIN`), `read`/`write` на сокете идут
+теми же путями. TCP-сервер: `bind` резервирует порт, `listen(201)` включает
+пассивный приём, `accept(202)` возвращает `FdEntry::TcpConn` и peer-адрес;
+queue ≤ 4, backlog зажимается, восемь слотов соединений, 30 s бюджет
+блокирующего `accept` (`SOCK_NONBLOCK` — сразу `-EAGAIN`). UDP —
+`FdEntry::UdpSocket`: `bind(200)` даёт порт (0 — эфемерный), `handle_udp`
+кладёт дейтаграмму в per-port очередь (8 портов × 4 слота × 1024 B),
+`sendto` отправляет через `udp_send_from`, а `recvfrom` без `MSG_DONTWAIT`
+опрашивает NIC до дейтаграммы или бюджета 1000 тиков;
+`MSG_DONTWAIT`/`SOCK_NONBLOCK` — один poll и `-EAGAIN`. Пока user-программа
+работает, шелл не в idle-цикле, поэтому `connect`/`send`/`shutdown`/`close`/
+блокирующий `recvfrom`/`accept` сами вызывают `net::poll()` и на время
+ожидания включают прерывания (как `nanosleep`), чтобы тики и вытеснение
+продолжали работать. UDP-`connect`, DNS и TLS в этот ABI не входят.
 
 Инварианты, которые легко нарушить:
 
@@ -1263,7 +1278,8 @@ user-программа работает, шелл не в idle-цикле, по
    конфигурации нет, `handle_ipv4` принимает **только** limited broadcast, всё
    остальное отбрасывает.
 5. **Один интерфейс, один адрес, один шлюз, один DNS.** Нет IPv6, нет
-   пересылки (машина не роутер), нет нескольких TCP-соединений; `tcp` — один клиент, и userland видит ровно его.
+   пересылки (машина не роутер); `tcp` — один активный клиент, один listener и
+   до семи принятых/ждущих соединений.
 6. **Ожидание — опрос до дедлайна в тиках**, а не блокирующий сон: иначе сеть
    зависела бы от планировщика и прерываний, которых у NIC нет.
 
@@ -1292,13 +1308,21 @@ user-программа работает, шелл не в idle-цикле, по
   ext2, `debugfs` кладёт libpagh `udp_echo`, host-эхо отвечает на
   `10.0.2.2:PORT`; фикстура печатает bind/sent/recv и выходит 0. Транскрипт —
   `docs/live-udp.txt`.
+* Живой TCP-сервер: `python3 tools/test_tcp_server.py` строит ext2-образ
+  `mke2fs -q -t ext2 -b 1024 -F -d root disk.img` (без предварительной
+  загрузки-форматирования) с libpagh `tcp_echo`, поднимает QEMU `user` с
+  `hostfwd=tcp:127.0.0.1:HOST-:45679` и подключается host-клиентом; фикстура
+  печатает bind/listen/accept/recv/echo и выходит 0. Транскрипт —
+  `docs/live-tcp-server.txt`.
 
 ### 13.4 Чего нет
 
 TLS/apt (следующий майлстоун), IPv6, фрагментации, UDP-`connect`/`sendmsg`/
-`recvmsg`, `listen`/`accept`, нескольких TCP-соединений и интерфейсов,
-DNS-вызова из userland (только `dns`-команда шелла), обновления lease по
-таймеру (только команда `dhcp`), прерываний NIC. UDP-сокеты есть, но
+`recvmsg`, нескольких TCP-listener'ов/интерфейсов, DNS-вызова из userland
+(только `dns`-команда шелла), обновления lease по таймеру (только команда
+`dhcp`), прерываний NIC. TCP-сервер ограничен одним listener'ом, backlog ≤ 4,
+восемью слотами соединений и 4 KiB приёма на соединение; нет out-of-order
+reassembly, congestion control, keepalive, TIME_WAIT и half-close. UDP-сокеты
 ограничены 8 bind, 4 дейтаграммами на порт и payload ≤ 1024 B; блокирующий
 `recvfrom` имеет бюджет ~10 s и не прерывается сигналом. Подробно —
 `src/net/README.md`.

@@ -1,7 +1,7 @@
 # Live UDP acceptance for pagh-riscv
 # kernel: /home/oleg/pagh-riscv/target/riscv64gc-unknown-none-elf/debug/pagh
-# fixture: /home/oleg/pagh-api/target/riscv64gc-unknown-none-elf/release/examples/udp_echo (149072 bytes)
-# host echo server: 127.0.0.1:57088 (guest reachable as 10.0.2.2:57088)
+# fixture: /home/oleg/pagh-api/target/riscv64gc-unknown-none-elf/release/examples/udp_echo (149200 bytes)
+# host echo server: 127.0.0.1:49256 (guest reachable as 10.0.2.2:49256)
 
 == format boot ==
 
@@ -77,15 +77,15 @@ device tree 0x8fe00000
 memory      0x80000000..0x90000000 (256 MiB)
 timebase    10000000 Hz
 console     NS16550 @ 0x10000000
-pmm         62554/65536 frames free (256 MiB tracked), heap 0 KiB in 0 chunk(s)
-sv39        on, satp=0x8000000000080ba4, identity 0x80000000..0x90000000 (RWX below 0x80ba4000, RW above), 65548 pages, 12 device
+pmm         62543/65536 frames free (256 MiB tracked), heap 0 KiB in 0 chunk(s)
+sv39        on, satp=0x8000000000080baf, identity 0x80000000..0x90000000 (RWX below 0x80baf000, RW above), 65548 pages, 12 device
 timer       10 ms ticks (100 Hz, timebase 10000000 Hz)
 plic        0xc000000 context 1, uart irq 10 (rx interrupt on)
 task        16 slots, 16 KiB stack + 4 KiB guard, quantum 8 ticks, timer clock
 virtio-blk: virtio-blk0 at 0x10007000: 131072 sectors (64 MiB)
 virtio-input: tablet at 0x10008000, abs X 0..32767, Y 0..32767
 fs          virtio-blk0 (131072 sectors, 65536 KiB)
-fs          virtio-blk0 is blank ��� formatting ext2
+fs          virtio-blk0 is blank — formatting ext2
 fs          ext2 on /mnt, 4096 B blocks, 16250/16384 blocks free, 4085/4096 inodes free
 virtio-net: no device
 net         no network device
@@ -168,8 +168,8 @@ device tree 0x8fe00000
 memory      0x80000000..0x90000000 (256 MiB)
 timebase    10000000 Hz
 console     NS16550 @ 0x10000000
-pmm         62554/65536 frames free (256 MiB tracked), heap 0 KiB in 0 chunk(s)
-sv39        on, satp=0x8000000000080ba4, identity 0x80000000..0x90000000 (RWX below 0x80ba4000, RW above), 65548 pages, 12 device
+pmm         62543/65536 frames free (256 MiB tracked), heap 0 KiB in 0 chunk(s)
+sv39        on, satp=0x8000000000080baf, identity 0x80000000..0x90000000 (RWX below 0x80baf000, RW above), 65548 pages, 12 device
 timer       10 ms ticks (100 Hz, timebase 10000000 Hz)
 plic        0xc000000 context 1, uart irq 10 (rx interrupt on)
 task        16 slots, 16 KiB stack + 4 KiB guard, quantum 8 ticks, timer clock
@@ -182,16 +182,16 @@ net         DHCP ip 10.0.2.15/255.255.255.0 gw 10.0.2.2 dns 10.0.2.3 lease 86400
 
 Type 'help' for the command list.
 
-pagh:rv64> run /mnt/udp_echo 10.0.2.2 57088 45678
+pagh:rv64> run /mnt/udp_echo 10.0.2.2 49256 45678
 udp: bound 0.0.0.0:45678
-udp: sent 13 bytes to 10.0.2.2:57088
-udp: recv 13 bytes from 10.0.2.2:57088
+udp: sent 13 bytes to 10.0.2.2:49256
+udp: recv 13 bytes from 10.0.2.2:49256
 udp: ok
 run: /mnt/udp_echo exited with code 0
 pagh:rv64>
 
 == host UDP server ==
-received 13 bytes from 127.0.0.1:42861: b'pagh udp echo'
+received 13 bytes from 127.0.0.1:41938: b'pagh udp echo'
 echoed 13 bytes
 
 RESULT: PASS — bind/send/recv over QEMU user net, fixture exit 0

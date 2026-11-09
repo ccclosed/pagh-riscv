@@ -1,6 +1,6 @@
 # Live BSD-socket acceptance for pagh-riscv
 # kernel: /home/oleg/pagh-riscv/target/riscv64gc-unknown-none-elf/debug/pagh
-# http_get: /home/oleg/pagh-api/target/riscv64gc-unknown-none-elf/release/examples/http_get (134984 bytes)
+# http_get: /home/oleg/pagh-api/target/riscv64gc-unknown-none-elf/release/examples/http_get (135232 bytes)
 # host server: 127.0.0.1:8000 (guest reachable as 10.0.2.2:8000)
 
 == format boot ==
@@ -77,8 +77,8 @@ device tree 0x8fe00000
 memory      0x80000000..0x90000000 (256 MiB)
 timebase    10000000 Hz
 console     NS16550 @ 0x10000000
-pmm         62554/65536 frames free (256 MiB tracked), heap 0 KiB in 0 chunk(s)
-sv39        on, satp=0x8000000000080ba4, identity 0x80000000..0x90000000 (RWX below 0x80ba4000, RW above), 65548 pages, 12 device
+pmm         62543/65536 frames free (256 MiB tracked), heap 0 KiB in 0 chunk(s)
+sv39        on, satp=0x8000000000080baf, identity 0x80000000..0x90000000 (RWX below 0x80baf000, RW above), 65548 pages, 12 device
 timer       10 ms ticks (100 Hz, timebase 10000000 Hz)
 plic        0xc000000 context 1, uart irq 10 (rx interrupt on)
 task        16 slots, 16 KiB stack + 4 KiB guard, quantum 8 ticks, timer clock
@@ -101,19 +101,19 @@ lost+found/
 http_get
 pagh:rv64>
  selftest
-[selftest] free frames before: 62399 of 65536
+[selftest] free frames before: 62388 of 65536
 SELFTEST frames-roundtrip PASS
 SELFTEST frame-pattern PASS
 SELFTEST sv39-map-roundtrip PASS
 SELFTEST sv39-translate PASS
 [selftest] heap: 46957 B in use, 65536 B mapped, 1 chunk(s)
 SELFTEST heap-vec PASS
-heap: double free of 0x80c38940 ignored
-heap: refusing to free 0x80ba0680: not a heap block
+heap: double free of 0x80c43940 ignored
+heap: refusing to free 0x80b58e40: not a heap block
 SELFTEST heap-defenses PASS
 SELFTEST heap-chunks PASS
 SELFTEST SUMMARY: 7/7 passed
-[selftest] PMM hygiene: free frames 62399 -> 62399
+[selftest] PMM hygiene: free frames 62388 -> 62388
 SELFTEST block-memblock PASS
 virtio-blk: request failed: 513 bytes is not a non-empty, whole-sector buffer
 virtio-blk: request failed: 0 bytes is not a non-empty, whole-sector buffer
@@ -124,7 +124,7 @@ SELFTEST input-device PASS
 [selftest] block heap: 38701 B used / 65536 B mapped (1 chunk(s)) before, 38701 B / 65536 B (1 chunk(s)) after
 SELFTEST block-heap-hygiene PASS
 SELFTEST SUMMARY (block): 4/4 passed
-[fs selftest] free frames before: 62399 of 65536
+[fs selftest] free frames before: 62388 of 65536
 SELFTEST ext2-format PASS
 SELFTEST ext2-write-read PASS
 SELFTEST ext2-dirs PASS
@@ -138,34 +138,34 @@ SELFTEST ext2-policy PASS
 [fs selftest] on-device: virtio-blk0 root has 4 entries
 SELFTEST ext2-on-device PASS
 SELFTEST ext2 summary: 11/11 passed
-[fs selftest] PMM hygiene: free frames 62399 -> 62399
+[fs selftest] PMM hygiene: free frames 62388 -> 62388
 SELFTEST timer-ticks PASS
 SELFTEST timer-interrupts PASS
 SELFTEST uart-ring PASS
 SELFTEST plic-uart-line PASS
 SELFTEST SUMMARY (arch): 4/4 passed
-[selftest] task PMM free frames before: 62399 of 65536
+[selftest] task PMM free frames before: 62388 of 65536
 [selftest] task interleave: 2 threads x 64 iterations, 130 switch-outs, 4 live slots
 SELFTEST task-interleave PASS
-[selftest] task exit: free frames 62399 -> 62394 (alive) -> 62399 (reaped), stack costs 5 frames
+[selftest] task exit: free frames 62388 -> 62383 (alive) -> 62388 (reaped), stack costs 5 frames
 SELFTEST task-exit-returns-stack PASS
-[selftest] task stack: base 0x80e12000, top 0x80e17000, guard 0x1000 + usable 16384 B, fill untouched (0 B used)
+[selftest] task stack: base 0x80e1d000, top 0x80e22000, guard 0x1000 + usable 16384 B, fill untouched (0 B used)
 SELFTEST task-stack-layout PASS
-[task] STACK OVERFLOW: guard/canary at 0x80e17000 was overwritten; frames returned anyway
+[task] STACK OVERFLOW: guard/canary at 0x80e22000 was overwritten; frames returned anyway
 [selftest] task canary: overflow detected on reap (violations 0 -> 1)
 SELFTEST task-canary PASS
 [selftest] task idle: entered 8 time(s) total, switched back to thread 0
 SELFTEST task-idle PASS
 SELFTEST SUMMARY (task): 5/5 passed
-[selftest] task PMM hygiene: free frames 62399 -> 62399
-[selftest] user PMM free frames before: 62399 of 65536
+[selftest] task PMM hygiene: free frames 62388 -> 62388
+[selftest] user PMM free frames before: 62388 of 65536
 argv: argc=3 argv[0]=argv.elf argv[1]=alpha argv[2]=beta env[0]=PWD=/
 SELFTEST user-abi-argv PASS
 abi: start
 mprotect
 abi: socket connected to 10.0.2.2:8000
 abi: socket send returned 34 bytes
-abi: socket recv got 138 bytes
+abi: socket recv got 166 bytes
 abi: socket shutdown/EOF ok
 abi: threads ok
 abi: signals ok
@@ -195,7 +195,7 @@ SELFTEST user-timer-preempts PASS
 hello from user mode
 SELFTEST user-run-large-file PASS
 SELFTEST SUMMARY (user): 10/10 passed
-[selftest] user PMM hygiene: free frames 62399 -> 62399
+[selftest] user PMM hygiene: free frames 62388 -> 62388
 SELFTEST net-checksum PASS
 SELFTEST net-ethernet PASS
 SELFTEST net-ipv4 PASS
@@ -215,7 +215,7 @@ http_get: connected, sending GET /
 http_get: 166 response bytes
 HTTP/1.0 200 OK
 Server: BaseHTTP/0.6 Python/3.14.7
-Date: Sun, 08 Nov 2026 20:51:30 GMT
+Date: Mon, 09 Nov 2026 00:25:48 GMT
 Content-Type: text/plain
 Content-Length: 28
 

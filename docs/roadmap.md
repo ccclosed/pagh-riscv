@@ -164,13 +164,15 @@ TCP-клиент для HTTP/1.0. Ни smoltcp, ни внешних крейто
 | ICMP echo / ARP | **готово** | `ping 10.0.2.2` → `4/4 replies`; ARP-кэш 8 записей, ответы на request'ы |
 | DNS-резолвер | **готово** | `dns example.com` → A-запись через DNS из lease |
 | TCP-клиент | **готово** | `src/net/tcp.rs`: handshake/seq/ack/FIN, один active-open сокет; `http 10.0.2.2 <port> /` получает ответ от сервера на хосте |
+| TCP-сервер | **готово** | `bind` stream-сокета, `listen(201)`, `accept(202)`, один listener с очередью на 4, 8 слотов соединений; живая libpagh-фикстура `tcp_echo` + `tools/test_tcp_server.py` (`mke2fs -d`, QEMU `hostfwd`) |
 | Логика проверяется без железа | **готово** | `SELFTEST net-* 11/11` (без NIC): checksum-вектор, round-trip заголовков, отказ на порче, DHCP/DNS из фиксированных байт |
 | CI и живой прогон | **готово** | `smoke.py --net` (DHCP+net+ping+halt) в CI; `selftest` дважды с одинаковым PMM-ledger; `docs/net.png` проверен `font_check` |
 
 Не входит в M7: TLS/apt (следующий майлстоун, нужен крипто-слой), IPv6,
-фрагментация, прослушивание TCP, несколько интерфейсов/соединений, обновление
+фрагментация, несколько интерфейсов, несколько TCP-listener'ов, обновление
 lease по таймеру, прерывания NIC. UDP-сокеты как публичный API появились
-позже, в 0.17.0 (`socket(SOCK_DGRAM)`/`bind`/`sendto`/`recvfrom`).
+позже, в 0.17.0 (`socket(SOCK_DGRAM)`/`bind`/`sendto`/`recvfrom`), а TCP-сервер —
+в 0.18.0 (`bind`/`listen(201)`/`accept(202)`, очередь ≤ 4).
 
 Релиз **0.6.0** — это M7: версия в `Cargo.toml`/`Cargo.lock`, тег `0.6.0`,
 GitHub release, скриншот `docs/net.png`.

@@ -50,8 +50,9 @@ NUL (запрос отклоняется до маппинга, `UserError::Argu
 16 слотов каждая; `run_source` сбрасывает новую строку перед спавном,
 `wait4`/раннер освобождает её после последнего потока (включая fault).
 `fork` копирует строку: файлы — `Arc`+offset, pipe — та же ring с +1 ссылкой
-на конец, сокет — `FdEntry::Unsupported` (единственное TCP-соединение остаётся
-у родителя; чтение/запись/`poll` в ребёнке — `-ENOTSUP`). `execve` строку не
+на конец, любой сокет — `FdEntry::Unsupported` (TCP-состояние, listener и
+UDP-порт остаются у родителя; чтение/запись/`poll` в ребёнке — `-ENOTSUP`).
+`execve` строку не
 трогает. Offset файла **копируется**, а не делится между процессами — это
 документированное отличие от POSIX open-file-description: две записи после fork
 двигают каждая свой offset.
@@ -126,18 +127,22 @@ S-mode page fault (тот напечатал бы и остановил hart). �
   `O_TRUNC` выполняет после установки fd и откатывает её при ошибке.
 * `clock_gettime` и `nanosleep` работают от 100 Гц тика: разрешение 10 ms,
   `nsec` всегда кратен миллиону.
-* **Сокеты — один TCP-клиент и UDP.** `socket` принимает `AF_INET` + 0;
-  `SOCK_STREAM` — один TCP-клиент (второй при открытом первом — `-ENOSPC`),
-  `SOCK_DGRAM` — UDP-сокет (можно несколько, `SOCK_NONBLOCK` — бит типа).
-  `connect` валидирует 16-байтный `sockaddr_in` через `copy_from_user`
-  (length, family, port BE) и внутри `net::tcp::connect` крутит `net::poll()`
-  до handshake; на UDP — `-ENOTSUP`. TCP `send` синхронный (ждёт ACK), `recv`
-  **неблокирующий** (`-EAGAIN` — повтор, 0 — EOF). UDP: `bind(200)` даёт
-  локальный порт (`0.0.0.0` или lease, port 0 — эфемерный; занятый —
-  `-EADDRINUSE`), `sendto` требует адрес и payload ≤ 1024 B (иначе
+* **Сокеты — TCP-клиент, TCP-сервер и UDP.** `socket` принимает `AF_INET` + 0;
+  `SOCK_STREAM` — один активный TCP-клиент (второй активный — `-ENOSPC`; listener
+  и принятые соединения — отдельные виды дескриптора), `SOCK_DGRAM` — UDP-сокет
+  (можно несколько); `SOCK_NONBLOCK` — бит типа (UDP `recvfrom`, stream
+  `accept`). `connect` валидирует 16-байтный `sockaddr_in` через
+  `copy_from_user` (length, family, port BE) и внутри `net::tcp::connect` крутит
+  `net::poll()` до handshake; на UDP — `-ENOTSUP`. TCP `send` синхронный (ждёт
+  ACK), `recv` **неблокирующий** (`-EAGAIN` — повтор, 0 — EOF). TCP-сервер:
+  `bind(200)` резервирует локальный порт (`0.0.0.0`/lease, 0 — эфемерный),
+  `listen(201)` зажимает backlog в `1..=4`, `accept(202)` пишет peer-адрес в
+  `sockaddr_in` и возвращает `FdEntry::TcpConn`; очередь на 4, восемь слотов
+  соединений (клиент + принятые), по 4 KiB приёма. UDP: `bind(200)` даёт
+  локальный порт, `sendto` требует адрес и payload ≤ 1024 B (иначе
   `-EMSGSIZE`), `recvfrom` без `MSG_DONTWAIT` блокируется на опросе NIC с
   бюджетом ~10 s и заполняет `src`; per-port очередь — 4 дейтаграммы,
-  старая вытесняется. `connect`/`send`/`shutdown`/`close`/блокирующий
+  старая вытесняется. `connect`/`send`/`shutdown`/`close`/`accept`/блокирующий
   `recvfrom` на время ожидания включают прерывания — иначе в trap-контексте
   тики стоят, дедлайн не работает и планировщик не может вытеснить застрявшую
   программу; `net::poll()` при этом вызывается на каждом шаге, потому что шелл
@@ -145,10 +150,10 @@ S-mode page fault (тот напечатал бы и остановил hart). �
   теми же путями (`read` на UDP — `recv` без source, `write` — `-EDESTADDRREQ`).
   `shutdown` закрывает TCP оба направления, но оставляет fd (последующий
   `read` → 0, `write` → `-EPIPE`); `close` освобождает слот, UDP — ещё и порт.
-  `listen`/`accept`, UDP-`connect`, IPv6, DNS-вызов и TLS отсутствуют.
-  Программа, вышедшая с открытым сокетом, закрывает его (и освобождает UDP-порт)
-  в `release_fds` при teardown прогона; `fork`/`dup` дают ребёнку/копии
-  `-ENOTSUP` (второй владелец bind-а не создаётся).
+  UDP-`connect`, IPv6, DNS-вызов и TLS отсутствуют. Программа, вышедшая с
+  открытым сокетом, закрывает его (и освобождает UDP-порт/bind-резерв) в
+  `release_fds` при teardown прогона; `fork`/`dup` дают ребёнку/копии
+  `-ENOTSUP` (второй владелец соединения/listener'а не создаётся).
 
 ## Процессы, потоки и фьютексы
 
@@ -522,11 +527,12 @@ root: тег — пространство имён TLB, а не обещание
   фьютексы, `join`/`waitid` и приоритеты отсутствуют; futex-таблица 32/16;
   `exit_group` снимает `Ready` и `Blocked`, но не может прервать поток, который
   в этот момент исполняется (на одном hart его нет — это текущий syscall);
-- ровно одно TCP-соединение на ядро и не больше одного `FdEntry::Socket` в
-  живом процессе (`AF_INET`/`SOCK_STREAM`, IPv4-литерал); UDP — до 8 bind,
-  4 дейтаграммы на порт, payload ≤ 1024 B, один интерфейс; без
-  `listen`/`accept`, UDP-`connect`, IPv6, DNS и TLS. TCP `recv` неблокирующий,
-  UDP `recvfrom` блокируется (бюджет ~10 s) или `-EAGAIN` с `MSG_DONTWAIT`;
+- один **активный** TCP-клиент, один listener и таблица из восьми соединений
+  (`AF_INET`/`SOCK_STREAM`, IPv4-литерал); backlog ≤ 4, принятые соединения —
+  отдельные `FdEntry::TcpConn`; UDP — до 8 bind, 4 дейтаграммы на порт,
+  payload ≤ 1024 B, один интерфейс; без UDP-`connect`, IPv6, DNS и TLS.
+  TCP `recv` неблокирующий, `accept` без `SOCK_NONBLOCK` ждёт до 30 s; UDP
+  `recvfrom` блокируется (бюджет ~10 s) или `-EAGAIN` с `MSG_DONTWAIT`;
   `shutdown` без half-close; ребёнок после `fork`/`dup` видит сокет как
   `-ENOTSUP`.
 

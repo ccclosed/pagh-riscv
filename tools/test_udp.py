@@ -250,7 +250,10 @@ def run(args: argparse.Namespace) -> int:
     transcript_path = args.transcript
     if not transcript_path.is_absolute():
         transcript_path = ROOT / transcript_path
-    transcript_path.write_text(transcript, encoding="utf-8")
+    # The serial transcript carries CR and prompt-trailing spaces; save the
+    # canonical LF form so the committed file stays diff-clean.
+    text = "\n".join(line.rstrip() for line in transcript.splitlines()) + "\n"
+    transcript_path.write_text(text, encoding="utf-8")
     print(f"test_udp: PASS — {transcript_path} ({len(transcript)} bytes)")
     print(
         f"test_udp: host received {server.received[0][0]!r} from "

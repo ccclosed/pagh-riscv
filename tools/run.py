@@ -373,10 +373,18 @@ def boot(args: argparse.Namespace, serial_path: str, monitor_path: str) -> subpr
             "-device", "virtio-blk-device,drive=hd0",
         ]
     if getattr(args, "net", False):
+        netdev = "user,id=net0"
+        if getattr(args, "hostfwd", ""):
+            netdev += f",hostfwd={args.hostfwd}"
         cmd += [
-            "-netdev", "user,id=net0",
+            "-netdev", netdev,
             "-device", "virtio-net-device,netdev=net0",
         ]
+        if getattr(args, "pcap", ""):
+            cmd += [
+                "-object",
+                f"filter-dump,id=paghdump,netdev=net0,file={args.pcap}",
+            ]
     print("+", " ".join(cmd), file=sys.stderr)
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -471,6 +479,14 @@ def main() -> int:
         help="attach a virtio-net NIC on QEMU's user network (DHCP: 10.0.2.15/24, gw 10.0.2.2)",
     )
     parser.add_argument(
+        "--hostfwd",
+        default="",
+        metavar="HOST:GUEST",
+        help="with --net, forward 127.0.0.1:HOST to guest port GUEST "
+        "(QEMU hostfwd=tcp:127.0.0.1:HOST-:GUEST)",
+    )
+    parser.add_argument("--pcap", default="", help="with --net, write a filter-dump pcap to PATH")
+    parser.add_argument(
         "--disk",
         default="",
         help="attach a virtio-mmio block device at PATH (M5); created blank when missing",
@@ -493,6 +509,18 @@ def main() -> int:
     args = parser.parse_args()
     if args.release and args.kernel == KERNEL_DEBUG:
         args.kernel = KERNEL_RELEASE
+    if args.hostfwd:
+        if not args.net:
+            parser.error("--hostfwd requires --net")
+        try:
+            host_port, guest_port = args.hostfwd.replace("tcp:", "").split(":", 1)
+            host_port = int(host_port)
+            guest_port = int(guest_port)
+        except ValueError:
+            parser.error("--hostfwd wants HOST:GUEST numeric ports")
+        if not (1 <= host_port <= 65535 and 1 <= guest_port <= 65535):
+            parser.error("--hostfwd ports must be 1..65535")
+        args.hostfwd = f"tcp:127.0.0.1:{host_port}-:{guest_port}"
 
     serial_path = os.path.abspath(args.serial)
     monitor_path = os.path.abspath(args.monitor)

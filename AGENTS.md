@@ -64,6 +64,8 @@ python3 tools/test_pkg.py                    # port 8000 must be free; --release
 python3 tools/test_sockets.py                # port 8000 must be free; writes docs/live-sockets.txt
 # live UDP: ext2 image + QEMU user net + libpagh udp_echo + host echo server
 python3 tools/test_udp.py                    # builds nothing; writes docs/live-udp.txt
+# live TCP server: mke2fs -d image + QEMU user net (hostfwd) + libpagh tcp_echo
+python3 tools/test_tcp_server.py             # builds nothing; writes docs/live-tcp-server.txt
 ```
 
 `rustup target add riscv64gc-unknown-none-elf` once; the nightly is pinned in
@@ -93,6 +95,7 @@ kernel-selftest -> the shell's `selftest`  # in-QEMU memory + block + filesystem
 package-e2e     -> tools/test_pkg.py       # .ppkg + HTTP mirror + QEMU disk, install/run/remove
 socket-live     -> tools/test_sockets.py   # host HTTP server + QEMU user net + libpagh http_get
 udp-live        -> tools/test_udp.py       # ext2 + QEMU user net + libpagh udp_echo + host echo
+tcp-server-live -> tools/test_tcp_server.py # mke2fs -d + QEMU hostfwd + libpagh tcp_echo
 kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
 ```
 
@@ -122,7 +125,7 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
   `pkg` end-to-end harness), `test_sockets.py` (the live TCP acceptance:
   host HTTP server + QEMU user net + libpagh `http_get`), `test_udp.py` (the
   live UDP acceptance: ext2 image + host echo server + libpagh `udp_echo`),
-  `udp_echo_server.py`, `gen_font.py`, `font_check.py`.
+  `udp_echo_server.py`, `test_tcp_server.py`, `gen_font.py`, `font_check.py`.
 - `.github/` — CI workflow and the smoke driver.
 - `run.sh`, `linker.ld`, `rust-toolchain.toml`, `.cargo/config.toml` — build and run.
 - Absent on purpose (do not assume they exist): `host-tests/`, `tools/build.py`,
@@ -394,7 +397,7 @@ fuzzing. That is a gap, not a policy — the rule stands:
 
 ## Versioning
 
-Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.17.0`,
+Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.18.0`,
 which `Cargo.lock` mirrors. **The two move together in one commit**: CI builds with
 `--locked`, and cargo refuses to rewrite the lock (`cannot update the lock file …
 because --locked was passed`), so a `Cargo.toml`-only bump fails the build job in
@@ -438,8 +441,11 @@ seconds. Verify locally with `cargo build --locked` after any version change.
   `0.16.1` bounds the execve path C-string read (a missing NUL no longer walks
   past the 256-byte buffer); `0.16.2` is the C-runtime/dynamic-linking docs
   patch; `0.17.0` adds userland UDP sockets (`socket(SOCK_DGRAM)`, `bind(200)`,
-  `sendto`/`recvfrom`, per-port bounded queues and a libpagh `UdpSocket`).
-  The same rule applies
+  `sendto`/`recvfrom`, per-port bounded queues and a libpagh `UdpSocket`);
+  `0.18.0` adds TCP server sockets (`bind(200)` for a stream socket, `listen(201)`,
+  `accept(202)` with a bounded queue and peer `sockaddr_in`, one listener, a
+  libpagh `TcpListener` and the `tcp_echo` live fixture) and fixes the virtio-net
+  used-ring advance. The same rule applies
   to both: the tag equals the manifest and the `Cargo.lock` entry, and the
   release is not optional.
 
@@ -453,7 +459,7 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
 | Sv39 is on with an **identity** map, so a physical address is still a pointer | the kernel root and every process root copy that identity map; any address handed to a device (`fw_cfg`, ramfb) relies on it. `create_user_space` copies only supervisor leaves, so a kernel mapping added after a process root was created is absent there — do not add kernel maps under a live process without a plan |
 | The tick is 100 Hz and preemption happens only on it (no priorities/deadline scheduler) | scheduling policy is a scheduler change; `timer::set_tick_handler` is the seam, not a policy |
 | No TLS/apt: the network stack speaks plain HTTP | `pkg` verifies size + SHA-256 from the index only (integrity, not signatures) and says so; apt stays deliberately unwired until the vendored-TLS + OpenPGP milestone lands. Never call the digest a signature or `pkg` an apt replacement |
-| TCP is one active-open client (HTTP/1.0), not a general stack; userland gets one `AF_INET`/`SOCK_STREAM` socket plus `AF_INET`/`SOCK_DGRAM` (bind/sendto/recvfrom) | no `listen`/`accept`, UDP `connect`, IPv6 sockets, DNS syscall, multiple TCP connections, out-of-order reassembly, congestion control or TLS; UDP is 8 bindings × 4 datagrams × 1024 B, one interface |
+| TCP is a minimal client + one listener, not a general stack; userland gets one active `AF_INET`/`SOCK_STREAM` client, one listener (`bind`/`listen`/`accept`) and `AF_INET`/`SOCK_DGRAM` (bind/sendto/recvfrom) | one listener, backlog ≤ 4, 8 connection slots (4 KiB rx each); no UDP `connect`, IPv6 sockets, DNS syscall, keepalive/TIME_WAIT/half-close, out-of-order reassembly, congestion control or TLS; UDP is 8 bindings × 4 datagrams × 1024 B, one interface |
 | The NIC is polled and the stack is synchronous | network progress happens while a command, a socket syscall (`connect`/`send`/`recv`/`close`) or the shell's idle loop polls; an IRQ-driven NIC is a later milestone |
 | Interrupt handlers cannot allocate or print | put work in normal context; bump a counter and read it from `time`/`selftest` |
 | The pointer/keyboard have **no IRQ**: both are polled from the shell's idle loop | a long-running command (or a blocking wait that does not poll) freezes the cursor and drops typed bytes; do not put input polling in a place that never returns to the idle loop |
@@ -555,30 +561,37 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
     mutation anywhere else (the shell keeps using the VFS directly); the
     `selftest` run through `userland/abi.elf` is the evidence.
 
-36. **The socket ABI is one TCP connection plus per-port UDP queues, and every
-    wait must pump the NIC.** `socket` accepts `AF_INET`/protocol 0 with
-    `SOCK_STREAM` (one fd; a second is `-ENOSPC`) or `SOCK_DGRAM`
-    (`SOCK_NONBLOCK` optional). `FdEntry::Socket`/`FdEntry::UdpSocket` live in
-    the per-process table; stream `read`/`write`/`close` route to
-    `tcp::recv_nonblocking`/`tcp::send`/`tcp::close`, UDP `read`/`poll`/`close`
-    to the port queue, and `bind`/`sendto`/`recvfrom` are the datagram paths.
-    A user program runs while the shell sits in `wait_for_process`, so **nothing
-    else polls the NIC**: `connect`, `send` and a blocking `recvfrom` run with
-    interrupts enabled for the wait (the same deliberate exception `nanosleep`
-    makes, with no lock held) so ticks and preemption still work, and each wait
-    loop calls `net::poll()` every iteration. TCP `recv` is non-blocking by
-    contract; UDP `recvfrom` blocks only when the descriptor is blocking and
-    `MSG_DONTWAIT` is absent, and even then the wait is bounded (it answers
-    `-EAGAIN` after ~10 s). Every `sockaddr` goes through `copy_from_user`; the
-    length (exactly 16), family, port (big-endian) and address are validated
-    before any state changes. The UDP binding table is static (8 ports, 4
-    datagrams each), the queue drops the oldest datagram when full, and the lock
-    is never held across `copy_to_user` or a NIC poll. IPv4 literals only:
-    there is no DNS syscall, no `listen`/`accept`, no UDP `connect`, no IPv6
-    socket, and no TLS. The live evidence is `tools/test_sockets.py` /
-    `docs/live-sockets.txt` (TCP) and `tools/test_udp.py` / `docs/live-udp.txt`
-    (UDP); the CI-safe evidence is the always-running bad-arg half of
-    `userland/abi.elf` plus its `SKIP` when `10.0.2.2:8000` is closed.
+36. **The socket ABI is one active TCP client, one listener plus per-port UDP
+    queues, and every wait must pump the NIC.** `socket` accepts
+    `AF_INET`/protocol 0 with `SOCK_STREAM` (one *active* client fd; a second is
+    `-ENOSPC`; listeners and accepted `TcpConn` descriptors are separate kinds)
+    or `SOCK_DGRAM` (`SOCK_NONBLOCK` optional). `FdEntry::Socket`/`Listener`/
+    `TcpConn`/`UdpSocket` live in the per-process table; stream
+    `read`/`write`/`close` route to `tcp::recv_nonblocking_id`/`send_id`/
+    `close_id`, UDP `read`/`poll`/`close` to the port queue, and
+    `bind`/`listen`/`accept`/`sendto`/`recvfrom` are the socket paths. A user
+    program runs while the shell sits in `wait_for_process`, so **nothing else
+    polls the NIC**: `connect`, `send`, a blocking `recvfrom` and a blocking
+    `accept` run with interrupts enabled for the wait (the same deliberate
+    exception `nanosleep` makes, with no lock held) so ticks and preemption still
+    work, and each wait loop calls `net::poll()` every iteration. TCP `recv` is
+    non-blocking by contract; `accept` blocks for at most 30 s and answers
+    `-EAGAIN` (immediately for `SOCK_NONBLOCK`); UDP `recvfrom` blocks only when
+    the descriptor is blocking and `MSG_DONTWAIT` is absent, and even then the
+    wait is bounded (it answers `-EAGAIN` after ~10 s). Every `sockaddr` goes
+    through `copy_from_user`; the length (exactly 16), family, port
+    (big-endian) and address are validated before any state changes. The TCP
+    table is 8 slots, the single listener has a 4-entry queue and `listen`
+    clamps the backlog to `1..=4`; the UDP binding table is static (8 ports, 4
+    datagrams each), the queue drops the oldest datagram when full, and no lock
+    is held across `copy_to_user` or a NIC poll. IPv4 literals only: there is
+    no DNS syscall, no UDP `connect`, no IPv6 socket, and no TLS. The live
+    evidence is `tools/test_sockets.py` / `docs/live-sockets.txt` (TCP client),
+    `tools/test_tcp_server.py` / `docs/live-tcp-server.txt` (TCP server) and
+    `tools/test_udp.py` / `docs/live-udp.txt` (UDP); the CI-safe evidence is the
+    always-running bad-arg half of `userland/abi.elf` (including the
+    bind/listen/nonblocking-accept section) plus its `SKIP` when
+    `10.0.2.2:8000` is closed.
 37. **The process, not the thread, owns the address space.** `Process` is created
     by `run_source`/`fork`, holds `root/satp/asid`, fd row, heap/mmap tracking and
     the futex pid, and is released only after the last thread is `Exited` and

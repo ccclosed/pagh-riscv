@@ -371,7 +371,14 @@ impl Queue {
                 core::ptr::read_volatile((at + 4) as *const u32),
             )
         };
-        self.last_used = used_idx;
+        // Advance by **one** completion, not to the device's current `idx`:
+        // the device may publish several completions between two calls (an
+        // ACK, a data segment and a FIN arriving in the same burst is exactly
+        // what a TCP server produces). Assigning `used_idx` here skipped the
+        // entries in between — the ACK was consumed and the data/FIN were
+        // lost until the peer's retransmission, which looked like a one-second
+        // stall in every `recv`.
+        self.last_used = self.last_used.wrapping_add(1);
         // Acknowledge any interrupt the transport latched even though this
         // driver asked for none (the block driver does the same for the same
         // reason: a future interrupt-driven device must not find it set).

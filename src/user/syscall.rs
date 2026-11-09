@@ -127,13 +127,15 @@ const SYS_FCHMODAT: usize = 53;
 const SYS_FTRUNCATE: usize = 46;
 const SYS_RENAMEAT2: usize = 276;
 // The BSD-socket subset. Numbers are the generic RISC-V table: 198 socket,
-// 200 bind, 203 connect, 206 sendto, 207 recvfrom, 208/209
-// setsockopt/getsockopt, 210 shutdown. Linux's `send`/`recv` are libc wrappers
+// 200 bind, 201 listen, 202 accept, 203 connect, 206 sendto, 207 recvfrom,
+// 208/209 setsockopt/getsockopt, 210 shutdown. Linux's `send`/`recv` are libc wrappers
 // around 206/207, so those two carry the full
 // `(fd, buf, len, flags, addr, addrlen)` signature; `read`/`write` are routed
 // to the same socket paths.
 const SYS_SOCKET: usize = 198;
 const SYS_BIND: usize = 200;
+const SYS_LISTEN: usize = 201;
+const SYS_ACCEPT: usize = 202;
 const SYS_CONNECT: usize = 203;
 const SYS_SENDTO: usize = 206;
 const SYS_RECVFROM: usize = 207;
@@ -296,6 +298,10 @@ pub struct Stats {
     pub sockets: u64,
     /// `connect` calls that completed the handshake.
     pub connects: u64,
+    /// `listen(201)` calls that put a socket into the listening state.
+    pub listens: u64,
+    /// `accept(202)` calls that returned a connection.
+    pub accepts: u64,
     /// `send`/`sendto`/`write` calls on a socket that handed bytes to TCP.
     pub socket_sends: u64,
     /// `recv`/`recvfrom`/`read` calls on a socket that returned bytes.
@@ -357,6 +363,8 @@ static DUPS: AtomicU64 = AtomicU64::new(0);
 static POLLS: AtomicU64 = AtomicU64::new(0);
 static SOCKETS: AtomicU64 = AtomicU64::new(0);
 static CONNECTS: AtomicU64 = AtomicU64::new(0);
+static LISTENS: AtomicU64 = AtomicU64::new(0);
+static ACCEPTS: AtomicU64 = AtomicU64::new(0);
 static SOCKET_SENDS: AtomicU64 = AtomicU64::new(0);
 static SOCKET_RECVS: AtomicU64 = AtomicU64::new(0);
 static SHUTDOWNS: AtomicU64 = AtomicU64::new(0);
@@ -407,6 +415,8 @@ pub fn stats() -> Stats {
         polls: POLLS.load(Ordering::Relaxed),
         sockets: SOCKETS.load(Ordering::Relaxed),
         connects: CONNECTS.load(Ordering::Relaxed),
+        listens: LISTENS.load(Ordering::Relaxed),
+        accepts: ACCEPTS.load(Ordering::Relaxed),
         socket_sends: SOCKET_SENDS.load(Ordering::Relaxed),
         socket_recvs: SOCKET_RECVS.load(Ordering::Relaxed),
         shutdowns: SHUTDOWNS.load(Ordering::Relaxed),
@@ -597,14 +607,28 @@ enum FdEntry {
         id: usize,
         read: bool,
     },
-    /// A BSD-style socket descriptor. The kernel has exactly one TCP
-    /// connection, so at most one of these exists in a live process; `id` is the stack's
-    /// socket number (always 0 today) and `connected` records that a
-    /// `connect` succeeded, which is what separates "never connected"
-    /// (`-ENOTCONN`) from "shut down" (read returns 0, write `-EPIPE`).
+    /// A BSD-style stream socket descriptor that is not yet a listener or an
+    /// accepted connection. At most one exists in a live process (the ABI's
+    /// "one active-open client" rule); `id` is the stack connection once a
+    /// `connect` succeeds, `bound` is the local port reserved by `bind(200)`
+    /// (0 when unbound), and `nonblocking` is inherited by a later listener
+    /// and makes its `accept` answer `-EAGAIN` immediately.
     Socket {
         id: u8,
         connected: bool,
+        bound: u16,
+        nonblocking: bool,
+    },
+    /// A listening stream socket (`listen(201)`). The stack has one listener;
+    /// `port` is the reserved local port and `nonblocking` controls `accept`.
+    Listener {
+        port: u16,
+        nonblocking: bool,
+    },
+    /// One accepted stream connection (`accept(202)`). Its `id` names a slot in
+    /// the TCP table, which makes several accepted connections possible.
+    TcpConn {
+        id: u8,
     },
     /// A userland UDP socket. `port == 0` is unbound; `bind` sets it, and the
     /// first `sendto` auto-binds an ephemeral port. `nonblocking` is the
@@ -632,15 +656,14 @@ impl Clone for FdEntry {
                     read: *read,
                 }
             }
-            FdEntry::Socket { id, connected } => FdEntry::Socket {
-                id: *id,
-                connected: *connected,
-            },
-            // A dup/fork of a UDP descriptor would be a second owner of one
-            // port binding; without a reference count, closing either copy
-            // would unbind the port under the other. The child/copy gets the
-            // same tombstone a forked stream socket already gets.
-            FdEntry::UdpSocket { .. } => FdEntry::Unsupported,
+            // A dup/fork of a socket would be a second owner of one
+            // connection or binding; without a reference count, closing either
+            // copy would tear the shared state down under the other. The
+            // child/copy gets the same tombstone UDP has always used.
+            FdEntry::Socket { .. }
+            | FdEntry::Listener { .. }
+            | FdEntry::TcpConn { .. }
+            | FdEntry::UdpSocket { .. } => FdEntry::Unsupported,
             FdEntry::Unsupported => FdEntry::Unsupported,
         }
     }
@@ -696,12 +719,36 @@ fn with_fds<R>(f: impl FnOnce(&mut FdTable) -> R) -> Option<R> {
 pub(crate) fn reset_fds(slot: usize) {
     let mut udp_ports = [0u16; MAX_FDS];
     let mut udp_count = 0usize;
-    let had_socket = {
+    let mut conn_ids = [SOCKET_NONE; MAX_FDS];
+    let mut conn_count = 0usize;
+    let mut bound_ports = [0u16; MAX_FDS];
+    let mut bound_count = 0usize;
+    let mut had_listener = false;
+    {
         let mut tables = FDS.lock();
-        let mut had = false;
         for entry in tables.rows[slot].slots.iter() {
             match entry {
-                Some(FdEntry::Socket { .. }) => had = true,
+                Some(FdEntry::Socket {
+                    id,
+                    connected,
+                    bound,
+                    ..
+                }) => {
+                    if *connected && conn_count < conn_ids.len() {
+                        conn_ids[conn_count] = *id;
+                        conn_count += 1;
+                    } else if *bound != 0 && bound_count < bound_ports.len() {
+                        bound_ports[bound_count] = *bound;
+                        bound_count += 1;
+                    }
+                }
+                Some(FdEntry::Listener { .. }) => had_listener = true,
+                Some(FdEntry::TcpConn { id }) => {
+                    if conn_count < conn_ids.len() {
+                        conn_ids[conn_count] = *id;
+                        conn_count += 1;
+                    }
+                }
                 Some(FdEntry::UdpSocket { port, .. }) if *port != 0 => {
                     if udp_count < udp_ports.len() {
                         udp_ports[udp_count] = *port;
@@ -712,13 +759,18 @@ pub(crate) fn reset_fds(slot: usize) {
             }
         }
         tables.rows[slot] = FdTable::console();
-        had
-    };
+    }
     for &port in udp_ports[..udp_count].iter() {
         crate::net::udp_unbind(port);
     }
-    if had_socket {
-        crate::net::tcp::close();
+    for &port in bound_ports[..bound_count].iter() {
+        crate::net::tcp::release_binding(port);
+    }
+    for &id in conn_ids[..conn_count].iter() {
+        crate::net::tcp::close_id(id);
+    }
+    if had_listener {
+        crate::net::tcp::close_listener();
     }
     if let Some(row) = MODES.lock().rows.get_mut(slot) {
         *row = ModeTable::empty();
@@ -735,12 +787,16 @@ pub(crate) fn release_fds(slot: usize) {
     let mut pipe_count = 0usize;
     let mut udp_ports = [0u16; MAX_FDS];
     let mut udp_count = 0usize;
-    let had_socket = {
+    let mut conn_ids = [SOCKET_NONE; MAX_FDS];
+    let mut conn_count = 0usize;
+    let mut bound_ports = [0u16; MAX_FDS];
+    let mut bound_count = 0usize;
+    let mut had_listener = false;
+    {
         let mut tables = FDS.lock();
         let Some(row) = tables.rows.get_mut(slot) else {
             return;
         };
-        let mut had = false;
         for entry in row.slots.iter_mut() {
             match entry.take() {
                 Some(FdEntry::Pipe { id, read }) => {
@@ -749,7 +805,27 @@ pub(crate) fn release_fds(slot: usize) {
                         pipe_count += 1;
                     }
                 }
-                Some(FdEntry::Socket { .. }) => had = true,
+                Some(FdEntry::Socket {
+                    id,
+                    connected,
+                    bound,
+                    ..
+                }) => {
+                    if connected && conn_count < conn_ids.len() {
+                        conn_ids[conn_count] = id;
+                        conn_count += 1;
+                    } else if bound != 0 && bound_count < bound_ports.len() {
+                        bound_ports[bound_count] = bound;
+                        bound_count += 1;
+                    }
+                }
+                Some(FdEntry::Listener { .. }) => had_listener = true,
+                Some(FdEntry::TcpConn { id }) => {
+                    if conn_count < conn_ids.len() {
+                        conn_ids[conn_count] = id;
+                        conn_count += 1;
+                    }
+                }
                 Some(FdEntry::UdpSocket { port, .. }) if port != 0 => {
                     if udp_count < udp_ports.len() {
                         udp_ports[udp_count] = port;
@@ -759,16 +835,21 @@ pub(crate) fn release_fds(slot: usize) {
                 Some(_) | None => {}
             }
         }
-        had
-    };
+    }
     for &(id, read) in pipes[..pipe_count].iter() {
         pipe_release(id, read);
     }
     for &port in udp_ports[..udp_count].iter() {
         crate::net::udp_unbind(port);
     }
-    if had_socket {
-        crate::net::tcp::close();
+    for &port in bound_ports[..bound_count].iter() {
+        crate::net::tcp::release_binding(port);
+    }
+    for &id in conn_ids[..conn_count].iter() {
+        crate::net::tcp::close_id(id);
+    }
+    if had_listener {
+        crate::net::tcp::close_listener();
     }
     if let Some(row) = MODES.lock().rows.get_mut(slot) {
         *row = ModeTable::empty();
@@ -778,10 +859,11 @@ pub(crate) fn release_fds(slot: usize) {
 /// Copy a parent's descriptor row into a child's.
 ///
 /// Files and pipes are cloned (the pipe's ring gains one reference for each end);
-/// a socket is replaced by [`FdEntry::Unsupported`] because the kernel owns
-/// exactly one TCP connection and a forked child must not become a second owner
-/// of it. A later `read`/`write`/`poll` on that descriptor is `-ENOTSUP`, and
-/// `close` simply drops it.
+/// every socket descriptor (active client, listener, accepted connection or UDP
+/// port) is replaced by [`FdEntry::Unsupported`] because a child/copy must not
+/// become a second owner of the kernel's connection state. A later
+/// `read`/`write`/`poll` on that descriptor is `-ENOTSUP`, and `close` simply
+/// drops it.
 pub(crate) fn fork_fds(parent: usize, child: usize) -> bool {
     let mut tables = FDS.lock();
     if parent == child || parent >= MAX_PROCESSES || child >= MAX_PROCESSES {
@@ -790,9 +872,10 @@ pub(crate) fn fork_fds(parent: usize, child: usize) -> bool {
     let mut copy: [Option<FdEntry>; MAX_FDS] = [const { None }; MAX_FDS];
     for (index, entry) in tables.rows[parent].slots.iter().enumerate() {
         copy[index] = match entry {
-            Some(FdEntry::Socket { .. }) | Some(FdEntry::UdpSocket { .. }) => {
-                Some(FdEntry::Unsupported)
-            }
+            Some(FdEntry::Socket { .. })
+            | Some(FdEntry::Listener { .. })
+            | Some(FdEntry::TcpConn { .. })
+            | Some(FdEntry::UdpSocket { .. }) => Some(FdEntry::Unsupported),
             Some(entry) => Some(entry.clone()),
             None => None,
         };
@@ -819,6 +902,15 @@ enum OpenFd {
     Socket {
         id: u8,
         connected: bool,
+        bound: u16,
+        nonblocking: bool,
+    },
+    Listener {
+        port: u16,
+        nonblocking: bool,
+    },
+    TcpConn {
+        id: u8,
     },
     UdpSocket {
         port: u16,
@@ -843,10 +935,22 @@ fn lookup(fd: usize) -> Result<OpenFd, isize> {
                 id: *id,
                 read: *read,
             }),
-            Some(FdEntry::Socket { id, connected }) => Ok(OpenFd::Socket {
+            Some(FdEntry::Socket {
+                id,
+                connected,
+                bound,
+                nonblocking,
+            }) => Ok(OpenFd::Socket {
                 id: *id,
                 connected: *connected,
+                bound: *bound,
+                nonblocking: *nonblocking,
             }),
+            Some(FdEntry::Listener { port, nonblocking }) => Ok(OpenFd::Listener {
+                port: *port,
+                nonblocking: *nonblocking,
+            }),
+            Some(FdEntry::TcpConn { id }) => Ok(OpenFd::TcpConn { id: *id }),
             Some(FdEntry::UdpSocket { port, nonblocking }) => Ok(OpenFd::UdpSocket {
                 port: *port,
                 nonblocking: *nonblocking,
@@ -873,10 +977,21 @@ fn take_slot(fd: usize) -> Option<FdEntry> {
 fn drop_entry(entry: FdEntry) {
     match entry {
         FdEntry::Pipe { id, read } => pipe_release(id, read),
-        FdEntry::Socket { connected, .. } => {
+        FdEntry::Socket {
+            id,
+            connected,
+            bound,
+            ..
+        } => {
             if connected {
-                with_network_interrupts(crate::net::tcp::close);
+                with_network_interrupts(|| crate::net::tcp::close_id(id));
+            } else if bound != 0 {
+                crate::net::tcp::release_binding(bound);
             }
+        }
+        FdEntry::Listener { .. } => with_network_interrupts(crate::net::tcp::close_listener),
+        FdEntry::TcpConn { id } => {
+            with_network_interrupts(|| crate::net::tcp::close_id(id));
         }
         FdEntry::UdpSocket { port, .. } => {
             if port != 0 {
@@ -908,9 +1023,11 @@ fn set_offset(fd: usize, offset: u64) {
     });
 }
 
-/// Install a socket descriptor. The kernel stack owns one connection, so a
-/// second `socket()` anywhere is refused with `ENOSPC`.
-fn install_socket() -> Result<usize, isize> {
+/// Install an unconnected stream socket descriptor. The active-open client is
+/// still one per kernel, so a second `Socket` row anywhere is refused with
+/// `ENOSPC`; listeners and accepted connections are separate variants and do
+/// not count.
+fn install_socket(nonblocking: bool) -> Result<usize, isize> {
     let slot = crate::user::process::current_slot().ok_or(EBADF)?;
     let mut tables = FDS.lock();
     for row in tables.rows.iter() {
@@ -924,8 +1041,10 @@ fn install_socket() -> Result<usize, isize> {
     for fd in 3..MAX_FDS {
         if table.slots[fd].is_none() {
             table.slots[fd] = Some(FdEntry::Socket {
-                id: 0,
+                id: SOCKET_NONE,
                 connected: false,
+                bound: 0,
+                nonblocking,
             });
             return Ok(fd);
         }
@@ -965,13 +1084,61 @@ fn set_udp_port(fd: usize, port: u16) -> bool {
     .unwrap_or(false)
 }
 
-/// Record that the socket on `fd` completed its handshake.
-fn mark_socket_connected(fd: usize) {
+/// Record that the socket on `fd` completed its handshake and which TCP slot
+/// owns the connection.
+fn mark_socket_connected(fd: usize, id: u8) {
     let _ = with_fds(|table| {
-        if let Some(Some(FdEntry::Socket { connected, .. })) = table.slots.get_mut(fd) {
+        if let Some(Some(FdEntry::Socket {
+            id: slot,
+            connected,
+            bound,
+            ..
+        })) = table.slots.get_mut(fd)
+        {
             *connected = true;
+            *slot = id;
+            *bound = 0;
         }
     });
+}
+
+/// Publish the local port chosen by TCP `bind`.
+fn set_socket_bound(fd: usize, port: u16) -> bool {
+    with_fds(|table| {
+        if let Some(Some(FdEntry::Socket { bound, .. })) = table.slots.get_mut(fd) {
+            *bound = port;
+            true
+        } else {
+            false
+        }
+    })
+    .unwrap_or(false)
+}
+
+/// Turn a bound stream socket into a listener after `listen` succeeded.
+fn convert_to_listener(fd: usize, port: u16, nonblocking: bool) -> bool {
+    with_fds(|table| match table.slots.get_mut(fd) {
+        Some(slot @ Some(FdEntry::Socket { .. })) => {
+            *slot = Some(FdEntry::Listener { port, nonblocking });
+            true
+        }
+        _ => false,
+    })
+    .unwrap_or(false)
+}
+
+/// Install one accepted stream connection in the first free descriptor slot.
+fn install_tcp_conn(id: u8) -> Result<usize, isize> {
+    with_fds(|table| {
+        for fd in 3..MAX_FDS {
+            if table.slots[fd].is_none() {
+                table.slots[fd] = Some(FdEntry::TcpConn { id });
+                return Ok(fd);
+            }
+        }
+        Err(ENOSPC)
+    })
+    .unwrap_or(Err(EBADF))
 }
 
 /// Remove a descriptor from the table and return it, so its resources (an
@@ -1122,6 +1289,8 @@ pub fn dispatch(frame: &mut TrapFrame) {
         SYS_PPOLL => ppoll(frame.a0, frame.a1, frame.a2),
         SYS_SOCKET => socket(frame.a0, frame.a1, frame.a2),
         SYS_BIND => bind(frame.a0, frame.a1, frame.a2),
+        SYS_LISTEN => listen(frame.a0, frame.a1),
+        SYS_ACCEPT => accept(frame.a0, frame.a1, frame.a2),
         SYS_CONNECT => connect(frame.a0, frame.a1, frame.a2),
         // 206/207 carry the `sendto`/`recvfrom` shape; on a connected socket
         // the destination/source address is optional and ignored (send) or
@@ -1473,10 +1642,13 @@ fn read(fd: usize, buf: usize, len: usize) -> isize {
         Ok(OpenFd::UdpSocket { port, nonblocking }) => {
             recv_udp(port, nonblocking, buf, len, 0, 0, 0)
         }
-        Ok(OpenFd::Socket { id, connected }) => {
-            let _ = id;
-            read_socket(buf, len, connected)
-        }
+        Ok(OpenFd::Socket {
+            id,
+            connected: true,
+            ..
+        })
+        | Ok(OpenFd::TcpConn { id }) => read_socket(buf, len, id),
+        Ok(OpenFd::Socket { .. }) | Ok(OpenFd::Listener { .. }) => ENOTCONN,
         Ok(OpenFd::File {
             node,
             offset,
@@ -1562,10 +1734,13 @@ fn write(fd: usize, buf: usize, len: usize) -> isize {
         // name one. The ABI has no UDP `connect`, so this is the POSIX
         // `EDESTADDRREQ`, never a silent send to nowhere.
         Ok(OpenFd::UdpSocket { .. }) => EDESTADDRREQ,
-        Ok(OpenFd::Socket { id, connected }) => {
-            let _ = id;
-            write_socket(buf, len, connected)
-        }
+        Ok(OpenFd::Socket {
+            id,
+            connected: true,
+            ..
+        })
+        | Ok(OpenFd::TcpConn { id }) => write_socket(buf, len, id),
+        Ok(OpenFd::Socket { .. }) | Ok(OpenFd::Listener { .. }) => ENOTCONN,
         Ok(OpenFd::File {
             node,
             offset,
@@ -1959,19 +2134,31 @@ fn poll_one(fd: usize, events: i16) -> i16 {
             revents
         }
         Ok(OpenFd::Unsupported) => POLLNVAL,
-        Ok(OpenFd::Socket { connected, .. }) => {
-            if !connected {
-                return POLLERR;
+        Ok(OpenFd::Listener { .. }) => {
+            if events & POLLIN != 0 && crate::net::tcp::accept_pending() {
+                POLLIN
+            } else {
+                0
             }
+        }
+        Ok(OpenFd::Socket {
+            id,
+            connected: true,
+            ..
+        })
+        | Ok(OpenFd::TcpConn { id }) => {
             let mut revents = 0;
-            if events & POLLIN != 0 {
+            if events & POLLIN != 0 && crate::net::tcp::readable_id(id) {
                 revents |= POLLIN;
             }
-            if events & POLLOUT != 0 {
+            if crate::net::tcp::reset_id_state(id) {
+                revents |= POLLERR;
+            } else if events & POLLOUT != 0 {
                 revents |= POLLOUT;
             }
             revents
         }
+        Ok(OpenFd::Socket { .. }) => POLLERR,
         Err(_) => POLLNVAL,
     }
 }
@@ -2013,9 +2200,13 @@ fn poll_wait(fds: usize, nfds: usize, timeout_ms: i64) -> isize {
     };
 
     loop {
-        // The keyboard has no routed interrupt (see the drivers README): make
-        // pending key events visible before deciding nothing is ready.
+        // The keyboard and NIC have no routed interrupt (see the drivers
+        // README): make pending events visible before deciding nothing is
+        // ready. A listener's `POLLIN` and a stream's data both depend on this
+        // poll, because the shell is parked in `wait_for_process` while the
+        // program runs.
         crate::drivers::virtio_input::poll();
+        crate::net::poll();
         let mut revents = [0i16; MAX_POLL_FDS];
         let mut ready = 0usize;
         for index in 0..nfds {
@@ -2253,9 +2444,12 @@ const SOCKADDR_IN_SIZE: usize = 16;
 const AF_INET: u16 = 2;
 const SOCK_STREAM: u32 = 1;
 const SOCK_DGRAM: u32 = 2;
-/// `socket()` type bit: the descriptor starts in non-blocking mode. Only
-/// `SOCK_DGRAM` accepts it; the TCP receive path is already non-blocking.
+/// `socket()` type bit: the descriptor starts in non-blocking mode. It applies
+/// to a UDP `recvfrom` and to a stream listener's `accept`; TCP `recv` is
+/// already non-blocking by contract.
 const SOCK_NONBLOCK: usize = 0x800;
+/// Sentinel in `FdEntry::Socket::id`: the descriptor has no TCP connection yet.
+const SOCKET_NONE: u8 = u8::MAX;
 /// `recvfrom` flag: do not wait for a datagram (`-EAGAIN` instead).
 const MSG_DONTWAIT: usize = 0x40;
 /// How long a blocking UDP `recvfrom` polls before answering `-EAGAIN`. The
@@ -2337,12 +2531,14 @@ fn write_u32_user(pointer: usize, value: u32) -> Result<(), isize> {
 
 /// `socket(domain, type, protocol)`.
 ///
-/// `AF_INET` with protocol 0 supports two types: `SOCK_STREAM` (the one TCP
-/// client; a second descriptor while one is open is `-ENOSPC`) and `SOCK_DGRAM`
-/// (a UDP socket, initially unbound; any number may be open). `SOCK_DGRAM`
-/// also accepts the Linux `SOCK_NONBLOCK` bit, which makes `recvfrom` answer
-/// `-EAGAIN` instead of polling. Everything else is `-EAFNOSUPPORT` — the ABI
-/// documents one answer instead of inventing per-field errnos.
+/// `AF_INET` with protocol 0 supports `SOCK_STREAM` (one active-open client
+/// descriptor at a time; a second `socket()` while one exists is `-ENOSPC`, but
+/// a listener and accepted connections have their own descriptors) and
+/// `SOCK_DGRAM` (a UDP socket, initially unbound; any number may be open).
+/// `SOCK_NONBLOCK` is accepted for both: for a datagram socket it makes
+/// `recvfrom` answer `-EAGAIN`, for a stream socket it makes a later
+/// `listen`/`accept` answer `-EAGAIN`. Everything else is `-EAFNOSUPPORT` — the
+/// ABI documents one answer instead of inventing per-field errnos.
 fn socket(domain: usize, kind: usize, protocol: usize) -> isize {
     if domain != AF_INET as usize || protocol != 0 {
         return EAFNOSUPPORT;
@@ -2350,7 +2546,7 @@ fn socket(domain: usize, kind: usize, protocol: usize) -> isize {
     let nonblocking = kind & SOCK_NONBLOCK != 0;
     let base = (kind & !SOCK_NONBLOCK) as u32;
     let result = match base {
-        SOCK_STREAM if !nonblocking => install_socket(),
+        SOCK_STREAM => install_socket(nonblocking),
         SOCK_DGRAM => install_udp(nonblocking),
         _ => return EAFNOSUPPORT,
     };
@@ -2363,14 +2559,28 @@ fn socket(domain: usize, kind: usize, protocol: usize) -> isize {
     }
 }
 
-/// `bind(fd, *sockaddr_in, addrlen)` for a UDP socket.
+/// Map a TCP bind/listen refusal to the ABI's errno.
+fn tcp_bind_errno(error: crate::net::tcp::BindError) -> isize {
+    match error {
+        crate::net::tcp::BindError::AddressInUse => EADDRINUSE,
+        crate::net::tcp::BindError::NoPorts => ENOSPC,
+        crate::net::tcp::BindError::NotBound => EINVAL,
+    }
+}
+
+/// `bind(fd, *sockaddr_in, addrlen)`.
 ///
-/// `addrlen` must be exactly 16 and the family `AF_INET`. The address must be
-/// `INADDR_ANY` (`0.0.0.0`) or the interface's current DHCP lease: there is one
-/// interface, so binding any other local address is `-EADDRNOTAVAIL`. Port 0
-/// asks the kernel for an ephemeral port; an already-bound socket is `-EINVAL`
-/// and a port another socket owns is `-EADDRINUSE`. A TCP descriptor answers
-/// `-ENOTSUP` (the stack has no local bind for its single connection).
+/// For a UDP socket `addrlen` must be exactly 16 and the family `AF_INET`; the
+/// address must be `INADDR_ANY` (`0.0.0.0`) or the interface's current DHCP
+/// lease. Port 0 asks for an ephemeral port; an already-bound socket is
+/// `-EINVAL` and a port another socket owns is `-EADDRINUSE`.
+///
+/// For a stream socket the same address rules apply, but the port is reserved
+/// for a later `listen(201)` instead of a datagram queue: one listener (one
+/// pre-listen reservation) exists at a time, so a second `bind` while one is
+/// live is `-EADDRINUSE`. Binding a connected socket or an accepted connection
+/// is `-EINVAL`; a listening descriptor is already bound, so binding it again
+/// is `-EINVAL` too.
 fn bind(fd: usize, address: usize, length: usize) -> isize {
     if address == 0 {
         return fault();
@@ -2385,32 +2595,164 @@ fn bind(fd: usize, address: usize, length: usize) -> isize {
     if family != AF_INET {
         return EAFNOSUPPORT;
     }
-    let current = match lookup(fd) {
-        Ok(OpenFd::UdpSocket { port, .. }) => port,
-        Ok(OpenFd::Socket { .. }) => return ENOTSUP,
-        Ok(OpenFd::Unsupported) => return ENOTSUP,
-        Ok(_) => return ENOTSOCK,
-        Err(error) => return error,
-    };
-    if current != 0 {
-        return EINVAL;
-    }
     if ip != [0; 4] {
         match crate::net::config() {
             Some(config) if config.ip == ip => {}
             _ => return EADDRNOTAVAIL,
         }
     }
-    let chosen = match crate::net::udp_bind(port) {
-        Ok(port) => port,
-        Err(crate::net::UdpBindError::AddressInUse) => return EADDRINUSE,
-        Err(crate::net::UdpBindError::NoSlots) => return ENOSPC,
-    };
-    if !set_udp_port(fd, chosen) {
-        crate::net::udp_unbind(chosen);
-        return EBADF;
+    match lookup(fd) {
+        Ok(OpenFd::UdpSocket { port: current, .. }) => {
+            if current != 0 {
+                return EINVAL;
+            }
+            let chosen = match crate::net::udp_bind(port) {
+                Ok(port) => port,
+                Err(crate::net::UdpBindError::AddressInUse) => return EADDRINUSE,
+                Err(crate::net::UdpBindError::NoSlots) => return ENOSPC,
+            };
+            if !set_udp_port(fd, chosen) {
+                crate::net::udp_unbind(chosen);
+                return EBADF;
+            }
+            0
+        }
+        Ok(OpenFd::Socket {
+            connected, bound, ..
+        }) => {
+            if connected || bound != 0 {
+                return EINVAL;
+            }
+            let chosen = match crate::net::tcp::bind_port(port) {
+                Ok(port) => port,
+                Err(error) => return tcp_bind_errno(error),
+            };
+            if !set_socket_bound(fd, chosen) {
+                crate::net::tcp::release_binding(chosen);
+                return EBADF;
+            }
+            0
+        }
+        Ok(OpenFd::Listener { .. }) | Ok(OpenFd::TcpConn { .. }) => EINVAL,
+        Ok(OpenFd::Unsupported) => ENOTSUP,
+        Ok(_) => ENOTSOCK,
+        Err(error) => error,
     }
-    0
+}
+
+/// `listen(fd, backlog)`.
+///
+/// Only a stream descriptor that has been bound with `bind(200)` can listen.
+/// `backlog` is clamped to `1..=4` (the fixed accept-queue depth); a negative
+/// value arrives as a huge `usize` and clamps to 4 as well. A second `listen`
+/// on the same listener updates the backlog and returns 0. A UDP descriptor,
+/// an accepted connection or an unbound stream socket is `-ENOTSUP`/`-EINVAL`.
+fn listen(fd: usize, backlog: usize) -> isize {
+    match lookup(fd) {
+        Ok(OpenFd::Socket {
+            connected: false,
+            bound,
+            nonblocking,
+            ..
+        }) if bound != 0 => match crate::net::tcp::listen(bound, backlog) {
+            Ok(()) => {
+                if convert_to_listener(fd, bound, nonblocking) {
+                    LISTENS.fetch_add(1, Ordering::Relaxed);
+                    0
+                } else {
+                    crate::net::tcp::close_listener();
+                    EBADF
+                }
+            }
+            Err(error) => tcp_bind_errno(error),
+        },
+        Ok(OpenFd::Listener { port, .. }) => match crate::net::tcp::listen(port, backlog) {
+            Ok(()) => 0,
+            Err(error) => tcp_bind_errno(error),
+        },
+        Ok(OpenFd::UdpSocket { .. }) => ENOTSUP,
+        Ok(OpenFd::Socket { .. }) | Ok(OpenFd::TcpConn { .. }) => EINVAL,
+        Ok(OpenFd::Unsupported) => ENOTSUP,
+        Ok(_) => ENOTSOCK,
+        Err(error) => error,
+    }
+}
+
+/// `accept(fd, *sockaddr_in, *addrlen)`.
+///
+/// Pops the oldest handshaken passive connection from the listener's queue and
+/// installs it as a new descriptor. The optional peer address is written as the
+/// same 16-byte native `sockaddr_in` `bind`/`connect` use, with the family,
+/// big-endian port and four address bytes; `*addrlen` is set to 16.
+///
+/// A blocking listener polls the NIC for up to [`crate::net::tcp::ACCEPT_TICKS`]
+/// (30 s) and answers `-EAGAIN` on expiry. A listener created with
+/// `SOCK_NONBLOCK` polls once and answers `-EAGAIN` immediately. The address
+/// buffers are validated before the wait, so a bad pointer is `-EFAULT` even
+/// when the queue is empty.
+fn accept(fd: usize, address: usize, length: usize) -> isize {
+    let nonblocking = match lookup(fd) {
+        Ok(OpenFd::Listener { nonblocking, .. }) => nonblocking,
+        Ok(OpenFd::Socket { .. }) | Ok(OpenFd::TcpConn { .. }) => return EINVAL,
+        Ok(OpenFd::UdpSocket { .. }) => return ENOTSUP,
+        Ok(OpenFd::Unsupported) => return ENOTSUP,
+        Ok(_) => return ENOTSOCK,
+        Err(error) => return error,
+    };
+    if address != 0 {
+        if length == 0 {
+            return EINVAL;
+        }
+        let capacity = match read_u32_user(length) {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        if capacity < SOCKADDR_IN_SIZE as u32 {
+            return EINVAL;
+        }
+        let Some(address_end) = address.checked_add(SOCKADDR_IN_SIZE) else {
+            return fault();
+        };
+        let Some(length_end) = length.checked_add(4) else {
+            return fault();
+        };
+        if !user_range_valid(address, address_end, true)
+            || !user_range_valid(length, length_end, true)
+        {
+            return fault();
+        }
+    }
+    let accepted = if nonblocking {
+        crate::net::tcp::accept_nonblocking()
+    } else {
+        with_network_interrupts(|| crate::net::tcp::accept(crate::net::tcp::ACCEPT_TICKS))
+    };
+    let (id, ip, remote_port) = match accepted {
+        Ok(connection) => connection,
+        Err(crate::net::tcp::Error::WouldBlock) => return EAGAIN,
+        Err(crate::net::tcp::Error::NoLease) => return ENETUNREACH,
+        Err(crate::net::tcp::Error::Reset) | Err(crate::net::tcp::Error::Closed) => return EAGAIN,
+        Err(_) => return EAGAIN,
+    };
+    if address != 0 {
+        if let Err(error) = write_sockaddr_in(address, ip, remote_port) {
+            crate::net::tcp::close_id(id);
+            return error;
+        }
+        if let Err(error) = write_u32_user(length, SOCKADDR_IN_SIZE as u32) {
+            crate::net::tcp::close_id(id);
+            return error;
+        }
+    }
+    let installed = match install_tcp_conn(id) {
+        Ok(fd) => fd,
+        Err(error) => {
+            crate::net::tcp::close_id(id);
+            return error;
+        }
+    };
+    ACCEPTS.fetch_add(1, Ordering::Relaxed);
+    installed as isize
 }
 
 /// Map a connect failure to the ABI's errno. `Reset` is a peer RST during the
@@ -2450,13 +2792,21 @@ fn stream_errno(error: tcp::Error) -> isize {
 /// there is no DNS in this layer. The call polls the NIC until the three-way
 /// handshake completes or the TCP client's own deadline expires.
 fn connect(fd: usize, address: usize, length: usize) -> isize {
-    let connected = match lookup(fd) {
-        Ok(OpenFd::Socket { connected, .. }) => connected,
+    let (connected, bound) = match lookup(fd) {
+        Ok(OpenFd::Socket {
+            connected, bound, ..
+        }) => (connected, bound),
+        Ok(OpenFd::Listener { .. }) | Ok(OpenFd::TcpConn { .. }) => return EISCONN,
         Ok(OpenFd::UdpSocket { .. }) => return ENOTSUP,
         Ok(OpenFd::Unsupported) => return ENOTSUP,
         Ok(_) => return ENOTSOCK,
         Err(error) => return error,
     };
+    if bound != 0 {
+        // `connect` on a bound-but-not-listening stream socket is not part of
+        // this ABI's small surface: the port reservation exists for `listen`.
+        return EINVAL;
+    }
     if connected {
         return EISCONN;
     }
@@ -2472,7 +2822,9 @@ fn connect(fd: usize, address: usize, length: usize) -> isize {
     }
     match with_network_interrupts(|| tcp::connect(ip, port)) {
         Ok(()) => {
-            mark_socket_connected(fd);
+            if let Some(id) = tcp::active_id() {
+                mark_socket_connected(fd, id);
+            }
             CONNECTS.fetch_add(1, Ordering::Relaxed);
             0
         }
@@ -2503,12 +2855,14 @@ fn send_socket(
 ) -> isize {
     match lookup(fd) {
         Ok(OpenFd::UdpSocket { port, .. }) => send_udp(fd, port, buf, len, flags, dest, addrlen),
-        Ok(OpenFd::Socket { connected, .. }) => {
+        Ok(OpenFd::Socket {
+            id,
+            connected: true,
+            ..
+        })
+        | Ok(OpenFd::TcpConn { id }) => {
             if flags != 0 {
                 return EINVAL;
-            }
-            if !connected {
-                return ENOTCONN;
             }
             if dest != 0 {
                 if addrlen != SOCKADDR_IN_SIZE {
@@ -2523,8 +2877,9 @@ fn send_socket(
             if len == 0 {
                 return 0;
             }
-            write_socket(buf, len, connected)
+            write_socket(buf, len, id)
         }
+        Ok(OpenFd::Socket { .. }) | Ok(OpenFd::Listener { .. }) => ENOTCONN,
         Ok(OpenFd::Unsupported) => ENOTSUP,
         Ok(_) => ENOTSOCK,
         Err(error) => error,
@@ -2619,12 +2974,14 @@ fn recv_socket(
         Ok(OpenFd::UdpSocket { port, nonblocking }) => {
             recv_udp(port, nonblocking, buf, len, flags, src, addrlen)
         }
-        Ok(OpenFd::Socket { connected, .. }) => {
+        Ok(OpenFd::Socket {
+            id,
+            connected: true,
+            ..
+        })
+        | Ok(OpenFd::TcpConn { id }) => {
             if flags != 0 {
                 return EINVAL;
-            }
-            if !connected {
-                return ENOTCONN;
             }
             if src != 0 {
                 if addrlen == 0 {
@@ -2637,7 +2994,7 @@ fn recv_socket(
                 if capacity < SOCKADDR_IN_SIZE as u32 {
                     return EINVAL;
                 }
-                let Some((ip, port)) = tcp::peer() else {
+                let Some((ip, port)) = tcp::peer_id(id) else {
                     return ENOTCONN;
                 };
                 if let Err(error) = write_sockaddr_in(src, ip, port) {
@@ -2650,8 +3007,9 @@ fn recv_socket(
             if len == 0 {
                 return 0;
             }
-            read_socket(buf, len, connected)
+            read_socket(buf, len, id)
         }
+        Ok(OpenFd::Socket { .. }) | Ok(OpenFd::Listener { .. }) => ENOTCONN,
         Ok(OpenFd::Unsupported) => ENOTSUP,
         Ok(_) => ENOTSOCK,
         Err(error) => error,
@@ -2745,15 +3103,12 @@ fn recv_udp(
 
 /// The body of `read`/`recv`/`recvfrom` on a stream socket: drain at most one
 /// buffer of payload, copying it page by page to the user.
-fn read_socket(buf: usize, len: usize, connected: bool) -> isize {
-    if !connected {
-        return ENOTCONN;
-    }
+fn read_socket(buf: usize, len: usize, id: u8) -> isize {
     let mut chunk = [0u8; SOCKET_CHUNK];
     let mut total = 0usize;
     while total < len {
         let want = (len - total).min(SOCKET_CHUNK);
-        let received = match tcp::recv_nonblocking(&mut chunk[..want]) {
+        let received = match tcp::recv_nonblocking_id(id, &mut chunk[..want]) {
             Ok(0) => break,
             Ok(received) if received <= want => received,
             Ok(_) => return if total > 0 { total as isize } else { EIO },
@@ -2785,10 +3140,7 @@ fn read_socket(buf: usize, len: usize, connected: bool) -> isize {
 /// The body of `write`/`send`/`sendto` on a stream socket: copy user bytes in
 /// MSS-sized pieces and hand each to the synchronous TCP send. A failure after
 /// some bytes left returns the short count, never a false success.
-fn write_socket(buf: usize, len: usize, connected: bool) -> isize {
-    if !connected {
-        return ENOTCONN;
-    }
+fn write_socket(buf: usize, len: usize, id: u8) -> isize {
     let mut chunk = [0u8; SOCKET_CHUNK];
     let mut total = 0usize;
     while total < len {
@@ -2796,7 +3148,7 @@ fn write_socket(buf: usize, len: usize, connected: bool) -> isize {
         if let Err(error) = copy_from_user(&mut chunk[..want], buf + total) {
             return if total > 0 { total as isize } else { error };
         }
-        match with_network_interrupts(|| tcp::send(&chunk[..want])) {
+        match with_network_interrupts(|| tcp::send_id(id, &chunk[..want])) {
             Ok(sent) if sent <= want => {
                 total += sent;
                 if sent < want {
@@ -2830,17 +3182,20 @@ fn shutdown(fd: usize, how: usize) -> isize {
     if how > 2 {
         return EINVAL;
     }
-    let connected = match lookup(fd) {
-        Ok(OpenFd::Socket { connected, .. }) => connected,
+    let id = match lookup(fd) {
+        Ok(OpenFd::Socket {
+            id,
+            connected: true,
+            ..
+        })
+        | Ok(OpenFd::TcpConn { id }) => id,
+        Ok(OpenFd::Socket { .. }) | Ok(OpenFd::Listener { .. }) => return ENOTCONN,
         Ok(OpenFd::UdpSocket { .. }) => return ENOTCONN,
         Ok(OpenFd::Unsupported) => return ENOTSUP,
         Ok(_) => return ENOTSOCK,
         Err(error) => return error,
     };
-    if !connected {
-        return ENOTCONN;
-    }
-    with_network_interrupts(tcp::close);
+    with_network_interrupts(|| tcp::shutdown_id(id));
     SHUTDOWNS.fetch_add(1, Ordering::Relaxed);
     0
 }
@@ -2853,7 +3208,10 @@ fn shutdown(fd: usize, how: usize) -> isize {
 /// so a program can tell "accepted no-op" from "not implemented".
 fn setsockopt(fd: usize, level: usize, name: usize, value: usize, length: usize) -> isize {
     match lookup(fd) {
-        Ok(OpenFd::Socket { .. }) | Ok(OpenFd::UdpSocket { .. }) => {}
+        Ok(OpenFd::Socket { .. })
+        | Ok(OpenFd::Listener { .. })
+        | Ok(OpenFd::TcpConn { .. })
+        | Ok(OpenFd::UdpSocket { .. }) => {}
         Ok(OpenFd::Unsupported) => return ENOTSUP,
         Ok(_) => return ENOTSOCK,
         Err(error) => return error,
@@ -2891,7 +3249,9 @@ fn setsockopt(fd: usize, level: usize, name: usize, value: usize, length: usize)
 /// truncated to it, then `optlen` is updated to the bytes written.
 fn getsockopt(fd: usize, level: usize, name: usize, value: usize, length: usize) -> isize {
     let socket_type = match lookup(fd) {
-        Ok(OpenFd::Socket { .. }) => SOCK_STREAM,
+        Ok(OpenFd::Socket { .. }) | Ok(OpenFd::Listener { .. }) | Ok(OpenFd::TcpConn { .. }) => {
+            SOCK_STREAM
+        }
         Ok(OpenFd::UdpSocket { .. }) => SOCK_DGRAM,
         Ok(OpenFd::Unsupported) => return ENOTSUP,
         Ok(_) => return ENOTSOCK,
@@ -3090,7 +3450,9 @@ fn lseek(fd: usize, offset: usize, whence: usize) -> isize {
         | Ok(OpenFd::ConsoleOut)
         | Ok(OpenFd::Pipe { .. })
         | Ok(OpenFd::UdpSocket { .. })
-        | Ok(OpenFd::Socket { .. }) => EINVAL,
+        | Ok(OpenFd::Socket { .. })
+        | Ok(OpenFd::Listener { .. })
+        | Ok(OpenFd::TcpConn { .. }) => EINVAL,
         Ok(OpenFd::File { node, offset, .. }) => {
             if node.is_directory() {
                 return EINVAL;
@@ -3149,9 +3511,10 @@ fn fstat(fd: usize, pointer: usize) -> isize {
                 .map_or(0, |pipe| pipe.len as u64),
             0u64,
         ),
-        Ok(OpenFd::Socket { .. }) | Ok(OpenFd::UdpSocket { .. }) => {
-            (KIND_OTHER, 0o644u32, 0u64, 0u64)
-        }
+        Ok(OpenFd::Socket { .. })
+        | Ok(OpenFd::Listener { .. })
+        | Ok(OpenFd::TcpConn { .. })
+        | Ok(OpenFd::UdpSocket { .. }) => (KIND_OTHER, 0o644u32, 0u64, 0u64),
         Ok(OpenFd::File { node, .. }) => {
             let is_dir = node.is_directory();
             let is_link = node.is_symlink();
@@ -3595,7 +3958,9 @@ fn ftruncate(fd: usize, length: usize) -> isize {
         | Ok(OpenFd::ConsoleOut)
         | Ok(OpenFd::Pipe { .. })
         | Ok(OpenFd::UdpSocket { .. })
-        | Ok(OpenFd::Socket { .. }) => EINVAL,
+        | Ok(OpenFd::Socket { .. })
+        | Ok(OpenFd::Listener { .. })
+        | Ok(OpenFd::TcpConn { .. }) => EINVAL,
         Ok(OpenFd::File { node, flags, .. }) => {
             if node.is_directory() {
                 return EISDIR;
