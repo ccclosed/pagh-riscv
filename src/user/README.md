@@ -12,13 +12,14 @@ syscall'ов заморожен в `pagh-api/docs/abi.md`; ниже — как �
 
 | Файл | Роль |
 |---|---|
-| `mod.rs` | `run_image(bytes, name)` / `run_image_with_args` для фикстур и `run_file(path)` / `run_file_with_args` / `run_file_with_argv0` для `run <path>` — весь сценарий запуска: новый root/ASID → ELF в него → user-стек → SysV-кадр `argc/argv/envp` → `spawn_in_group_satp` главного потока → `enter_user` (`a0=argc`, `a1=argv`, `sret`) → ожидание `Process::threads == 0` → `reap` → снятие маппингов, fd и heap-кадров; `FileSource` поверх `VfsNode` (потоковое чтение), `Exit`/`UserError`, `on_fault` (убивает процесс), `brk`, `mmap`, `exit_thread`/`exit_group`/`process_id`/`parent_id`, `fork`/`execve`/`wait4`, очистка сирот, capture для ABI-теста, встроенные фикстуры `HELLO_ELF`/`FAULT_ELF`/`SPIN_ELF`/`ARGV_ELF`/`ABI_ELF`/`EXEC_CHILD_ELF` |
-| `process.rs` | таблица процессов: `MAX_PROCESSES = 6`, `Process { pid, ppid, root, satp, asid, name, entry/sp/argc/argv, main_tid, threads, exit, signal, heap, mmap, stack_base, wait_tid, ready }`; `Free -> Live -> Zombie -> Free`, `reserve`/`publish`/`slot_of`/`with_slot_mut`, отдельные статические `IMAGES`/`HEAPS`, `ready_pids` и `force_finish` для очистки сирот; `kill_group` работает по `group == pid` |
+| `mod.rs` | `run_image(bytes, name)` / `run_image_with_args` для фикстур и `run_file(path)` / `run_file_with_args` / `run_file_with_argv0` для `run <path>` — весь сценарий запуска: новый root/ASID → ELF в него → user-стек → SysV-кадр `argc/argv/envp` → `spawn_in_group_satp` главного потока → `enter_user` (`a0=argc`, `a1=argv`, `sret`) → ожидание `Process::threads == 0` → `reap` → снятие маппингов (включая выросший стек), fd и heap-кадров; `FileSource` поверх `VfsNode` (потоковое чтение), `Exit`/`UserError`, `on_fault` (убивает процесс), `brk`, `mmap`, `exit_thread`/`exit_group`/`process_id`/`parent_id`, `fork`/`execve`/`wait4` (fork копирует и выросшие страницы стека, exec сбрасывает `stack_low`), очистка сирот, capture для ABI-теста, встроенные фикстуры `HELLO_ELF`/`FAULT_ELF`/`SPIN_ELF`/`ARGV_ELF`/`ABI_ELF`/`EXEC_CHILD_ELF`/`STACK_ELF`/`STACK_OVER_ELF` |
+| `process.rs` | таблица процессов: `MAX_PROCESSES = 6`, `Process { pid, ppid, root, satp, asid, name, entry/sp/argc/argv, main_tid, threads, exit, signal, heap, mmap, stack_base, stack_low, wait_tid, ready }`; `Free -> Live -> Zombie -> Free`, `reserve`/`publish`/`slot_of`/`with_slot_mut`, отдельные статические `IMAGES`/`HEAPS`, `ready_pids` и `force_finish` для очистки сирот; `kill_group` работает по `group == pid` |
+| `stack.rs` | деманд-рост user-стека: `try_grow(scause, stval, user_sp)` из trap-диспетчера мапит и обнуляет страницы от `Process::stack_low` вниз до адреса fault'а (load/store, не ниже `USER_STACK_FLOOR`, не дальше `FAULT_SLACK = 64 KiB` от `sp`, ни одна страница диапазона не занята), `release(root, low)` возвращает выросшие кадры при teardown, `stats()` (`growths`/`pages`/`refused`/`refused_frames`) — счётчики для selftest; потолок `USER_STACK_MAX_SIZE = 1 MiB`, `MAX_GROWTH_PAGES = 240` |
 | `signal.rs` | POSIX-подобные сигналы: per-process таблица `sigaction` (1..=31, строка привязана к слоту процесса), per-thread `pending`/`blocked`/`altstack`/активный кадр; `fork_process` копирует обработчики/blocked/altstack, `exec_process` сбрасывает обработчики в `SIG_DFL`, гасит pending и alt-стек, `clear_process` освобождает строку, `kill`/`tgkill` (129/131), `sigaltstack` (132), `rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn` (134/135/139), кадр 736 B в user-памяти с 128-байтным `siginfo_t` и 288-байтным `ucontext_t`, `SA_SIGINFO`/`SA_ONSTACK`/`SA_NODEFER`/`SA_RESETHAND`/`SA_RESTART`, `deliver_pending` на границе kernel→user, `deliver_fault` для SIGILL/SIGSEGV/SIGBUS/SIGTRAP и job control через `scheduler::stop_current`/`continue_task`; счётчики и `live_handlers`/`live_threads`/`live_pending` для selftest |
 | `futex.rs` | статическая очередь ожидающих `(run, uaddr) -> tid`: 32 слота на 16 адресов, `wait` (регистрация → `scheduler::block_current` → снятие), `wake` (`wake_task`, не больше N), `clear_run` на teardown; лок очереди маскирует прерывания и **не** держится через блокировку; порядок `futex → scheduler` |
 | `elf.rs` | ELF64-загрузчик: `ImageSource` (`len` + `read_at`) и потоковое чтение — заголовок, таблица program headers (≤ 8) и сегменты кусками ≤ 512 B в уже замапленные страницы, **без буфера размером с образ**; `load` — в активный root, `load_in(root, …)` — в root процесса; валидация заголовка/сегментов до первого кадра, `PT_LOAD`-страницы `U=1`, нулевой `.bss`-хвост, откат кадров при любой ошибке; `Loaded { root, entry, pages(), release() }` (Vec, не inline-массив), `from_pages` для fork; типизированные `ElfError`/`SourceError` |
 | `syscall.rs` | `dispatch(frame)`: `read(63)`, `write(64)`, `openat(56)`, `close(57)`, `lseek(62)`, `fstat(80)`, `getdents64(61)`, `brk(214)`, `clock_gettime(113)`, `nanosleep(101)`, `uname(160)`, `readlinkat(78)`, `exit(93)`, `exit_group(94)`, `set_tid_address(96)`, `futex(98)`, `sched_yield(124)`, `getpid(172)`, `getppid(173)`, `gettid(178)`, `clone(220)`, `fork(1000)`, `execve(221)`, `wait4(260)`, сигналы `kill(129)`, `tgkill(131)`, `sigaltstack(132)`, `rt_sigaction(134)`, `rt_sigprocmask(135)`, `rt_sigreturn(139)` + мутации `mkdirat(34)`, `unlinkat(35)`, `symlinkat(36)`, `linkat(37)`, `fchmodat(53)`, `ftruncate(46)`, `renameat2(276)` + сокеты `socket(198)`, `bind(200)`, `connect(203)`, `sendto(206)`, `recvfrom(207)`, `setsockopt(208)`, `getsockopt(209)`, `shutdown(210)`; per-process таблица 16 fd (`FdTables`; `fork` копирует, `execve` сохраняет), per-process таблица режимов для `fchmodat`/`fstat`, `copy_from_user`/`copy_to_user` (проверка `U/R/W` по PTE, `SUM` только вокруг копии), `-errno`/`-ENOSYS`, `ecall → sepc + 4`, счётчики для selftest |
-| `selftest.rs` | десять проверок для `selftest`: `user-abi-argv` (точная строка из фикстуры), `user-abi-syscalls` (все вызовы + секции потоков/фьютексов, сигналов и процессов + мутационная половина: mkdir/rmdir, rename, link, symlink, chmod, ftruncate, unlink; маркеры `abi: fork ok`/`wait ok`/`exec ok`/`exec wait ok`, с диском exit 0 и «все имена убраны», без `/mnt` — SKIP после no-fs половины), accept фикстуры, reject-матрица (14 мутаций заголовка/сегментов), отказ `run_image` на битом ELF, round-trip `hello`, fault-изоляция, запуск после fault, таймер-in-U и `user-run-large-file` (100 KiB образ с нулевым хвостом через `run_file`) |
+| `selftest.rs` | тринадцать проверок для `selftest`: `user-abi-argv` (точная строка из фикстуры), `user-abi-syscalls` (все вызовы + секции потоков/фьютексов, сигналов и процессов + мутационная половина: mkdir/rmdir, rename, link, symlink, chmod, ftruncate, unlink; маркеры `abi: fork ok`/`wait ok`/`exec ok`/`exec wait ok`, с диском exit 0 и «все имена убраны», без `/mnt` — SKIP после no-fs половины), accept фикстуры, reject-матрица (14 мутаций заголовка/сегментов), отказ `run_image` на битом ELF, round-trip `hello`, fault-изоляция, запуск после fault, таймер-in-U, `user-stack-grows` (160 KiB цепочка возвращается, маркер `stack: deep recursion ok`, счётчики роста сдвинулись ≥ 16 страниц, ledger цел), `user-stack-cap` (1.2 MiB цепочка умирает `Exit::Fault` с `cause = store page fault`, рост ровно на 240 страниц, отказ зафиксирован, ledger цел), `user-stack-fork` (цепочка форкается на 30-м уровне, когда ~14 страниц уже выращены; ребёнок доходит до конца на копии, родитель ждёт `wait4` и получает pid; счётчики `forks`/`waits` сдвинулись, ledger цел) и `user-run-large-file` (100 KiB образ с нулевым хвостом через `run_file`) |
 
 ## Вход в U-mode и начальный стек
 
@@ -43,6 +44,47 @@ sp -> [argc (8 B)][argv0 … argvN-1][NULL][env0 … envK-1][NULL][строки 
 Пределы кадра: `argv`+`env` ≤ 64 строк и ≤ 16 KiB, строка не может содержать
 NUL (запрос отклоняется до маппинга, `UserError::ArgumentsTooLong`). Шелл режет
 строку по пробелам: кавычек и экранирования нет.
+
+## Растущий user-стек (`stack.rs`)
+
+64 KiB — это **стартовое** окно, а не предел. `Process::stack_low` хранит
+текущее дно (изначально `USER_STACK_BASE = 0x3fff_0000`); U-mode load/store page
+fault ниже дна обрабатывает `stack::try_grow` **до** доставки сигнала:
+
+* причина — только load/store page fault (instruction fetch не растёт: страницы
+  `U|R|W`, не X, и повторный fetch зациклился бы);
+* адрес не ниже `USER_STACK_FLOOR = USER_TOP - USER_STACK_MAX_SIZE`, где
+  `USER_STACK_MAX_SIZE = 1 MiB` — потолок на процесс: 16 начальных кадров +
+  `MAX_GROWTH_PAGES = 240` страниц роста (960 KiB);
+* адрес не дальше `FAULT_SLACK = 64 KiB` ниже прерванного `sp` — дикий указатель
+  далеко под стеком не «доращивает» его на всё окно;
+* ни одна страница диапазона `page..stack_low` не замаплена: загрузчик вправе
+  положить `PT_LOAD` в это окно (ему разрешено всё ниже `USER_STACK_BASE`), и
+  такая страница сохраняется, а fault остаётся фатальным;
+* PMM выдаёт кадры — иначе рост останавливается, уже замапленное остаётся
+  учтённым в `stack_low`, а fault отклоняется.
+
+Принятый fault: кадры обнуляются через identity-карту, мапятся
+`Flags::user_rw()`, `stack_low` сдвигается вниз, `sepc` не меняется — эпилог
+повторяет faulting-инструкцию. Ничего не печатается; счётчики `stack::stats()`
+(`growths`, `pages`, `refused`, `refused_frames`) читает selftest.
+
+Отказ — это обычный `on_fault`: рекурсия сверх 1 MiB упирается в страницу ниже
+`USER_STACK_FLOOR`, которая не мапится никогда, и прогон умирает
+`[user] <name> killed: store page fault`. То есть guard не «почти» есть, а есть:
+он стоит на странице ниже потолка, а не на 64 KiB.
+
+Учёт и teardown:
+
+* `fork` копирует `stack_low..USER_STACK_BASE` постранично
+  (`copy_grown_stack`) в нового ребёнка — он наследует ровно тот стек, что был
+  у родителя;
+* `execve` собирает новый стек и ставит `stack_low = USER_STACK_BASE`;
+* `release_process_memory` (раннер, `wait4`, `cleanup_orphans`, `execve`) зовёт
+  `stack::release(root, stack_low)` **до** освобождения таблиц: каждая
+  замапленная страница диапазона снимается и возвращается в PMM, немапленные
+  пропускаются. Инвариант «в `stack_low..USER_STACK_BASE` лежат только страницы
+  роста» держится проверкой всего диапазона до первой аллокации.
 
 ## Таблица файловых дескрипторов
 
@@ -237,7 +279,8 @@ wait/wake-rendezvous, `exit` не-главного, `exit_group` с заблок
 
 **`fork` — глубокая копия, не COW.** `paging::create_user_space` даёт ребёнку
 свой root и ASID, затем копируются все mapped user-страницы: image (`Loaded`),
-64 KiB стека, `brk`-heap, `mmap`-регионы. Копия идёт по parent root через
+64 KiB начального стека, выросшие страницы стека (`snapshot.stack_low ..
+USER_STACK_BASE`), `brk`-heap, `mmap`-регионы. Копия идёт по parent root через
 `paging::translate_in`; флаги страницы (включая X) сохраняются. Ребёнок получает
 копию fd-строки и обработчиков сигналов, но не pending и не чужие потоки.
 Родитель и ребёнок после возврата — два независимых процесса; общий у них
@@ -247,7 +290,8 @@ wait/wake-rendezvous, `exit` не-главного, `exit_group` с заблок
 
 **`execve(path, argv, envp)`** абсолютного пути: читает ELF в **новый** root,
 собирает новый стек и SysV-кадр, затем атомарно подменяет образ. Старые image,
-heap, mmap и user-стек освобождаются, `root`/`satp`/`asid` заменяются, но
+heap, mmap и user-стек (включая выросшие страницы) освобождаются, `stack_low`
+ставится на `USER_STACK_BASE`, `root`/`satp`/`asid` заменяются, но
 `pid`, `ppid`, fd-таблица и `blocked`-маска сохраняются. Все обработчики
 сбрасываются в `SIG_DFL`, alt-стек выключается, pending гасится; sibling-потоки
 ретируются (`kill_group`), `threads = 1`, `wait_tid = 0`. На успехе
@@ -378,7 +422,10 @@ root: тег — пространство имён TLB, а не обещание
 0x0000_0000 … 0x0000_ffff   не отображено (включая 0 — на этом стоит fault-фикстура)
 0x0001_0000 … 0x3fff_0000   окно образа: PT_LOAD-страницы с U=1 (≤ 256 страниц)
 0x2000_0000 … 0x2010_0000   user heap (brk), 1 MiB, страницы по требованию
-0x3fff_0000 … 0x4000_0000   user-стек: 64 KiB = 16 кадров, U=1
+0x3000_0000 … 0x3f00_0000   mmap-окно (поиск свободных страниц, не резерв)
+0x3ff0_0000                 USER_STACK_FLOOR: страница ниже не мапится никогда
+0x3ff0_0000 … 0x3fff_0000   выращенная часть user-стека (≤ 960 KiB = 240 страниц)
+0x3fff_0000 … 0x4000_0000   начальный user-стек: 64 KiB = 16 кадров, U=1
 0x4000_0000                 stack_top; начальный sp ниже, на SysV-кадре
 0x8000_0000 …               RAM ядра: identity-карта, страницы без U
 ```
@@ -492,6 +539,11 @@ root: тег — пространство имён TLB, а не обещание
 
 ## Пределы (честно)
 
+- user-стек: 64 KiB начального окна + деманд-рост до **1 MiB на процесс**
+  (`USER_STACK_MAX_SIZE`, 240 страниц роста, дно `USER_STACK_FLOOR =
+  0x3ff0_0000`); ниже дна — guard, поэтому рекурсия сверх лимита умирает
+  `store page fault`, а не растёт дальше. Растёт только стек: `brk`/`mmap`
+  по-прежнему выделяются сразу, COW нет;
 - образ ≤ 1 MiB (`MAX_IMAGE_BYTES`) / 256 страниц / 8 `PT_LOAD` / 8 program
   headers (`elf.rs`); больше — `ElfError::ImageTooLarge`, отказ без маппинга;
 - `run <path>` читает файл **потоково** через `ImageSource` кусками ≤ 512 B;
@@ -543,7 +595,10 @@ run demo         # hello: write + sched_yield + exit 42
 run demo a b     # то же: у фикстуры argc = 1, лишние слова игнорируются
 run fault        # getpid, затем load с адреса 0 -> killed: load page fault; машина жива
 run spin         # 0.2 s в U-mode (~20 timer interrupts из U), getpid, exit 7
-selftest         # SELFTEST user-*: 10/10 с /mnt (8/10 + 2 SKIP без диска), ledger одинаковый
+selftest         # SELFTEST user-*: 13/13 с /mnt (11/13 + 2 SKIP без диска), ledger одинаковый
+                 # user-stack-grows: 160 KiB цепочка -> "stack: deep recursion ok"
+                 # user-stack-cap:   1.2 MiB цепочка -> killed: store page fault (stval 0x3fef_ffc8)
+                 # user-stack-fork:  fork на выросшем стеке -> "stack: fork child/parent ok"
 ```
 
 `user-abi-argv` запускает `userland/argv.elf` с тремя аргументами и `PWD=/`,
@@ -589,6 +644,17 @@ host-эхо, `docs/live-udp.txt`).
 
 Два `selftest` подряд печатают одинаковые ledger'ы — это и есть доказательство,
 что не течёт ни образ, ни стек, ни стек задачи, ни heap-кадры, ни fd-узлы.
+Растущий стек проверяют три фикстуры: `userland/stack.rs` (40 уровней по 4 KiB,
+160 KiB — заведомо больше начальных 64 KiB) обязан вернуться и напечатать
+`stack: deep recursion ok`, причём `stack::stats()` должен показать рост не
+меньше 16 страниц; `userland/stack-over.rs` (300 уровней, 1.2 MiB) обязан
+умереть `Exit::Fault` с `cause == store page fault` ровно после
+`MAX_GROWTH_PAGES = 240` выращенных страниц и хотя бы одного отказа;
+`userland/stack-fork.rs` форкается на 30-м уровне цепочки (уже ~14 выросших
+страниц) и требует оба маркера `stack: fork child ok`/`stack: fork parent ok`,
+движение счётчиков `forks`/`waits` и тот же ledger — это единственная проверка
+`copy_grown_stack` и teardown'а выросшего стека через `wait4`. Все три
+проверки сверяют PMM-ledger до/после: выросшие кадры возвращаются teardown'ом.
 Таймер-in-U проверяется счётчиком `traps::user_timer_ticks()` (инкремент только
 при `SPP == 0`). Скриншот — `docs/user.png`, снимается `tools/run.py` (см.
 `docs/screenshot.md`).

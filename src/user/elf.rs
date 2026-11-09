@@ -32,10 +32,22 @@
 //! The user virtual layout is fixed and small:
 //!
 //! ```text
-//! 0x0001_0000 .. 0x3fff_0000   image window (PT_LOAD pages, U=1)
-//! 0x3fff_0000 .. 0x4000_0000   user stack (64 KiB, U=1)
-//! 0x4000_0000                  stack top / initial sp
+//! 0x0001_0000 .. 0x3fff_0000     image window (PT_LOAD pages, U=1; ≤ 256 pages)
+//! 0x2000_0000 .. 0x2010_0000     brk heap window (see `src/user/mod.rs`)
+//! 0x3000_0000 .. 0x3f00_0000     mmap search window
+//! 0x3ff0_0000                    stack floor: the lowest page demand growth maps
+//! 0x3ff0_0000 .. 0x3fff_0000     demand-grown stack (up to 960 KiB below)
+//! 0x3fff_0000 .. 0x4000_0000     initial user stack (64 KiB, U=1)
+//! 0x4000_0000                    stack top / initial sp
 //! ```
+//!
+//! A process starts with the 16 frames of [`USER_STACK_BASE`]`..`[`USER_TOP`]
+//! mapped; a U-mode load or store below that window (but no lower than
+//! [`USER_STACK_FLOOR`], and close to the faulting task's `sp`) makes the kernel
+//! map and zero the pages between, so a deep call chain grows the stack instead
+//! of dying. The page below [`USER_STACK_FLOOR`] is never mapped by growth —
+//! that is the real guard page the 1 MiB cap leaves behind. See
+//! [`crate::user::stack`] for the policy.
 //!
 //! The window sits below the kernel's identity map (`0x8000_0000`) and below
 //! nothing else the kernel maps: the PLIC lives at `0x0c00_0000` and the UART at
@@ -59,11 +71,32 @@ pub const USER_TOP: usize = 0x4000_0000;
 /// Bytes of user stack the process starts with.
 pub const USER_STACK_SIZE: usize = 64 * 1024;
 
-/// Lowest address of the user stack (a guard page sits below it, unmapped).
+/// Lowest address of the *initial* user stack.
+///
+/// The first demand-grown page is mapped directly below it, so this is not a
+/// guard page; the guard is [`USER_STACK_FLOOR`] minus one page (see
+/// [`crate::user::stack`]).
 pub const USER_STACK_BASE: usize = USER_TOP - USER_STACK_SIZE;
 
-/// Frames in the user stack.
+/// Frames in the initial user stack.
 pub const USER_STACK_PAGES: usize = USER_STACK_SIZE / FRAME_SIZE;
+
+/// Most user stack one process may ever have mapped: 1 MiB.
+///
+/// The bound is per process and deliberate: a runaway recursion must fail with a
+/// clean page fault instead of draining the frame pool, and the runner's PMM
+/// ledger must return every frame once the process is gone. Six live processes
+/// at the cap hold at most 6 MiB of stack, which the 256 MiB boot configuration
+/// can afford (see `Process` and `MAX_PROCESSES`).
+pub const USER_STACK_MAX_SIZE: usize = 1 << 20;
+
+/// Lowest address the demand-grown stack may reach.
+///
+/// The page below this one is never mapped by growth: it is the real guard page
+/// that makes "recursion past the cap" a clean fault. The region between the
+/// `mmap` window's top (`0x3f00_0000`) and this floor is left unmapped, so a
+/// stack fault and a wild `mmap`-window pointer cannot be confused.
+pub const USER_STACK_FLOOR: usize = USER_TOP - USER_STACK_MAX_SIZE;
 
 /// Largest image the loader will map, in bytes (and therefore in pages).
 pub const MAX_IMAGE_BYTES: usize = 1 << 20;

@@ -4,13 +4,13 @@
 //! # What a process is
 //!
 //! One [`Process`](process::Process) owns one Sv39 address space (a private root
-//! table with a nonzero ASID), its image pages, a 64 KiB user stack, the `brk`
-//! heap window, the `mmap` extents, one thread group, one descriptor table and
-//! its signal state. `run_source` creates the first process; `fork` copies the
-//! current one; `execve` replaces its image; `wait4` reaps a child. The shell
-//! still starts one foreground program with `run` and waits for it, but a
-//! forked child is a separate process that runs concurrently and can be waited
-//! for.
+//! table with a nonzero ASID), its image pages, a user stack (64 KiB initially,
+//! grown on demand up to 1 MiB — see [`stack`]), the `brk` heap window, the
+//! `mmap` extents, one thread group, one descriptor table and its signal state.
+//! `run_source` creates the first process; `fork` copies the current one;
+//! `execve` replaces its image; `wait4` reaps a child. The shell still starts one
+//! foreground program with `run` and waits for it, but a forked child is a
+//! separate process that runs concurrently and can be waited for.
 //!
 //! # The address space
 //!
@@ -53,18 +53,22 @@
 //! # Faults
 //!
 //! An exception whose saved `sstatus.SPP` is 0 ends the *process*, never the
-//! machine ([`on_fault`]). It prints one diagnostic line, retires the other
-//! threads with `scheduler::kill_group` and ends the caller; the runner or the
-//! waiting parent then does the cleanup. A fault is process-fatal because a
-//! thread that died holding a userspace lock would otherwise leave its siblings
-//! waiting forever. S-mode exceptions keep the print-and-park contract in
-//! `arch::riscv64::traps`.
+//! machine ([`on_fault`]): it prints one diagnostic line, retires the other
+//! threads with `scheduler::kill_group` and ends the caller, and the runner or
+//! the waiting parent then does the cleanup. There is one exception: a load or
+//! store page fault in the demand-growth window below the current stack bottom
+//! maps the missing page(s) and resumes the faulting instruction
+//! ([`stack::try_grow`]), which is how a deep call chain gets a bigger stack. A
+//! fault is process-fatal otherwise, because a thread that died holding a
+//! userspace lock would leave its siblings waiting forever. S-mode exceptions
+//! keep the print-and-park contract in `arch::riscv64::traps`.
 
 pub mod elf;
 pub mod futex;
 pub mod process;
 pub mod selftest;
 pub mod signal;
+pub mod stack;
 pub mod syscall;
 
 use core::fmt;
@@ -113,6 +117,26 @@ pub const ABI_ELF: &[u8] = include_bytes!("../../userland/abi.elf");
 /// the program exits 0 only when both arrived correctly.
 pub const EXEC_CHILD_ELF: &[u8] = include_bytes!("../../userland/exec-child.elf");
 
+/// Embedded demand-grown-stack fixture: a 4 KiB-per-level call chain 40 levels
+/// deep (160 KiB), i.e. past the 64 KiB initial window, which must return and
+/// print `stack: deep recursion ok` when the kernel grows the stack on the
+/// faults. See `userland/stack.rs` and `SELFTEST user-stack-grows`.
+pub const STACK_ELF: &[u8] = include_bytes!("../../userland/stack.elf");
+
+/// Embedded stack-cap fixture: the same chain at 300 levels (1.2 MiB), which
+/// must die with a store page fault on the guard page below the 1 MiB cap
+/// instead of exhausting the frame pool. See `userland/stack-over.rs` and
+/// `SELFTEST user-stack-cap`.
+pub const STACK_OVER_ELF: &[u8] = include_bytes!("../../userland/stack-over.elf");
+
+/// Embedded fork-with-a-grown-stack fixture: the same 40-level chain forks at
+/// depth 30, when about 14 pages below the initial window are already
+/// demand-grown, and both processes finish the chain on their own copy. It
+/// proves `fork` copies `stack_low..USER_STACK_BASE` and that `wait4` releases
+/// the child's grown pages. See `userland/stack-fork.rs` and
+/// `SELFTEST user-stack-fork`.
+pub const STACK_FORK_ELF: &[u8] = include_bytes!("../../userland/stack-fork.elf");
+
 pub use elf::{ElfError, ImageSource, SourceError, USER_STACK_BASE, USER_STACK_PAGES, USER_TOP};
 
 /// Longest program name kept for the fault diagnostic; the shell's path may be
@@ -127,9 +151,11 @@ const MAX_ENTRY_STRINGS: usize = 64;
 
 /// Most bytes of string data (NULs included) one initial stack may carry.
 ///
-/// The user stack is 64 KiB; leaving 48 KiB for the program's own frames is
-/// plenty for a shell command line and keeps a caller that invokes
-/// [`run_file`] from the kernel from filling the whole stack with pointers.
+/// The initial user stack window is 64 KiB; leaving 48 KiB for the program's own
+/// frames is plenty for a shell command line and keeps a caller that invokes
+/// [`run_file`] from the kernel from filling the whole window with pointers. (A
+/// program that needs more stack than that grows it on demand — see [`stack`] —
+/// but the entry frame itself stays in the top 16 KiB.)
 const MAX_ENTRY_BYTES: usize = 16 * 1024;
 
 /// The user heap window (`brk`): 1 MiB at 2 GiB, one page at a time.
@@ -153,9 +179,10 @@ pub const USER_HEAP_PAGES: usize = USER_HEAP_SIZE / FRAME_SIZE;
 /// The range is deliberately disjoint from every other user allocation the
 /// runner makes: the image loader accepts pages below [`USER_STACK_BASE`], the
 /// `brk` heap is the 1 MiB window at [`USER_HEAP_BASE`], and the stack is the
-/// last 64 KiB before `0x4000_0000`. `mmap` still validates every candidate page
-/// with `paging::flags`, so an image that happens to sit inside this window is
-/// never overwritten — the window is a search range, not a reservation.
+/// last 1 MiB before `0x4000_0000` (64 KiB initial plus up to 960 KiB
+/// demand-grown, floor `0x3ff0_0000`). `mmap` still validates every candidate
+/// page with `paging::flags`, so an image that happens to sit inside this window
+/// is never overwritten — the window is a search range, not a reservation.
 pub const USER_MMAP_BASE: usize = 0x3000_0000;
 /// One past the last `mmap` byte (`0x3f00_0000`, 16 MiB below the stack base).
 pub const USER_MMAP_TOP: usize = 0x3f00_0000;
@@ -568,6 +595,7 @@ fn run_source<S: ImageSource + ?Sized>(
     proc.argc = built.argc;
     proc.argv = built.argv;
     proc.stack_base = stack_base;
+    proc.stack_low = USER_STACK_BASE;
 
     let slot = match process::publish(proc) {
         Ok(slot) => slot,
@@ -1102,7 +1130,11 @@ fn release_mmap(run: &mut Process) {
     run.mmap_count = 0;
 }
 
-/// Unmap the user stack pages of `root` and return the contiguous run to the PMM.
+/// Unmap the *initial* user stack pages of `root` and return the contiguous run
+/// to the PMM.
+///
+/// The demand-grown pages below [`USER_STACK_BASE`] are not part of this run;
+/// their teardown is [`stack::release`], which the caller runs first.
 fn release_stack_in(root: usize, base: usize) {
     for page in 0..USER_STACK_PAGES {
         let _ = paging::unmap_in(root, USER_STACK_BASE + page * FRAME_SIZE);
@@ -1125,6 +1157,12 @@ fn release_process_memory(proc: &mut Process, slot: Option<usize>) {
         release_heap(proc, slot);
     }
     release_mmap(proc);
+    // The grown half of the stack first (below the initial window), then the
+    // contiguous 64 KiB. The walk is safe even for a slot whose stack was never
+    // built: it skips unmapped pages, and every page it does find in the range
+    // was mapped by `stack::try_grow` into this root.
+    stack::release(proc.root, proc.stack_low);
+    proc.stack_low = USER_STACK_BASE;
     if proc.stack_base != 0 {
         release_stack_in(proc.root, proc.stack_base);
         proc.stack_base = 0;
@@ -1506,6 +1544,9 @@ struct ForkSnapshot {
     heap_count: usize,
     mmap_regions: [MmapRegion; MAX_MMAP_REGIONS],
     mmap_count: usize,
+    /// Lowest mapped stack page of the parent, copied so the child starts with
+    /// the same demand-grown stack the parent had at the `fork`.
+    stack_low: usize,
 }
 
 impl ForkSnapshot {
@@ -1524,6 +1565,7 @@ impl ForkSnapshot {
             heap_count: run.heap_count,
             mmap_regions: run.mmap_regions,
             mmap_count: run.mmap_count,
+            stack_low: run.stack_low,
         }
     }
 }
@@ -1579,7 +1621,14 @@ fn build_fork_into(child_slot: usize, snapshot: &ForkSnapshot) -> Result<(), isi
     let Some(stack_base) = pmm::alloc_frames_contiguous(USER_STACK_PAGES) else {
         return Err(ENOMEM);
     };
-    if let Some(child) = process::with_slot_mut(child_slot, |child| child.stack_base = stack_base) {
+    // `stack_low` is published in the same step as `stack_base`: if any copy
+    // below fails, `fork_cleanup` releases the child by walking
+    // `stack_low..USER_STACK_BASE`, and every page that was actually mapped by
+    // then is found and freed (unmapped holes are skipped).
+    if let Some(child) = process::with_slot_mut(child_slot, |child| {
+        child.stack_base = stack_base;
+        child.stack_low = snapshot.stack_low;
+    }) {
         let _ = child;
     } else {
         pmm::free_frames_contiguous(stack_base, USER_STACK_PAGES);
@@ -1591,6 +1640,9 @@ fn build_fork_into(child_slot: usize, snapshot: &ForkSnapshot) -> Result<(), isi
         if copy_page_into(snapshot.root, space.root, va, frame).is_err() {
             return Err(ENOMEM);
         }
+    }
+    if snapshot.stack_low < USER_STACK_BASE {
+        copy_grown_stack(snapshot.root, space.root, snapshot.stack_low)?;
     }
 
     for index in 0..snapshot.heap_count {
@@ -1648,6 +1700,22 @@ fn copy_page_into(src_root: usize, dst_root: usize, va: usize, frame: usize) -> 
     unsafe { core::ptr::copy_nonoverlapping(source as *const u8, frame as *mut u8, FRAME_SIZE) };
     if paging::map_in(dst_root, va & !(FRAME_SIZE - 1), frame, flags).is_err() {
         return Err(());
+    }
+    Ok(())
+}
+
+/// Copy the parent's demand-grown stack pages into the child's root.
+///
+/// The pages in `low..USER_STACK_BASE` are mapped in the parent by construction —
+/// that range *is* the grown half of its stack — so a missing or non-user page
+/// there is a bug, and the fork fails (the caller's cleanup frees the pages
+/// copied so far) rather than leaving a hole a later fault would silently fill.
+fn copy_grown_stack(src_root: usize, dst_root: usize, low: usize) -> Result<(), isize> {
+    const ENOMEM: isize = -12;
+    let mut va = low;
+    while va < USER_STACK_BASE {
+        copy_user_page(src_root, dst_root, va).map_err(|_| ENOMEM)?;
+        va += FRAME_SIZE;
     }
     Ok(())
 }
@@ -1816,6 +1884,7 @@ pub(crate) fn execve(
         proc.satp = space.satp;
         proc.asid = space.asid;
         proc.stack_base = stack_base;
+        proc.stack_low = USER_STACK_BASE;
         proc.heap_end = USER_HEAP_BASE;
         proc.heap_count = 0;
         proc.mmap_count = 0;

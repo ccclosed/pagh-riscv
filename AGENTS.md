@@ -53,7 +53,7 @@ unknown argument is rejected, not ignored. Checks that are not part of CI:
 
 ```sh
 # at the `pagh:rv64>` prompt
-selftest                                        # in-QEMU suites: 7 mem + 4 block/pointer + 11 fs + 4 arch/timer + 5 task + 10 user (10/10 with /mnt, 8/10 + 2 skip without) + 11 net + ledgers
+selftest                                        # in-QEMU suites: 7 mem + 4 block/pointer + 11 fs + 4 arch/timer + 5 task + 13 user (13/13 with /mnt, 11/13 + 2 skip without) + 11 net + ledgers
 # from the host
 python3 tools/run.py --keys "help\n" --shot /tmp/shot.png --check-font --scan-all
 python3 tools/run.py --disk /tmp/pagh.img --keys "ls /mnt\n" --shot /tmp/fs.png
@@ -109,12 +109,13 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
   (+ `src/drivers/README.md`), `fs/{ext2,format_policy,selftest}.rs`
   (+ `src/fs/README.md`), `vfs/mod.rs` (+ `src/vfs/README.md`),
   `task/{mod,scheduler,selftest}.rs` (+ `src/task/README.md`),
-  `user/{mod,process,signal,elf,syscall,selftest,futex}.rs` (+ `src/user/README.md`),
+  `user/{mod,process,signal,elf,syscall,selftest,futex,stack}.rs` (+ `src/user/README.md`),
   `net/{mod,wire,dhcp,dns,tcp,selftest}.rs` (+ `src/net/README.md`),
   `pkg/{mod,sha256}.rs` (+ `src/pkg/README.md`), `console.rs`, `shell.rs`,
   `sync.rs`.
-- `userland/` — six static RV64 fixture programs (`hello`, `fault`, `spin`,
-  `argv`, `abi`, `exec-child`), their linker script and `build.sh`
+- `userland/` — nine static RV64 fixture programs (`hello`, `fault`, `spin`,
+  `argv`, `abi`, `exec-child`, `stack`, `stack-over`, `stack-fork`), their
+  linker script and `build.sh`
   (+ `userland/README.md`).
   The ELFs are committed and embedded with `include_bytes!`; a rebuild must be
   committed with the sources in the same commit.
@@ -333,8 +334,9 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
 ## Testing philosophy
 
 What exists: the in-QEMU suites (shell `selftest`: 7 memory + 4 block/pointer + 11 ext2/VFS
-+ 4 interrupt/timer + 5 scheduler + 10 user-mode (including the native
-thread/futex and the signal/altstack/siginfo/job-control sections) + 11 network
++ 4 interrupt/timer + 5 scheduler + 13 user-mode (including the native
+thread/futex and the signal/altstack/siginfo/job-control sections, and the three
+demand-grown-stack runs) + 11 network
 checks, idempotent, each group prints a
 free-frame ledger), the headless QEMU smoke driver in six
 modes (serial, ramfb, disk-fresh, disk-existing, `--net`, `--keyboard`) — every mode attaches a
@@ -355,7 +357,17 @@ signal sections (markers `abi: altstack ok`, `abi: siginfo ok`,
 counters to move and no live handler, pending bit or `Stopped` task to survive),
 the process family (`fork`/`execve`/`wait4`/`getppid`; markers `abi: fork ok`,
 `abi: wait ok`, `abi: exec ok`, `abi: exec wait ok`; `live_processes() == 0`
-and the fork/exec counters must move) and the socket section (bad args/EBADF always; `connect` to `10.0.2.2:8000` plus
+and the fork/exec counters must move), the demand-grown-stack pair
+(`user-stack-grows` runs a 160 KiB chain that must return and print
+`stack: deep recursion ok`, with `stack::stats()` showing at least the 16 pages
+the initial window does not cover; `user-stack-cap` runs a 1.2 MiB chain that
+must die `Exit::Fault` with `cause == store page fault` after exactly
+`MAX_GROWTH_PAGES = 240` grown pages and at least one refusal; `user-stack-fork`
+forks a chain that has already grown ~14 pages and requires both markers
+(`stack: fork child ok`, `stack: fork parent ok`), the fork/wait counters and an
+unchanged ledger, so `fork`'s copy of `stack_low..USER_STACK_BASE` and `wait4`'s
+teardown of it are both exercised; all three compare the
+PMM ledger before and after) and the socket section (bad args/EBADF always; `connect` to `10.0.2.2:8000` plus
 send/recv/shutdown/EOF only when a host server is listening, otherwise a
 `SKIP`, never a failure). `run demo` must print
 `run: demo exited with code 42`, `run fault` must be killed with cause 13 while
@@ -397,7 +409,7 @@ fuzzing. That is a gap, not a policy — the rule stands:
 
 ## Versioning
 
-Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.18.0`,
+Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.20.0`,
 which `Cargo.lock` mirrors. **The two move together in one commit**: CI builds with
 `--locked`, and cargo refuses to rewrite the lock (`cannot update the lock file …
 because --locked was passed`), so a `Cargo.toml`-only bump fails the build job in
@@ -445,7 +457,12 @@ seconds. Verify locally with `cargo build --locked` after any version change.
   `0.18.0` adds TCP server sockets (`bind(200)` for a stream socket, `listen(201)`,
   `accept(202)` with a bounded queue and peer `sockaddr_in`, one listener, a
   libpagh `TcpListener` and the `tcp_echo` live fixture) and fixes the virtio-net
-  used-ring advance. The same rule applies
+  used-ring advance; `0.19.0` adds the TLS 1.3 client with fail-closed chain/SAN/
+  clock/`CertificateVerify` verification; `0.20.0` adds demand-grown user stacks
+  (64 KiB initial window, page-at-a-time growth on a load/store fault below
+  `stack_low` up to the 1 MiB per-process cap, a real guard below
+  `USER_STACK_FLOOR`, `stack_low` bookkeeping carried through fork/exec/teardown
+  and the `user-stack-grows`/`user-stack-cap` selftests). The same rule applies
   to both: the tag equals the manifest and the `Cargo.lock` entry, and the
   release is not optional.
 
@@ -465,7 +482,7 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
 | The pointer/keyboard have **no IRQ**: both are polled from the shell's idle loop | a long-running command (or a blocking wait that does not poll) freezes the cursor and drops typed bytes; do not put input polling in a place that never returns to the idle loop |
 | The keyboard translates **US layout only** and ignores arrows/Home/End/dead keys | a program needing another layout or key semantics needs a keymap layer, not a driver tweak |
 | Clicks/selection are not consumed: `BTN_LEFT` is read and stored, nothing acts on it | mouse-driven editing/selection is a UI milestone, not a driver change |
-| Per-process Sv39 root/ASID, but no COW/demand paging: `MAX_PROCESSES = 6`, `fork` deep-copies every page, `mmap`/`brk` allocate eagerly, ASID is only a TLB tag (switch still flushes) | releasing a process root while any thread lives, or reusing an ASID without the flush, aliases two processes; a seventh live process is `-EAGAIN`, not silent serialisation. `brk` is one fixed 1 MiB window, `MAP_SHARED`/`MAP_FIXED`/file-backed `mmap` are absent. 16 fds per process, console reads are non-blocking (`-EAGAIN`), `getdents64` is a snapshot taken at `openat`, `openat`/`mkdirat` ignore `mode` and `fchmodat` is a per-process override never written to the inode or enforced; `run <path>` streams from the VFS and accepts images up to 1 MiB (`MAX_IMAGE_BYTES`), one foreground image at a time |
+| Per-process Sv39 root/ASID, but no COW/demand paging beyond the user stack: `MAX_PROCESSES = 6`, `fork` deep-copies every page, `mmap`/`brk` allocate eagerly, ASID is only a TLB tag (switch still flushes) | releasing a process root while any thread lives, or reusing an ASID without the flush, aliases two processes; a seventh live process is `-EAGAIN`, not silent serialisation. `brk` is one fixed 1 MiB window, `MAP_SHARED`/`MAP_FIXED`/file-backed `mmap` are absent. 16 fds per process, console reads are non-blocking (`-EAGAIN`), `getdents64` is a snapshot taken at `openat`, `openat`/`mkdirat` ignore `mode` and `fchmodat` is a per-process override never written to the inode or enforced; `run <path>` streams from the VFS and accepts images up to 1 MiB (`MAX_IMAGE_BYTES`), one foreground image at a time |
 | The filesystem has **no journal** (M5 deliberately skipped the x86 WAL) | a power cut between two writes can leave an operation half-applied; do not claim crash consistency |
 | One block device slot, no partitions/hot-plug | a second disk is a design change, not a registration |
 | Formatting is the only destructive operation and is gated by `format_policy` | never format "to recover": a failed mount is not permission to erase |
@@ -668,3 +685,21 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
     released process root is never still installed and a zombie never outlives
     the command. Do not free `Process.root` while any of its threads is live or
     while the hart is running on it.
+43. **The user stack grows one page at a time and stops at a real guard.**
+    `src/user/stack.rs::try_grow` is the single growth path and it runs from
+    `trap_dispatch` **before** `signal::deliver_fault`, for load/store page
+    faults only, only below the task's current bottom (`Process::stack_low`),
+    only at or above `USER_STACK_FLOOR = USER_TOP - USER_STACK_MAX_SIZE` (1 MiB
+    per process), and only within `FAULT_SLACK = 64 KiB` of the interrupted user
+    `sp`. It verifies the whole `page..stack_low` span is unmapped **before** it
+    allocates (an image `PT_LOAD` may legally sit in that window and must never
+    be overwritten), zeroes every frame through the identity map (a stack page
+    must not leak a previous tenant), maps it `user_rw()`, and leaves `sepc`
+    alone so the epilogue retries the instruction. A refusal is not a kernel
+    error: the fault keeps its pre-growth meaning (`SIGSEGV`/`on_fault`), which
+    is what makes recursion past 1 MiB die cleanly on the page below the floor.
+    `stack_low..USER_STACK_BASE` is exactly the set of pages this module mapped:
+    `fork` copies that span (`copy_grown_stack`), `execve` resets `stack_low`,
+    and the one teardown (`release_process_memory`) calls `stack::release`
+    before the page tables go. Do not move the check after the first allocation,
+    do not map an instruction-fetch fault, and do not grow past the floor.

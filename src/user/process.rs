@@ -74,8 +74,17 @@ pub(crate) struct Process {
     /// Contiguous extents created by `mmap`.
     pub mmap_regions: [MmapRegion; MAX_MMAP_REGIONS],
     pub mmap_count: usize,
-    /// First frame of the 64 KiB user stack allocation (`0` before it is set).
+    /// First frame of the 64 KiB initial user stack allocation (`0` before it is
+    /// set). The frames above [`stack_low`](Self::stack_low) are this run.
     pub stack_base: usize,
+    /// Lowest user stack address currently mapped.
+    ///
+    /// Starts at `USER_STACK_BASE` and moves down one page at a time as the
+    /// demand-grown stack expands (see `src/user/stack.rs`), never below
+    /// `USER_STACK_FLOOR`. Teardown walks `stack_low..USER_STACK_BASE` to unmap
+    /// and free the grown pages, so this field is the whole bookkeeping the
+    /// grown half of the stack needs.
+    pub stack_low: usize,
     /// Thread id blocked in `wait4` for one of this process's children (0 while
     /// nobody waits). Written by the parent's `wait4`, read by the child's exit.
     pub wait_tid: u64,
@@ -109,6 +118,7 @@ impl Process {
             mmap_regions: [MmapRegion::empty(); MAX_MMAP_REGIONS],
             mmap_count: 0,
             stack_base: 0,
+            stack_low: crate::user::elf::USER_STACK_BASE,
             wait_tid: 0,
             ready: false,
         }

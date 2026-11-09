@@ -1,7 +1,7 @@
 # C runtime and dynamic linking on pagh-riscv
 
 The kernel loads static ELF64 programs. Two userland projects build on the native
-ABI and are tested against **0.18.0+**:
+ABI and are tested against **0.20.0+**:
 
 ## pagh-libc
 
@@ -42,7 +42,9 @@ does not implement `PT_INTERP` — the loader is an ordinary static program.
 
 - entry: `a0=argc`, `a1=argv`; envp is computed as `argv + (argc+1)*8` (a2 is
   not reliable);
-- `sp` is 16-byte aligned; stack is 64 KiB per process;
+- `sp` is 16-byte aligned; the stack starts at 64 KiB and grows on demand up to
+  1 MiB per process (a load/store fault just below the current bottom maps the
+  missing page); deeper recursion dies with a clean store page fault;
 - `stat` is 24 bytes (`mode u32, kind u32, size u64, ino u64`);
 - dirents: `ino u64`, `kind u8`, `name_len u8`, pad, name; records are
   `align8(12 + name_len)`;

@@ -217,7 +217,7 @@ stvec ──► trap_entry:
 | 9 + bit63 | supervisor external | PLIC claim/complete: UART RX → кольцевой буфер; неизвестный source считается и виден в `time`. Возврат |
 | прочее + bit63 | любое другое прерывание | печать `[EXC] interrupt cause N (unhandled)` один раз, возврат |
 | 8, `SPP=0` | `ecall` из U-mode | `user::syscall::dispatch(frame)`: syscall-ABI Linux/RISC-V, `sepc += 4`, возврат в U |
-| 2/3/12/13/15, `SPP=0` | исключение из U-mode | `user::on_fault`: одна строка `[user] … killed: …`, `scheduler::exit` — **задача** умирает, машина живёт |
+| 2/3/12/13/15, `SPP=0` | исключение из U-mode | сначала `user::stack::try_grow` (`stack.rs:116-192`): load/store page fault **ниже текущего дна** стека, но не ниже `USER_STACK_FLOOR` и не дальше 64 KiB от прерванного `sp`, домапливает и обнуляет страницы до адреса fault'а и возвращает `true` — инструкция повторяется с тем же `sepc`; иначе `signal::deliver_fault` (обработчик SIGSEGV/SIGILL/SIGBUS/SIGTRAP) или `user::on_fault`: одна строка `[user] … killed: …`, `scheduler::exit` — **задача** умирает, машина живёт |
 | 2/3/12/13/15, `SPP=1` | исключение из S-mode | имя + `scause/stval/sepc`, `ra/sp`, `halting`, `park_forever` |
 | любое иное | exception | то же, что S-mode-исключение, с именем `exception` |
 
@@ -520,6 +520,27 @@ PLIC, virtio-окна), а `elf::load_in` добавляет поверх тол
 принимается, но слова игнорируются. Стек нулевой при маппинге: кадр мог раньше
 быть kernel-стеком, и U-mode не должен читать его остатки.
 
+**Растущий стек (`user::stack`).** Начальные 64 KiB (`USER_STACK_BASE =
+0x3fff_0000 .. USER_TOP = 0x4000_0000`, 16 кадров) — это только стартовое окно.
+U-mode load/store page fault, попавший **ниже текущего дна** `Process::stack_low`,
+но не ниже `USER_STACK_FLOOR = 0x3ff0_0000` (потолок `USER_STACK_MAX_SIZE = 1 MiB`
+на процесс: 64 KiB окна + 960 KiB = 240 страниц роста) и не дальше `FAULT_SLACK
+= 64 KiB` от прерванного user `sp`, обрабатывается `stack::try_grow` **до**
+доставки сигнала: кадры берутся из PMM, обнуляются через identity-карту,
+мапятся `Flags::user_rw()` и публикуются в `stack_low`; `sepc` не двигается,
+поэтому эпилог повторяет faulting-инструкцию. Условия отказа: не load/store
+(instruction fetch не растёт никогда — страницы RW, не X), адрес ниже дна,
+ниже floor, дальше `FAULT_SLACK` от `sp`, любая страница диапазона уже
+замаплена (загрузчик вправе положить `PT_LOAD` в это окно — тогда она
+сохраняется, а fault остаётся фатальным) или PMM пуст. Отказ — это прежний
+`on_fault`: рекурсия сверх 1 MiB умирает `store page fault` на странице ниже
+`0x3ff0_0000`, то есть guard реален. Учёт — одно поле `Process::stack_low`:
+`fork` копирует `stack_low..USER_STACK_BASE` постранично (`copy_grown_stack`),
+`execve` ставит границу обратно на `USER_STACK_BASE`, teardown (`run_source`,
+`wait4`, `cleanup_orphans`, `execve`) вызывает `stack::release(root, stack_low)`
+до освобождения таблиц. Счётчики `stack::stats()` (`growths/pages/refused/
+refused_frames`) читает `user-stack-grows`/`user-stack-cap`.
+
 **Жизненный цикл** (`user::run_image` для фикстур, `user::run_file` для
 `run <path>`):
 
@@ -531,7 +552,8 @@ PLIC, virtio-окна), а `elf::load_in` добавляет поверх тол
    4 KiB, потому что `run_file` — самый глубокий путь на 128 KiB boot-стеке
    шелла;
 2. 16 contiguous-кадров под 64 KiB user-стека, `map_in(root, …)` `U|R|W`,
-   обнуление;
+   обнуление; `Process::stack_low = USER_STACK_BASE` — дно, ниже которого
+   начинается деманд-рост (см. выше);
 3. кадр `argc/argv/envp` пишется через `paging::translate_in(root, …)` (см.
    выше), сброс строки fd процесса (`reset_fds(slot)`);
 4. `spawn_in_group_satp(user_task, pid, root_satp)`; шелл ждёт
@@ -539,7 +561,8 @@ PLIC, virtio-окна), а `elf::load_in` добавляет поверх тол
    включая user-потоки. Процесс считается живым, пока не вышел последний поток
    или пока `exit_group`/fault не снял группу;
 5. `reap` kernel-стеков всех потоков; `release_process_memory` снимает image,
-   heap, mmap и user-стек, освобождает таблицы root'а; `release_fds`/`clear_process`
+   heap, mmap, выросшие страницы стека (`stack::release(root, stack_low)`) и
+   начальные 64 KiB, освобождает таблицы root'а; `release_fds`/`clear_process`
    освобождают fd и signal-строку, `futex::clear_run(pid)` — очередь. Затем
    `cleanup_orphans` убивает и хоронит всех, кто пережил foreground (9.4).
 
@@ -678,9 +701,10 @@ heap ровно 1 MiB, `getdents64` без места в
 буфере отдаёт 0 (неотличимо от конца каталога — буфер на 264 B покрывает имя
 ext2), `openat`/`mkdirat` игнорируют `mode`, `chmod` живёт только до конца
 процесса, `uname.release` намеренно `0.10.0` (стабильная строка ABI) при
-`Cargo.toml` 0.18.0. Процессов ≤ 6, потоков ≤ 14 на процесс (16 слотов минус
-`shell`/`idle`), у каждого свой kernel-стек 16 KiB + guard; user-стек — память
-вызывающего, ядро её не освобождает. TLS/PI/requeue, `join`/`waitid` и
+`Cargo.toml` 0.20.0. Процессов ≤ 6, потоков ≤ 14 на процесс (16 слотов минус
+`shell`/`idle`), у каждого свой kernel-стек 16 KiB + guard; user-стек —
+память вызывающего, ядро её не освобождает (главный стек процесса ядро заводит
+само: 64 KiB + деманд-рост до 1 MiB, см. 9.1). TLS/PI/requeue, `join`/`waitid` и
 приоритеты отсутствуют; futex-таблица — 32 ожидающих на 16 адресов. `fork` —
 deep copy без COW, `SIGCHLD` не генерируется, сирот убивает раннер foreground.
 ### 9.2 Нативные потоки и фьютексы (native-thread)
@@ -919,14 +943,22 @@ SIGCONT с обработчиком доставляется как обычны
 одного прогона `kill(0, SIGSTOP)` — документированный тупик. SIGKILL/SIGSTOP
 нельзя поймать или заблокировать; `SIG_IGN` просто сбрасывает pending.
 
-**Синхронные fault'ы.** `deliver_fault` в `trap_dispatch`: illegal instruction →
+**Синхронные fault'ы.** Первым делом `trap_dispatch` предлагает load/store page
+fault деманд-росту user-стека (`user::stack::try_grow`, см. 9.1): если адрес
+лежит ниже текущего дна стека (`Process::stack_low`), не ниже `USER_STACK_FLOOR`
+(1 MiB на процесс) и не дальше 64 KiB от прерванного `sp`, страницы до адреса
+fault'а мапятся и обнуляются, инструкция повторяется, и до `deliver_fault` дело
+не доходит — так глубокая рекурсия растёт, а не падает. Всё остальное —
+`deliver_fault` в `trap_dispatch`: illegal instruction →
 SIGILL (`SI_KERNEL`), breakpoint → SIGTRAP (`TRAP_BRKPT`), load/store address
 misaligned → SIGBUS (`BUS_ADRALN`), instruction/load/store page fault → SIGSEGV
 (`SEGV_MAPERR`). Если для сигнала установлен реальный обработчик, кадр строится
 как обычно, `si_addr` = `stval`, а `sepc` сохранённого кадра указывает на
 faulting-инструкцию; без обработчика остаётся прежний `user::on_fault` (убить
 прогон с диагностикой). `SIG_IGN` для синхронного сигнала не делает инструкцию
-успешной, поэтому тоже уходит в `on_fault`.
+успешной, поэтому тоже уходит в `on_fault`. Рекурсия сверх лимита — это
+page fault на странице ниже дна: `try_grow` отказывает, и прогон умирает
+обычной строкой `[user] … killed: store page fault` без единого лишнего кадра.
 
 **Lock order.** `process → signal table` (pid читается до лока), а
 `scheduler → signal table` не бывает: цели `kill` резолвятся под
@@ -964,7 +996,7 @@ SIGTSTP/SIGCONT на futex-ожидании. Маркеры — `abi: signals ok
 (`MAX_PROCESSES = 6`) плюс собственный Sv39-root и ASID. `Process` хранит
 `pid/ppid`, `root/satp/asid`, `name`, `entry/sp/argc/argv`, `main_tid`,
 `threads`, `exit/signal`, `heap_end/heap_count`, `mmap_regions`, `stack_base`,
-`wait_tid` и `ready`. Списки image- и heap-кадров лежат **вне** `Process`
+`stack_low`, `wait_tid` и `ready`. Списки image- и heap-кадров лежат **вне** `Process`
 (`IMAGES`/`HEAPS`): процесс весит сотни байт, а перенос 2 KiB `Loaded` через
 16 KiB kernel-стек уже вызывал переполнение в ранней версии fork. Состояния:
 `Free -> Live -> Zombie -> Free`; `threads` уменьшается на каждом `exit`, а
@@ -982,8 +1014,9 @@ PLIC, virtio-окна) и **не** копирует листья с `U=1`. За�
 таблиц; листья освобождает процессный teardown, а kernel-листья — общие и не
 трогаются.
 
-**`fork`** копирует **все** mapped user-страницы (image, heap, mmap, 64 KiB
-user-стека) — это deep copy, не COW. `ForkSnapshot` снимается под process-локом,
+**`fork`** копирует **все** mapped user-страницы (image, heap, mmap, начальные
+64 KiB user-стека и всё, что стек успел вырастить, — `snapshot.stack_low ..
+USER_STACK_BASE`) — это deep copy, не COW. `ForkSnapshot` снимается под process-локом,
 страницы копируются по `translate_in(parent.root)`, флаги листа (включая `X`)
 сохраняются. Строка fd копируется (`fork_fds`: файлы/pipe/`Arc` клонируются,
 pipe-ring получает +1 ссылку, TCP- или UDP-сокет становится `FdEntry::Unsupported`);
@@ -1035,7 +1068,8 @@ exec проверяет сброс `SIG_IGN` в `SIG_DFL` и сохранени�
 файл даёт `-ENOEXEC`, процесс выживает.
 `SELFTEST user-abi-syscalls` требует, чтобы `forks`/`waits`/`getppids`/
 `execs` выросли, `live_processes() == 0`, `live_pipes() == 0`, а selftest с
-диском проходит 10/10; PMM-ledger в двух прогонах совпадает.
+диском проходит 13/13 (11/13 + 2 SKIP без `/mnt`); PMM-ledger в двух прогонах
+совпадает.
 
 ## 10. Консоль, экран и шелл
 
@@ -1163,8 +1197,8 @@ exec проверяет сброс `SIG_IGN` в `SIG_DFL` и сохранени�
   поэтому образ можно проверять хостовыми инструментами.
 * **Нет SMP**: работает один hart.
 * **Нет host-тестов**: есть in-QEMU selftests (7 памяти, 3 блочного слоя, 11
-  ext2/VFS, 4 таймера/PLIC, 5 планировщика, 10 user-mode — с диском 10/10, без
-  `/mnt` 8/10 + 2 SKIP), QEMU-smoke в шести режимах (serial, ramfb, диск
+  ext2/VFS, 4 таймера/PLIC, 5 планировщика, 13 user-mode — с диском 13/13, без
+  `/mnt` 11/13 + 2 SKIP), QEMU-smoke в шести режимах (serial, ramfb, диск
   fresh/existing, net, keyboard) и проверка пикселей `tools/font_check.py`;
   чистая логика (`fdt.rs`) тестами не покрыта.
 * **Инструментов сборки нет**: `run.sh` — единственный лаунчер; в `tools/` только
@@ -1197,8 +1231,9 @@ fork/exec/wait подтверждены живыми прогонами (`run de
 killed, `run spin` → 7 с таймером в U; маркеры `abi: threads ok`,
 `abi: signals ok`, `abi: altstack ok`, `abi: siginfo ok`, `abi: jobcontrol ok`,
 `abi: fork ok`, `abi: wait ok`, `abi: exec ok`, `abi: exec wait ok`),
-`SELFTEST user-* 10/10` с диском (`user-run-large-file`: 100 KiB образ с нулевым
-хвостом через `run_file`; без `/mnt` — 8/10 + 2 SKIP), PMM-ledger до/после
+`SELFTEST user-* 13/13` с диском (`user-run-large-file`: 100 KiB образ с нулевым
+хвостом через `run_file`; `user-stack-grows`/`user-stack-cap`/`user-stack-fork`:
+рост до 1 MiB, guard и fork на выросшем стеке; без `/mnt` — 11/13 + 2 SKIP), PMM-ledger до/после
 каждого блока совпадает в двух прогонах, smoke проходит serial/net/ramfb/
 disk-fresh/disk-existing. Следующие шаги —
 из `docs/roadmap.md`:

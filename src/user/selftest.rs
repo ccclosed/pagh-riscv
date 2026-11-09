@@ -30,14 +30,25 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::arch::riscv64::traps::CAUSE_LOAD_PAGE_FAULT;
+use crate::arch::riscv64::traps::{CAUSE_LOAD_PAGE_FAULT, CAUSE_STORE_PAGE_FAULT};
 use crate::memory::pmm;
 use crate::user::elf::{self, ElfError, MAX_IMAGE_BYTES};
+use crate::user::stack;
 use crate::user::syscall;
 use crate::user::{
     self, Exit, UserError, ABI_ELF, ARGV_ELF, EXEC_CHILD_ELF, FAULT_ELF, HELLO_ELF, SPIN_ELF,
+    STACK_ELF, STACK_FORK_ELF, STACK_OVER_ELF, USER_STACK_PAGES,
 };
 use crate::vfs::{self, VfsError, VfsNode};
+
+/// The line `userland/stack.elf` prints only after its whole 160 KiB chain
+/// returned; the growth check requires it in the captured transcript.
+const STACK_MARKER: &[u8] = b"stack: deep recursion ok";
+
+/// The two lines `userland/stack-fork.elf` prints: the child's after finishing
+/// its chain on the stack `fork` copied, the parent's after `wait4` reaped it.
+const STACK_FORK_CHILD_MARKER: &[u8] = b"stack: fork child ok";
+const STACK_FORK_PARENT_MARKER: &[u8] = b"stack: fork parent ok";
 
 /// The fixture's `e_entry`: `user.ld` places `_start` at the bottom of the first
 /// mapped page, 0x1_0000.
@@ -821,6 +832,180 @@ fn user_timer_preempts(_buf: &mut Vec<u8>) -> bool {
     ok
 }
 
+/// The demand-grown-stack proof: `stack` descends 160 KiB in 4 KiB store frames,
+/// so the kernel has to map pages below the initially mapped 64 KiB window,
+/// retry each faulting store and let the chain return.
+///
+/// Three things have to hold: the run exits 0 *after* printing its own marker
+/// (the marker is the proof that the deepest frame really was reached, since the
+/// shell never sees a program that died in the middle), the growth counters move
+/// by more than the initial window covers, and the frames come back.
+fn user_stack_grows(_buf: &mut Vec<u8>) -> bool {
+    let before = frames();
+    let baseline = stack::stats();
+    user::capture_start();
+    let result = user::run_image(STACK_ELF, "stack");
+    let captured = user::capture_stop();
+
+    let mut ok = match result {
+        Ok(Exit::Code(0)) => true,
+        Ok(other) => {
+            crate::kprintln!("[selftest] user: the deep-stack fixture ended {other}");
+            false
+        }
+        Err(error) => {
+            crate::kprintln!("[selftest] user: the deep-stack fixture failed: {error}");
+            false
+        }
+    };
+    if !captured_contains(&captured, STACK_MARKER) {
+        crate::kprintln!(
+            "[selftest] user: the deep-stack transcript was {:?}",
+            core::str::from_utf8(&captured.bytes[..captured.len]).unwrap_or("<non-UTF-8>")
+        );
+        ok = false;
+    }
+    let after = stack::stats();
+    let grown = after.pages.saturating_sub(baseline.pages);
+    if after.growths <= baseline.growths || grown < USER_STACK_PAGES as u64 {
+        crate::kprintln!(
+            "[selftest] user: stack growth did not move as expected (growths {} -> {}, pages {} -> {})",
+            baseline.growths,
+            after.growths,
+            baseline.pages,
+            after.pages
+        );
+        ok = false;
+    }
+    if frames() != before {
+        crate::kprintln!(
+            "[selftest] user: the deep-stack run left the ledger at {} (was {before})",
+            frames()
+        );
+        ok = false;
+    }
+    ok
+}
+
+/// The fork half of the contract: `stack-fork` grows about 14 pages below the
+/// initial window, `fork`s there, and both processes finish the chain on their
+/// own copy — the parent waits, the child exits 0.
+///
+/// The kernel side requires both markers (the child's proves the copied pages
+/// were usable, the parent's that `wait4` returned a pid and not a fault
+/// status), the `fork`/`wait4` counters to move, the growth counters to move in
+/// both processes, and the PMM ledger to come back: the child's grown pages are
+/// released by the parent's `wait4`, the parent's by the runner.
+fn user_stack_fork(_buf: &mut Vec<u8>) -> bool {
+    let before = frames();
+    let baseline = stack::stats();
+    let syscalls_before = syscall::stats();
+    user::capture_start();
+    let result = user::run_image(STACK_FORK_ELF, "stack-fork");
+    let captured = user::capture_stop();
+
+    let mut ok = match result {
+        Ok(Exit::Code(0)) => true,
+        Ok(other) => {
+            crate::kprintln!("[selftest] user: the stack-fork fixture ended {other}");
+            false
+        }
+        Err(error) => {
+            crate::kprintln!("[selftest] user: the stack-fork fixture failed: {error}");
+            false
+        }
+    };
+    for marker in [STACK_FORK_CHILD_MARKER, STACK_FORK_PARENT_MARKER] {
+        if !captured_contains(&captured, marker) {
+            crate::kprintln!(
+                "[selftest] user: the stack-fork transcript was {:?}",
+                core::str::from_utf8(&captured.bytes[..captured.len]).unwrap_or("<non-UTF-8>")
+            );
+            ok = false;
+        }
+    }
+    let after = stack::stats();
+    let syscalls_after = syscall::stats();
+    let grown = after.pages.saturating_sub(baseline.pages);
+    if after.growths <= baseline.growths || grown < USER_STACK_PAGES as u64 {
+        crate::kprintln!(
+            "[selftest] user: stack-fork growth did not move as expected (growths {} -> {}, pages {} -> {})",
+            baseline.growths,
+            after.growths,
+            baseline.pages,
+            after.pages
+        );
+        ok = false;
+    }
+    if syscalls_after.forks <= syscalls_before.forks
+        || syscalls_after.waits <= syscalls_before.waits
+    {
+        crate::kprintln!(
+            "[selftest] user: stack-fork did not fork and wait (forks {} -> {}, waits {} -> {})",
+            syscalls_before.forks,
+            syscalls_after.forks,
+            syscalls_before.waits,
+            syscalls_after.waits
+        );
+        ok = false;
+    }
+    if frames() != before {
+        crate::kprintln!(
+            "[selftest] user: the stack-fork run left the ledger at {} (was {before})",
+            frames()
+        );
+        ok = false;
+    }
+    ok
+}
+
+/// The cap proof: `stack-over` asks for 1.2 MiB and must be stopped by the guard
+/// page below the 1 MiB floor — `Exit::Fault` with the store-page-fault cause,
+/// after consuming the whole growth budget and having the next fault refused.
+///
+/// This is the "runaway recursion still produces a clean fault" half of the
+/// contract: the process dies, the frame pool comes back exactly as it was, and
+/// the kernel is still running (the next checks use it).
+fn user_stack_cap(_buf: &mut Vec<u8>) -> bool {
+    let before = frames();
+    let baseline = stack::stats();
+    let mut ok = match user::run_image(STACK_OVER_ELF, "stack-over") {
+        Ok(Exit::Fault { cause, .. }) if cause == CAUSE_STORE_PAGE_FAULT => true,
+        Ok(other) => {
+            crate::kprintln!(
+                "[selftest] user: the stack-cap fixture ended {other}, expected a store page fault"
+            );
+            false
+        }
+        Err(error) => {
+            crate::kprintln!("[selftest] user: the stack-cap fixture failed to start: {error}");
+            false
+        }
+    };
+    let after = stack::stats();
+    let grown = after.pages.saturating_sub(baseline.pages);
+    let refused = after.refused.saturating_sub(baseline.refused);
+    if grown != stack::MAX_GROWTH_PAGES as u64 {
+        crate::kprintln!(
+            "[selftest] user: the stack-cap run grew {grown} page(s), expected the whole {}-page budget",
+            stack::MAX_GROWTH_PAGES
+        );
+        ok = false;
+    }
+    if refused == 0 {
+        crate::kprintln!("[selftest] user: no stack fault was refused at the cap");
+        ok = false;
+    }
+    if frames() != before {
+        crate::kprintln!(
+            "[selftest] user: the stack-cap run left the ledger at {} (was {before})",
+            frames()
+        );
+        ok = false;
+    }
+    ok
+}
+
 /// The large-image check's scratch file and its padded size.
 ///
 /// 100 KiB is deliberately more than one 64 KiB heap chunk (the old `run
@@ -1019,7 +1204,7 @@ pub fn run() -> usize {
         total
     );
 
-    let checks: [(&str, fn(&mut Vec<u8>) -> Outcome); 10] = [
+    let checks: [(&str, fn(&mut Vec<u8>) -> Outcome); 13] = [
         ("user-abi-argv", user_abi_argv),
         ("user-abi-syscalls", user_abi_syscalls),
         ("user-elf-accept", |buf| verdict(elf_accept(buf))),
@@ -1033,6 +1218,9 @@ pub fn run() -> usize {
         ("user-timer-preempts", |buf| {
             verdict(user_timer_preempts(buf))
         }),
+        ("user-stack-grows", |buf| verdict(user_stack_grows(buf))),
+        ("user-stack-cap", |buf| verdict(user_stack_cap(buf))),
+        ("user-stack-fork", |buf| verdict(user_stack_fork(buf))),
         ("user-run-large-file", user_run_large_file),
     ];
     let mut passed = 0usize;

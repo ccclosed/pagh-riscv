@@ -1,9 +1,9 @@
 #!/bin/sh
-# Build the two checked-in RISC-V userland fixtures with the kernel's toolchain.
+# Build the checked-in RISC-V userland fixtures with the kernel's toolchain.
 #
-# The kernel embeds both ELFs (include_bytes!), so a clean checkout builds
-# without this script. Re-run it only when hello.rs / fault.rs / user.ld change,
-# and commit the regenerated ELFs.
+# The kernel embeds the ELFs (include_bytes!), so a clean checkout builds
+# without this script. Re-run it when any fixture .rs or user.ld changes, and
+# commit the regenerated ELFs in the same commit.
 set -eu
 cd "$(dirname "$0")"
 
@@ -29,3 +29,6 @@ build spin.rs spin.elf
 build argv.rs argv.elf
 build abi.rs abi.elf
 build exec.rs exec-child.elf
+build stack.rs stack.elf
+build stack-over.rs stack-over.elf
+build stack-fork.rs stack-fork.elf

@@ -377,14 +377,26 @@ pub extern "C" fn trap_dispatch(frame: *mut TrapFrame) {
     if frame.sstatus & crate::arch::riscv64::csr::SSTATUS_SPP == 0 {
         if scause == CAUSE_ECALL_FROM_USER {
             crate::user::syscall::dispatch(frame);
-        } else if !crate::user::signal::deliver_fault(frame, scause, sepc, stval) {
-            // No SIGILL/SIGSEGV/SIGTRAP handler is installed: the pre-signal
-            // contract stands, and the run is killed with the fault diagnostic.
-            crate::user::on_fault(scause, sepc, stval);
+        } else {
+            // A demand-grown stack page takes precedence over SIGSEGV delivery:
+            // a load or store just below the current stack bottom is the
+            // ordinary way a deep call chain asks for more stack, and Linux
+            // grows the stack at this point too. `frame.sp` is the interrupted
+            // user `sp` (the U-mode half of the frame ABI), which is what bounds
+            // "just below". `try_grow` returns true only when the faulting page
+            // is mapped; `sepc` is untouched, so the epilogue retries the
+            // instruction that faulted instead of signalling on it.
+            let grown = crate::user::stack::try_grow(scause, stval, frame.sp);
+            if !grown && !crate::user::signal::deliver_fault(frame, scause, sepc, stval) {
+                // No SIGILL/SIGSEGV/SIGTRAP handler is installed: the pre-signal
+                // contract stands, and the run is killed with the fault diagnostic.
+                crate::user::on_fault(scause, sepc, stval);
+            }
         }
-        // Whatever the trap did (a syscall result, a delivered synchronous
-        // signal, or nothing), this is the boundary where a pending asynchronous
-        // signal can be installed. A default-fatal signal ends the run here.
+        // Whatever the trap did (a syscall result, a grown stack page, a
+        // delivered synchronous signal, or nothing), this is the boundary where
+        // a pending asynchronous signal can be installed. A default-fatal
+        // signal ends the run here.
         crate::user::signal::deliver_pending(frame);
         return;
     }

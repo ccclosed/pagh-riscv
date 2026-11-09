@@ -38,7 +38,10 @@ that it has a 100 Hz timer, a PLIC-driven UART, a virtio-mmio disk with ext2/VFS
 preemptive kernel threads, a virtio-net NIC with its own TCP/IP stack (DHCP, DNS,
 ICMP, a minimal TCP client) and — since M6b — **user mode**: a static ELF runs with
 the `U` bit set, enters through `sret`, talks to the kernel through an `ecall`
-ABI and is killed (not the machine) when it faults. **All of these are verified on
+ABI and is killed (not the machine) when it faults. The 64 KiB initial user stack
+**grows on demand** when a load or store faults just below its current bottom,
+page by page, up to a documented 1 MiB per-process cap; past the cap a real guard
+page still turns runaway recursion into one clean `[user] … killed` line. **All of these are verified on
 a live boot**; what is genuinely missing — per-process page tables, a journal,
 SMP and apt — is listed plainly in [Чего нет](#чего-нет). The documentation is deliberately checkable: every claim in
 [`docs/architecture.md`](docs/architecture.md) cites the file and line it comes from,
@@ -85,7 +88,10 @@ ext2 смонтирован в `/mnt`; `ls`/`cat`/`stat` работают, `disk
 User mode M6b: `run demo` исполняет статический ELF в U-mode (`write`,
 `sched_yield`, `exit(42)`), `run fault` намеренно падает по load page fault —
 ядро печатает причину и **оставляет машину живой**, `run spin` крутится в U-mode
-0.2 с, чтобы таймер успел вытеснить задачу, и выходит с кодом 7. Native ABI для
+0.2 с, чтобы таймер успел вытеснить задачу, и выходит с кодом 7. Стек программы
+не фиксирован: 64 KiB замаплены сразу, а страница, на которую пришёлся fault
+ниже текущего дна, домапливается и обнуляется в trap-обработчике — до **1 MiB**
+на процесс, после чего срабатывает guard. Native ABI для
 libpagh: `run <path> [args...]` передаёт `argc`/`argv`/`envp`, а `read`/`openat`/
 `fstat`/`getdents64`/`brk`/`clock_gettime`/`uname`/`readlinkat` проверены
 встроенным `userland/abi.elf` в `selftest`.
@@ -104,13 +110,28 @@ peer-адрес в `sockaddr_in`; ожидание опрашивает NIC до
 (TCP-сервер: `mke2fs -d` + QEMU `hostfwd`); транскрипты —
 `docs/live-sockets.txt`, `docs/live-udp.txt`, `docs/live-tcp-server.txt`.
 
-Версия **0.18.0** добавляет TCP-сервер: пассивное состояние и bounded
-accept-очередь в `net::tcp`, `bind` для stream-сокета, `listen(201)`,
-`accept(202)` с корректным `sockaddr_in`, teardown listener'а/соединений,
-`fork`/`dup` — `-ENOTSUP`, как у UDP, `libpagh::net::TcpListener` и
-native-фикстуру `tcp_echo`. Попутно исправлен used-ring virtio-net: драйвер
-раньше «перепрыгивал» несколько завершений, если ACK, данные и FIN приходили
-одним пакетом, и `recv` ждал retransmit.
+Версия **0.20.0** добавляет **растущий по требованию user-стек**: страница,
+на которую пришёлся load/store page fault чуть ниже текущего дна стека,
+мапится и обнуляется в trap-обработчике, инструкция повторяется, и глубокая
+рекурсия перестаёт умирать на фиксированных 64 KiB. Потолок — **1 MiB на
+процесс** (64 KiB начального окна + 960 KiB роста, дно `0x3ff0_0000`); ниже дна
+страница не мапится никогда — это настоящий guard, на котором рекурсия сверх
+лимита даёт обычный `store page fault` и убивает только процесс. Учёт — одно
+поле `Process::stack_low`: `fork` копирует выросшие страницы, `execve` сбрасывает
+границу, teardown (раннер/`wait4`/`execve`) обходит `stack_low..USER_STACK_BASE`
+и возвращает кадры в PMM. In-QEMU проверки — `user-stack-grows` (цепочка 160 KiB
+возвращается и печатает `stack: deep recursion ok`) и `user-stack-cap`
+(цепочка 1.2 MiB умирает `store page fault` на `stval=0x3fef_ffc8`), обе с
+неизменным PMM-ledger'ом.
+
+Версия **0.19.0** добавила TLS 1.3 (`https <url>`, fail-closed проверка
+цепочки/SAN/срока/`CertificateVerify`), **0.18.0** — TCP-сервер: пассивное
+состояние и bounded accept-очередь в `net::tcp`, `bind` для stream-сокета,
+`listen(201)`, `accept(202)` с корректным `sockaddr_in`, teardown
+listener'а/соединений, `fork`/`dup` — `-ENOTSUP`, как у UDP,
+`libpagh::net::TcpListener` и native-фикстуру `tcp_echo`. Попутно исправлен
+used-ring virtio-net: драйвер раньше «перепрыгивал» несколько завершений, если
+ACK, данные и FIN приходили одним пакетом, и `recv` ждал retransmit.
 
 ![user mode: run demo, run fault, run spin](docs/user.png)
 
@@ -230,11 +251,11 @@ SELFTEST SUMMARY: 7/7 passed
 | Файловая система (ext2) | готово | чтение/запись файлов (direct + single/double indirect), truncate, каталоги, create/unlink/mkdir/rmdir/rename, симлинки; совместимо с образом хостового `mkfs.ext2 -t ext2`; форматируется только пустое устройство (MBR/GPT/чужие данные — отказ с причиной); журнала/WAL нет | `src/fs/ext2/`, `src/fs/format_policy.rs` |
 | VFS | готово | `VfsNode`, синтетический корень, монтирование в `/mnt`, два примитива разрешения путей (`lookup_path` без последней симлинки / `walk` с переходом и бюджетом) | `src/vfs/mod.rs` |
 | Планировщик, потоки ядра (M6a) | готово | контекстный switch (callee-saved ABI), до 16 слотов (14 user-потоков на процесс), round-robin, квант 8 тиков, стек 16 KiB + guard из PMM, состояния `Ready/Running/Blocked/Stopped/Exited`, `block_current`/`wake_task` с тиковым дедлайном, `stop_current`/`continue_task` для job control, `Task::satp` + `install_satp` перед switch, вытеснение тиком таймера из trap-контекста (включая вытеснение U-mode), `tasks`/`spawn`/`yield`; exit возвращает кадры | `src/arch/riscv64/switch.rs`, `src/task/` |
-| User mode, syscalls, ELF, native ABI (M6b) | готово | `sret` в U-mode (`SPP=0`, `SPIE=1`, `SUM=0`, `sscratch`-контракт); нативные потоки `clone`/`gettid`/`set_tid_address`/`exit`/`exit_group`/`futex` (общие Process/root, fd-таблица, heap и mmap; своё ядро-стек и user-стек вызывающего), фьютексы `WAIT`/`WAKE`; процессы `fork`(1000)/`execve`(221)/`wait4`(260)/`getppid`(173): свой Sv39-root/ASID, глубокая копия страниц, наследование fd/pipe/обработчиков, замена образа и статус `wait`, очистка сирот раннером; вход `a0=argc`, `a1=argv`, SysV-кадр `argc/argv/envp` с `argv[0]` как набран и `PWD=<cwd>`; `ecall`-диспетчер: `read`/`write`/`openat`/`close`/`lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/`readlinkat`/`exit`/`sched_yield`/`getpid` + `mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`/`ftruncate` (мутации через `parent_and_leaf` + `walk(parent, true)`, per-process режим для `fstat`), `sepc+4`, таблица 16 fd на процесс, `copy_from_user`/`copy_to_user` с проверкой `U/R/W` и `SUM` вокруг копии, heap-окно 1 MiB с возвратом кадров; ELF64-загрузчик с откатом кадров и **потоковым чтением** `ImageSource` (сегменты кусками ≤ 512 B, без буфера размером с файл), `run <path> [args...]` до 1 MiB и фикстуры `demo`/`fault`/`spin`/`argv`/`abi`; BSD-сокеты `socket`/`bind`/`connect`/`sendto`/`recvfrom`/`setsockopt`/`getsockopt`/`shutdown` (один TCP-клиент + UDP-сокеты, IPv4-литералы) и маршрутизация `read`/`write`/`close`/`poll` на сокет; POSIX-подобные сигналы `kill`/`tgkill`/`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`/`sigaltstack` (обработчики на процесс: fork копирует, exec сбрасывает; pending/blocked/altstack на поток; user-кадр 736 B с полным `siginfo_t` и `ucontext_t`; `SA_SIGINFO`/`SA_ONSTACK`/`SA_NODEFER`/`SA_RESETHAND`/`SA_RESTART`; job control `SIGSTOP`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU` + `SIGCONT`); synchronous SIGSEGV/SIGILL/SIGBUS/SIGTRAP при установленном обработчике; fault из U без обработчика убивает процесс; таймер вытесняет U-mode | `src/user/`, `src/user/process.rs`, `src/user/signal.rs`, `src/memory/paging.rs`, `userland/` |
+| User mode, syscalls, ELF, native ABI (M6b) | готово | `sret` в U-mode (`SPP=0`, `SPIE=1`, `SUM=0`, `sscratch`-контракт); **user-стек растёт по требованию**: load/store page fault ниже текущего дна (`Process::stack_low`) мапит и обнуляет страницы до адреса fault'а и повторяет инструкцию, потолок 1 MiB на процесс (64 KiB начального окна + 960 KiB, дно `0x3ff0_0000`), ниже дна — настоящий guard, на котором рекурсия сверх лимита умирает `store page fault`; `fork` копирует выросшие страницы, `execve` сбрасывает границу, teardown возвращает кадры в PMM; нативные потоки `clone`/`gettid`/`set_tid_address`/`exit`/`exit_group`/`futex` (общие Process/root, fd-таблица, heap и mmap; своё ядро-стек и user-стек вызывающего), фьютексы `WAIT`/`WAKE`; процессы `fork`(1000)/`execve`(221)/`wait4`(260)/`getppid`(173): свой Sv39-root/ASID, глубокая копия страниц, наследование fd/pipe/обработчиков, замена образа и статус `wait`, очистка сирот раннером; вход `a0=argc`, `a1=argv`, SysV-кадр `argc/argv/envp` с `argv[0]` как набран и `PWD=<cwd>`; `ecall`-диспетчер: `read`/`write`/`openat`/`close`/`lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/`readlinkat`/`exit`/`sched_yield`/`getpid` + `mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`/`ftruncate` (мутации через `parent_and_leaf` + `walk(parent, true)`, per-process режим для `fstat`), `sepc+4`, таблица 16 fd на процесс, `copy_from_user`/`copy_to_user` с проверкой `U/R/W` и `SUM` вокруг копии, heap-окно 1 MiB с возвратом кадров; ELF64-загрузчик с откатом кадров и **потоковым чтением** `ImageSource` (сегменты кусками ≤ 512 B, без буфера размером с файл), `run <path> [args...]` до 1 MiB и фикстуры `demo`/`fault`/`spin`/`argv`/`abi`; BSD-сокеты `socket`/`bind`/`connect`/`sendto`/`recvfrom`/`setsockopt`/`getsockopt`/`shutdown` (один TCP-клиент + UDP-сокеты, IPv4-литералы) и маршрутизация `read`/`write`/`close`/`poll` на сокет; POSIX-подобные сигналы `kill`/`tgkill`/`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`/`sigaltstack` (обработчики на процесс: fork копирует, exec сбрасывает; pending/blocked/altstack на поток; user-кадр 736 B с полным `siginfo_t` и `ucontext_t`; `SA_SIGINFO`/`SA_ONSTACK`/`SA_NODEFER`/`SA_RESETHAND`/`SA_RESTART`; job control `SIGSTOP`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU` + `SIGCONT`); synchronous SIGSEGV/SIGILL/SIGBUS/SIGTRAP при установленном обработчике; fault из U без обработчика убивает процесс; таймер вытесняет U-mode | `src/user/`, `src/user/stack.rs`, `src/user/process.rs`, `src/user/signal.rs`, `src/memory/paging.rs`, `userland/` |
 | Сеть (M7) | готово | virtio-net (modern, polled) + свой стек: Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP-клиент, DNS-резолвер, `net`/`dhcp`/`ping`/`dns`/`http`; без smoltcp и внешних крейтов. Для userland — один active-open TCP-сокет (`AF_INET`/`SOCK_STREAM`, IPv4-литерал) и UDP-сокеты (`AF_INET`/`SOCK_DGRAM`, `bind`/per-port-очередь/`sendto`/`recvfrom`); syscall'ы сами опрашивают NIC; `read`/`write`/`poll` работают на сокете | `src/net/`, `src/drivers/virtio_net.rs`, `src/user/syscall.rs` |
 | Пакеты (`pkg`) | MVP | нативный установщик (не apt): плоский `index` и `.ppkg` с репозитория по **plain HTTP** (`http://IP:port/`, в QEMU хост — `10.0.2.2`), потоковая загрузка в `/mnt/pkg` кусками 4 KiB, шлюз «размер + SHA-256 из индекса» **до** разбора `PPKG0001`; `kind=app` → `/mnt/bin/<name>`, `applet-bundle` → `/mnt/bin/paghbox` + симлинки; манифест в `/mnt/pkg/<name>.manifest`; TLS/OpenPGP/apt по-прежнему нет | `src/pkg/` |
 | apt / TLS / OpenPGP | **нет** | apt намеренно не подключён, пока нет vendored TLS + проверки подписей Debian; `pkg` — отдельный нативный путь для портов | — |
-| Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 4 блока/указателя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 10 user-mode (ABI-фикстуры `argv`/`abi` с секциями потоков/фьютексов, сигналов и TCP-сервера: bind/listen/nonblocking accept/EAGAIN/dup-ENOTSUP; 10/10 с диском, 8/10 + 2 SKIP без `/mnt`) + 11 сети (идемпотентность по ledger'у), QEMU-smoke в шести режимах (serial, ramfb, диск-fresh, диск-existing, net, keyboard), установка пакета проверяется отдельным тестом `pkg`, живые сокетные прогоны — `tools/test_sockets.py` (TCP-клиент), `tools/test_udp.py` (UDP) и `tools/test_tcp_server.py` (TCP-сервер: `mke2fs -d` + QEMU `hostfwd`; libpagh-фикстуры, не в CI); проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/net/selftest.rs`, `src/pkg/`, `.github/smoke.py`, `tools/` |
+| Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 4 блока/указателя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 13 user-mode (ABI-фикстуры `argv`/`abi` с секциями потоков/фьютексов, сигналов и TCP-сервера: bind/listen/nonblocking accept/EAGAIN/dup-ENOTSUP; `user-stack-grows` — цепочка 160 KiB возвращается через `stack: deep recursion ok`, `user-stack-cap` — цепочка 1.2 MiB умирает `store page fault` на guard-странице, `user-stack-fork` — fork на выросшем стеке, обе стороны доходят до конца, `wait4` возвращает pid; 13/13 с диском, 11/13 + 2 SKIP без `/mnt`) + 11 сети (идемпотентность по ledger'у), QEMU-smoke в шести режимах (serial, ramfb, диск-fresh, диск-existing, net, keyboard), установка пакета проверяется отдельным тестом `pkg`, живые сокетные прогоны — `tools/test_sockets.py` (TCP-клиент), `tools/test_udp.py` (UDP) и `tools/test_tcp_server.py` (TCP-сервер: `mke2fs -d` + QEMU `hostfwd`; libpagh-фикстуры, не в CI); проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/net/selftest.rs`, `src/pkg/`, `.github/smoke.py`, `tools/` |
 | CI | готово | `fmt`, debug/release build, QEMU-smoke в шести режимах: serial, ramfb, диск-fresh (формат/монтирование/запись), диск-existing (повторная загрузка читает файл), net (DHCP + ping шлюза), keyboard (virtio-keyboard печатает `help`/`halt` через монитор QEMU); во всех приложен virtio-tablet, в keyboard — ещё и virtio-keyboard | `.github/workflows/ci.yml` |
 
 ---
@@ -305,7 +326,7 @@ run demo        # hello from user mode + run: demo exited with code 42
 run demo a b    # то же: у фикстуры по контракту argc=1, лишние слова не мешают
 run fault       # [user] fault killed: load page fault ... ; шелл жив
 run spin        # 0.2 s в U-mode (таймер вытесняет) -> exit 7
-selftest        # + SELFTEST user-*: 10/10 с /mnt (без диска 8/10 + 2 SKIP)
+selftest        # + SELFTEST user-*: 13/13 с /mnt (без диска 11/13 + 2 SKIP)
 ```
 
 ### Native ABI для libpagh
@@ -341,8 +362,8 @@ selftest        # + SELFTEST user-*: 10/10 с /mnt (без диска 8/10 + 2 S
 | 93 | `exit` | завершает **вызывающий поток**; если он последний — прогон кончается, `run_source` возвращает код главного потока (код не-главного отбрасывается); не возвращается |
 | 94 | `exit_group` | завершает все потоки прогона (готовые и заблокированные) и возвращает код главного, если он уже вышел, иначе код вызывающего; не возвращается |
 | 220 | `clone` | нативный `clone(flags, stack, entry, arg)`: `CLONE_VM|CLONE_THREAD` обязательны, `CLONE_FS/FILES/SIGHAND` принимаются (общие и так), `CLONE_SETTLS` — `-ENOTSUP`, неизвестный бит — `-EINVAL`; дочерний поток стартует в U-mode на `entry(arg)` со `sp=stack` и не возвращается из syscall (и `entry` не должен возвращаться — трамплина нет); родитель получает tid (>0). `clone(0,0,0,0)` — алиас `fork` |
-| 1000 | `fork` | pagh-native (в asm-generic номера нет): глубокая копия user-страниц (image, heap, mmap, 64 KiB стек) в новый root/ASID, копия fd-таблицы (pipe — +1 ссылка на ring, сокет — `-ENOTSUP` в ребёнке), копия обработчиков/blocked/altstack, без pending и чужих потоков; ребёнок получает 0, родитель — pid, обе стороны продолжают с `sepc+4`; ошибки `-EAGAIN`/`-EINVAL` |
-| 221 | `execve` | абсолютный путь, `argv`/`envp` через `copy_from_user`; новый root, ELF, 64 KiB стек и SysV-кадр; старые image/heap/mmap/стек освобождаются, `pid`/`ppid`/fd/blocked-маска сохраняются, все обработчики → `SIG_DFL`, alt-стек выключен, pending погашен, sibling-потоки сняты; `a0=argc`, `a1=argv`, `sepc` не сдвигается; ошибки `-ENOENT`/`-ENOEXEC`/`-EISDIR`/`-E2BIG`/`-EFAULT`/`-ENOMEM` не меняют образ |
+| 1000 | `fork` | pagh-native (в asm-generic номера нет): глубокая копия user-страниц (image, heap, mmap, начальный 64 KiB стек и выросшие страницы до `stack_low`) в новый root/ASID, копия fd-таблицы (pipe — +1 ссылка на ring, сокет — `-ENOTSUP` в ребёнке), копия обработчиков/blocked/altstack, без pending и чужих потоков; ребёнок получает 0, родитель — pid, обе стороны продолжают с `sepc+4`; ошибки `-EAGAIN`/`-EINVAL` |
+| 221 | `execve` | абсолютный путь, `argv`/`envp` через `copy_from_user`; новый root, ELF, свежий 64 KiB стек (`stack_low` сбрасывается) и SysV-кадр; старые image/heap/mmap/стек освобождаются, `pid`/`ppid`/fd/blocked-маска сохраняются, все обработчики → `SIG_DFL`, alt-стек выключен, pending погашен, sibling-потоки сняты; `a0=argc`, `a1=argv`, `sepc` не сдвигается; ошибки `-ENOENT`/`-ENOEXEC`/`-EISDIR`/`-E2BIG`/`-EFAULT`/`-ENOMEM` не меняют образ |
 | 260 | `wait4` | `pid > 0` — конкретный ребёнок, `0`/`-1` — любой, `pid < -1` — `-EINVAL`; `options & !WNOHANG` — `-EINVAL`; возвращает pid зомби, 0 при `WNOHANG`, `-ECHILD`, `-EFAULT`; статус — `code << 8` либо номер сигнала в младших 7 битах; блокирует вызывающий поток и просыпается на exit/exit_group/fault ребёнка; `SIGCHLD` не генерируется |
 | 98 | `futex` | `uaddr, op, val, timeout, uaddr2, val3`: `FUTEX_WAIT` (0) проверяет `*uaddr == val` и блокирует до `FUTEX_WAKE`/тикового дедлайна; `FUTEX_WAKE` (1) будит не больше `val`; `FUTEX_PRIVATE_FLAG` принимается; `WAKE_OP`/requeue/PI — `-ENOSYS`; `-EAGAIN`/`-ETIMEDOUT`/`-ENOMEM`, как в POSIX |
 | 129 | `kill` | `pid > 0` — tid потока прогона, `0`/`-1` — все живые потоки; `sig = 0` — только проверка существования; неизвестный pid — `-ESRCH`, signum вне 0..31 — `-EINVAL`; SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU с `SIG_DFL` останавливают поток (per-thread `Stopped` в планировщике), SIGCONT возобновляет; signal помечается pending, а заблокированный `FUTEX_WAIT` будится (wait вернёт `-EINTR`, либо перезапустится при `SA_RESTART`) |
@@ -406,7 +427,8 @@ user-страницы добавляет только этот процесс. �
 переключается в `scheduler::install_satp` перед `task_switch`, и, хотя ASID —
 метка TLB, смена root всегда сопровождается полным `sfence.vma` (кадр таблицы
 может быть переиспользован). `fork` — **глубокая копия**, не COW: image, heap,
-mmap и 64 KiB user-стека копируются постранично; fd-строка копируется (pipe
+mmap и user-стек копируются постранично (начальные 64 KiB и все выросшие
+страницы до `stack_low`); fd-строка копируется (pipe
 получает +1 ссылку на общий ring, сокет в ребёнке становится `-ENOTSUP`, offset
 файла копируется, а не делится); обработчики, blocked-маска и altstack
 наследуются, pending-биты — нет. Ребёнок возвращается с `a0 = 0`, родитель — с
@@ -510,7 +532,7 @@ backspace работает, всё остальное — команды:
 |---|---|
 | `help` | список команд |
 | `mem` | память из device tree **и** статистика PMM и кучи (свободно/всего кадров, диапазон пула, байты кучи) |
-| `selftest` | in-QEMU self-tests: 7 памяти, 4 блока/указателя, 11 ext2/VFS, 4 таймера/PLIC, 5 планировщика, 10 user-mode (включая мутационную половину ABI-фикстуры, сокетную секцию и секцию потоков: `clone`/`gettid`/futex/`exit`/`exit_group`; с живым сервером на `10.0.2.2:8000` — connect/send/recv/shutdown/EOF, без него — `SKIP`; без `/mnt` два SKIP — `user-run-large-file` и `user-abi-syscalls`, итог 8/10); печатает ledger свободных кадров до и после каждого блока |
+| `selftest` | in-QEMU self-tests: 7 памяти, 4 блока/указателя, 11 ext2/VFS, 4 таймера/PLIC, 5 планировщика, 13 user-mode (включая мутационную половину ABI-фикстуры, сокетную секцию и секцию потоков: `clone`/`gettid`/futex/`exit`/`exit_group`; `user-stack-grows`/`user-stack-cap`/`user-stack-fork` — рост до 1 MiB, guard ниже `USER_STACK_FLOOR` и fork на выросшем стеке; с живым сервером на `10.0.2.2:8000` — connect/send/recv/shutdown/EOF, без него — `SKIP`; без `/mnt` два SKIP — `user-run-large-file` и `user-abi-syscalls`, итог 11/13); печатает ledger свободных кадров до и после каждого блока |
 | `disk` | блочное устройство: имя, ёмкость, живая проверка чтения сектора 0 |
 | `ls [path]` | листинг каталога (каталоги с `/`) |
 | `cat <path>` | содержимое файла |
@@ -675,7 +697,9 @@ IPv4, ICMP и UDP, а `dhcp`/`dns`/`tcp` — маленькие клиенты. 
   `fork`/`exec` дают каждому процессу свой Sv39-root и 16-битный ASID; ядро
   копирует supervisor-карту, user-страницы приватны. Ограничения: не больше
   6 процессов, `fork` копирует все страницы целиком (COW нет), страницы `mmap`
-  и `brk` выделяются сразу (нет fault-подкачки), `MAP_SHARED`/`MAP_FIXED`/
+  и `brk` выделяются сразу (fault-подкачки нет нигде, кроме роста user-стека:
+  он растёт по требованию до 1 MiB на процесс и дальше упирается в guard),
+  `MAP_SHARED`/`MAP_FIXED`/
   file-backed `mmap` и разделяемая память отсутствуют, ASID не используется для
   пропуска `sfence.vma`, а один hart остаётся. Foreground-`run` по-прежнему один:
   второй параллельный запуск ждёт, пока шелл не вернётся из первого.
