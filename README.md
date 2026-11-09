@@ -40,7 +40,7 @@ ICMP, a minimal TCP client) and — since M6b — **user mode**: a static ELF ru
 the `U` bit set, enters through `sret`, talks to the kernel through an `ecall`
 ABI and is killed (not the machine) when it faults. **All of these are verified on
 a live boot**; what is genuinely missing — per-process page tables, a journal,
-SMP, TLS/apt — is listed plainly in [Чего нет](#чего-нет). The documentation is deliberately checkable: every claim in
+SMP and apt — is listed plainly in [Чего нет](#чего-нет). The documentation is deliberately checkable: every claim in
 [`docs/architecture.md`](docs/architecture.md) cites the file and line it comes from,
 and the CI smoke test asserts the exact boot log this README shows.
 
@@ -98,7 +98,7 @@ IPv4-литералу → `send`/`recv` → `shutdown`/`close`; `read`/`write` �
 peer-адрес в `sockaddr_in`; ожидание опрашивает NIC до 30 s, `SOCK_NONBLOCK`
 даёт `-EAGAIN` сразу. Рядом — `SOCK_DGRAM`: `socket` → `bind(200)` →
 `sendto`/`recvfrom`, с per-port bounded-очередью, блокирующим `recvfrom` и
-`MSG_DONTWAIT`/`SOCK_NONBLOCK` для `-EAGAIN`. DNS-syscall и TLS отсутствуют.
+`MSG_DONTWAIT`/`SOCK_NONBLOCK` для `-EAGAIN`. DNS-syscall отсутствует; TLS 1.3 работает (`https <url>`, fail-closed проверка цепочки/SAN/срока/`CertificateVerify`).
 Живые прогоны — `python3 tools/test_sockets.py` (HTTP),
 `python3 tools/test_udp.py` (UDP-эхо) и `python3 tools/test_tcp_server.py`
 (TCP-сервер: `mke2fs -d` + QEMU `hostfwd`); транскрипты —
@@ -457,7 +457,7 @@ peer `sockaddr_in`; при переполнении очереди handshake с�
 `connect`/`send`/`close`/`recvfrom`/`accept` включают прерывания на время
 ожидания (как `nanosleep`), чтобы тики шли и дедлайн работал, и крутят
 `net::poll()` — иначе NIC некому опрашивать, пока исполняется user-программа.
-UDP-`connect`, IPv6, `sendmsg`/`recvmsg` и TLS отсутствуют;
+UDP-`connect`, IPv6 и `sendmsg`/`recvmsg` отсутствуют;
 `sendmsg`/`recvmsg` отвечают `-ENOSYS`. Программа, вышедшая с открытым
 сокетом, закрывает его (и освобождает порт) при teardown прогона.
 
@@ -659,7 +659,7 @@ IPv4, ICMP и UDP, а `dhcp`/`dns`/`tcp` — маленькие клиенты. 
 | M4 | ramfb + шрифт покрытия Fira Code, съёмка скриншотов | **готов** (экран, шрифт и снимок проверены) |
 | M5 | virtio-mmio блочное устройство, ext2, VFS | **готов** (virtio-mmio, ext2 rw + формат пустого диска, VFS, шелл-команды; журнала нет) |
 | M6 | Задачи, syscalls, Linux-compat-слой из x86-ветки | M6a (планировщик/потоки) — **готов**; M6b (user mode, syscalls, ELF) — **готов**; Linux-compat — нет |
-| M7 | Сеть: virtio-net и свой TCP/IP-стек | **готов** (Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP, DNS, `net`/`ping`/`dns`/`http`; TLS/apt — следующий шаг) |
+| M7 | Сеть: virtio-net и свой TCP/IP-стек | **готов** (Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP, DNS, `net`/`ping`/`dns`/`http`, `https` (TLS 1.3 с проверкой CA/SAN/срока/подписи); apt — следующий шаг) |
 
 Что считается «сделано» для каждого майлстоуна и что в него не входит —
 [`docs/roadmap.md`](docs/roadmap.md).
@@ -730,7 +730,7 @@ IPv4, ICMP и UDP, а `dhcp`/`dns`/`tcp` — маленькие клиенты. 
 * **Сокетный ABI узкий.** `AF_INET`/`SOCK_STREAM` (активный клиент, listener и
   принятые соединения) и `AF_INET`/`SOCK_DGRAM` (UDP: `bind`/`sendto`/
   `recvfrom`, per-port очередь 4×1024 B, IPv4-литералы); UDP-`connect`,
-  `sendmsg`/`recvmsg`, `select`, DNS/getaddrinfo и TLS отсутствуют. `recv`
+  `sendmsg`/`recvmsg`, `select`, DNS/getaddrinfo отсутствуют; TLS 1.3 есть (см. `docs/tls.md`). `recv`
   на TCP неблокирующий (`-EAGAIN`), `shutdown` без half-close. UDP ограничен
   8 одновременными bind, одним интерфейсом и дейтаграммой ≤ 1024 B; блокирующий
   `recvfrom` имеет бюджет ~10 s и не прерывается сигналом (возвращает `-EAGAIN`

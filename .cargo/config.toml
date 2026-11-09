@@ -3,3 +3,14 @@ target = "riscv64gc-unknown-none-elf"
 
 [target.riscv64gc-unknown-none-elf]
 rustflags = ["-C", "link-arg=-Tlinker.ld", "-C", "force-frame-pointers=yes"]
+
+# All dependencies are vendored (see `vendor/`), so the build is offline and
+# byte-reproducible: the tree contains the exact sources the lockfile names.
+# The vendored `embedded-tls` carries the deliberate local
+# `Finished`-ordering patch (see Cargo.toml); refreshing it means re-applying
+# that patch and updating its `.cargo-checksum.json`.
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"

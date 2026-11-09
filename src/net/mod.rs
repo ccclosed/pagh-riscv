@@ -26,11 +26,19 @@
 //!   window, no retransmission timer beyond a bounded poll.
 //! * No TLS, no apt: those are the next milestone (see `docs/roadmap.md`).
 
+pub mod ca_bundle;
 pub mod dhcp;
 pub mod dns;
+pub mod hostname;
+pub mod http;
 pub mod selftest;
 pub mod tcp;
+pub mod tls;
+pub mod tls_auth;
+pub mod tls_chain;
+pub mod tls_verify;
 pub mod wire;
+pub mod x509;
 
 use crate::arch::riscv64::timer;
 use crate::drivers::virtio_net;

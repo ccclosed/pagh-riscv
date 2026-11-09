@@ -421,6 +421,44 @@ impl Fdt {
         self.u32_prop_at(&path[..len], "interrupts")
     }
 
+    /// The wall clock's `(base, size)`: the `google,goldfish-rtc` node QEMU
+    /// `virt` declares, or `None` on a machine without one.
+    ///
+    /// Found by `compatible`, like every other window here, so a tree that moves
+    /// the device still works. `None` is not a boot failure: it means the kernel
+    /// has no wall clock, and the TLS clock gate then refuses every handshake
+    /// (see `drivers::rtc`) rather than validating certificates against a made-up
+    /// "now".
+    pub fn rtc(&self) -> Option<(usize, usize)> {
+        let mut path = [0u8; NODE_PATH_CAPACITY];
+        let len = self.find_compatible(&["google,goldfish-rtc"], &mut path)?;
+        self.reg_at(&path[..len])
+    }
+
+    /// Copy `/chosen/rng-seed` into `out`, returning how many bytes were copied.
+    ///
+    /// QEMU hands the guest a host-derived random seed here (the same mechanism
+    /// Linux uses for early-boot entropy); the property is a plain byte string
+    /// with no declared structure, so the only correct reading is "copy the
+    /// bytes, no interpretation". `None` means this machine's firmware offered
+    /// no seed — the kernel's entropy pool is then unavailable and every TLS
+    /// handshake is refused (see `crate::entropy`), which is the fail-closed
+    /// direction rather than a silent fallback to a predictable key.
+    pub fn rng_seed(&self, out: &mut [u8]) -> Option<usize> {
+        let mut copied = None;
+        self.walk(|path, name, value| {
+            if path == "/chosen" && name == "rng-seed" {
+                let take = value.len().min(out.len());
+                out[..take].copy_from_slice(&value[..take]);
+                copied = Some(take);
+                true
+            } else {
+                false
+            }
+        });
+        copied
+    }
+
     /// Find the first node whose `compatible` names one of `wanted`, and copy its
     /// path into `out`. Returns the copied length.
     ///

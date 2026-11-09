@@ -18,6 +18,7 @@ extern crate alloc;
 mod arch;
 mod console;
 mod drivers;
+mod entropy;
 mod fdt;
 mod fs;
 mod memory;
@@ -102,16 +103,21 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     // in the log rather than inferred from silence.
     let plic = tree.plic();
     let uart_irq = tree.uart_interrupt();
+    // The wall clock. Only the TLS verifier needs it today (validity windows),
+    // and a machine without one keeps the fail-closed "unknown time refuses the
+    // handshake" behaviour rather than inventing a date.
+    let rtc = tree.rtc();
 
     // Every MMIO window the kernel touches after the switch: the console UART,
     // which prints through it, the PLIC's own register pages (only the windows
     // the driver addresses — priority, enable and this hart's context page, see
-    // `plic::windows`) and each virtio transport window the tree named. A window
-    // the map does not cover is not an unmapped device — it is a trap on the
-    // first register read — so the list comes from the device tree rather than
-    // from constants; a machine without virtio or a PLIC adds nothing.
+    // `plic::windows`), the wall clock and each virtio transport window the tree
+    // named. A window the map does not cover is not an unmapped device — it is a
+    // trap on the first register read — so the list comes from the device tree
+    // rather than from constants; a machine without virtio, a PLIC or an RTC adds
+    // nothing.
     const PLIC_WINDOWS: usize = 3;
-    let mut device_windows = [(0usize, 0usize); 1 + PLIC_WINDOWS + fdt::MAX_VIRTIO_MMIO];
+    let mut device_windows = [(0usize, 0usize); 2 + PLIC_WINDOWS + fdt::MAX_VIRTIO_MMIO];
     device_windows[0] = (drivers::uart::BASE, 0x100);
     let mut slots = 1usize;
     if let Some((base, _size)) = plic {
@@ -119,6 +125,10 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
             device_windows[slots] = (base + offset, length);
             slots += 1;
         }
+    }
+    if let Some((base, size)) = rtc {
+        device_windows[slots] = (base, size);
+        slots += 1;
     }
     for window in &virtio_mmio[..virtio_mmio_count] {
         device_windows[slots] = (window.base, window.length);
@@ -166,6 +176,51 @@ pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
         arch::riscv64::park_forever()
     }
     memory::report_paging();
+
+    // The wall clock, now that its page is mapped. This line is the one piece of
+    // evidence that the date TLS checks certificates against is the host's and
+    // not a placeholder: a wrong or absent clock is visible at boot, before any
+    // handshake can quietly succeed against an invented "now".
+    if let Some((base, _size)) = rtc {
+        drivers::rtc::init(base);
+        let words = drivers::rtc::dump();
+        match drivers::rtc::now_unix() {
+            Some(seconds) => {
+                let (year, month, day, hour, minute, second) =
+                    drivers::rtc::civil_from_unix(seconds);
+                crate::kprintln!(
+                    "rtc         goldfish @ {:#x} - {year:04}-{month:02}-{day:02} \
+                     {hour:02}:{minute:02}:{second:02} UTC",
+                    base
+                );
+            }
+            None => crate::kprintln!("rtc         goldfish @ {:#x} - unreadable", base),
+        }
+        crate::kprintln!(
+            "rtc         raw {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}",
+            words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]
+        );
+    } else {
+        crate::kprintln!("rtc         none in the device tree - TLS will refuse (unknown time)");
+    }
+
+    // The entropy pool. `/chosen/rng-seed` is the host's random seed; without it
+    // the pool stays unavailable and every TLS fetch is refused before a socket
+    // is opened (the x86 kernel's "no hardware entropy, no TLS" rule, kept).
+    let mut seed = [0u8; entropy::SEED_MAX];
+    match tree.rng_seed(&mut seed) {
+        Some(len) if len > 0 => {
+            let absorbed = entropy::init(&seed[..len]);
+            crate::kprintln!(
+                "entropy     {absorbed} bytes from /chosen/rng-seed - TLS session keys available"
+            );
+        }
+        _ => {
+            crate::kprintln!(
+                "entropy     no /chosen/rng-seed - TLS will refuse (no session randomness)"
+            );
+        }
+    }
 
     // Traps before anything that can trap: a bad address in the shell must
     // report itself instead of resetting the machine silently.

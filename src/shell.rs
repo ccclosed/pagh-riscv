@@ -258,6 +258,12 @@ fn execute(line: &str, tree: &Fdt, state: &mut State) {
             crate::kprintln!("  dns <name>    resolve a host name through the DHCP DNS server");
             crate::kprintln!("  http <ip> <port> <path>  GET over TCP and print the response");
             crate::kprintln!(
+                "  https <url>   TLS 1.3 GET (chain+SAN verified against the CA bundle)"
+            );
+            crate::kprintln!(
+                "  entropy       the kernel entropy pool (seed source and byte counts)"
+            );
+            crate::kprintln!(
                 "  pkg <cmd>     native packages: repo/index/list/install/remove/installed"
             );
             crate::kprintln!("  fs            filesystem status: device, mount point, free space");
@@ -503,6 +509,8 @@ fn execute(line: &str, tree: &Fdt, state: &mut State) {
         "ping" => cmd_ping(args),
         "dns" => cmd_dns(args),
         "http" => cmd_http(args),
+        "https" => cmd_https(args),
+        "entropy" => cmd_entropy(),
         "pkg" => crate::pkg::command(args),
         "clear" => crate::kprint!("\x1b[2J\x1b[H"),
         "halt" => {
@@ -1328,5 +1336,134 @@ fn cmd_http<'a>(mut args: impl Iterator<Item = &'a str>) {
             crate::kprintln!("http: {received} bytes received");
         }
         Err(error) => crate::kprintln!("http: connect failed: {error}"),
+    }
+}
+
+/// `https <url>`: one HTTPS (TLS 1.3) GET with fail-closed server
+/// authentication — chain to the committed CA bundle, SAN hostname check,
+/// validity window against the goldfish RTC, and the handshake's
+/// `CertificateVerify` signature.
+///
+/// Accepts three spellings of the same thing:
+/// `https https://example.com/`, `https example.com /` and
+/// `https example.com:443 /`. The optional `--show`/first-argument form does
+/// not exist: the body is always printed (bounded), because the point of the
+/// command is the end-to-end proof, and a fetch whose bytes nobody sees is a
+/// claim rather than evidence.
+///
+/// Everything the handshake decided is on the serial line before the body:
+/// the resolved address, the TCP handle, the leaf certificate's SHA-256
+/// fingerprint, the chain length, the `CertificateVerify` result and the byte
+/// counters. A rejection prints the single `tls: verify FAILED cause=…` line
+/// that names the failed gate; the command then returns an error summary.
+fn cmd_https<'a>(args: impl Iterator<Item = &'a str>) {
+    let mut words: alloc::vec::Vec<&str> = args.collect();
+    if words.is_empty() {
+        crate::kprintln!("https: usage: https <url>   (e.g. https https://example.com/)");
+        crate::kprintln!("https:        https <host> [path] [port]");
+        crate::kprintln!("https:        https --ip <addr> <url>   (pin the destination address)");
+        return;
+    }
+    // `--ip <addr>` pins the destination while keeping the URL's host as the
+    // TLS server name. It is how a negative test asks a server for a name its
+    // certificate does not cover — the SAN check's whole reason to exist.
+    let mut pinned = None;
+    if words[0] == "--ip" {
+        if words.len() < 3 {
+            crate::kprintln!("https: --ip needs an address and a target");
+            return;
+        }
+        match crate::net::wire::parse_ipv4_str(words[1]) {
+            Some(address) => pinned = Some(address),
+            None => {
+                crate::kprintln!("https: {}: not an IPv4 address", words[1]);
+                return;
+            }
+        }
+        words.drain(..2);
+    }
+    let (host, path, port) = parse_https_target(&words);
+    let Some(host) = host else {
+        crate::kprintln!("https: {}: not a usable https target", words[0]);
+        return;
+    };
+    match crate::net::tls::https_get_at(&host, pinned, port, &path) {
+        Ok(body) => {
+            crate::kprintln!("https: ----- body ({} bytes) -----", body.len());
+            // Print the whole body when it is small (example.com is ~1.2 KiB);
+            // a larger one is truncated with an explicit marker so the
+            // transcript stays readable and bounded.
+            let show = body.len().min(4096);
+            crate::kprint!("{}", alloc::string::String::from_utf8_lossy(&body[..show]));
+            if body.len() > show {
+                crate::kprintln!();
+                crate::kprintln!("https: ... {} more bytes not printed", body.len() - show);
+            } else if !body.ends_with(b"\n") {
+                crate::kprintln!();
+            }
+            crate::kprintln!("https: ----- end body -----");
+            crate::kprintln!("https: OK - {} verified body bytes from {host}", body.len());
+        }
+        Err(error) => crate::kprintln!("https: FAILED: {error}"),
+    }
+}
+
+/// Split a command-line https target into `(host, path, port)`.
+///
+/// One function so `https://host:port/path`, `host path` and `host:port path`
+/// cannot disagree about which part is which: the scheme is stripped, the
+/// authority is split on the last `:` (an IPv6 literal is not supported by
+/// this stack, so a `:` in the host can only be a port), and the path defaults
+/// to `/`.
+fn parse_https_target(
+    words: &[&str],
+) -> (Option<alloc::string::String>, alloc::string::String, u16) {
+    let raw = words[0];
+    let rest = raw.strip_prefix("https://").unwrap_or(raw);
+    let (authority, inline_path) = match rest.find('/') {
+        Some(index) => (&rest[..index], &rest[index..]),
+        None => (rest, ""),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port_text)) => match port_text.parse::<u16>() {
+            Ok(port) => (host, port),
+            // A colon that is not a port is part of the name; leave it to the
+            // resolver, which will simply fail to resolve it.
+            Err(_) => (authority, crate::net::tls::HTTPS_PORT),
+        },
+        None => (authority, crate::net::tls::HTTPS_PORT),
+    };
+    if host.is_empty() {
+        return (None, alloc::string::String::new(), port);
+    }
+    let path = if !inline_path.is_empty() {
+        alloc::string::String::from(inline_path)
+    } else if let Some(word) = words.get(1) {
+        alloc::string::String::from(*word)
+    } else {
+        alloc::string::String::from("/")
+    };
+    (Some(alloc::string::String::from(host)), path, port)
+}
+
+/// `entropy`: what the kernel's entropy pool is made of, and whether TLS will
+/// run at all. The numbers are the evidence behind the "fail-closed without a
+/// seed" rule: `seed=0` means `https` refuses before opening a socket.
+fn cmd_entropy() {
+    let status = crate::entropy::status();
+    crate::kprintln!(
+        "entropy: pool {} - seed {} bytes from /chosen/rng-seed, {} bytes generated",
+        if status.available {
+            "available"
+        } else {
+            "UNAVAILABLE"
+        },
+        status.seeded,
+        status.out_bytes
+    );
+    if status.available {
+        crate::kprintln!("entropy: TLS session keys are drawn from this pool (SHA-256 ratchet)");
+    } else {
+        crate::kprintln!("entropy: no seed - every https fetch will be refused (NoEntropy)");
     }
 }

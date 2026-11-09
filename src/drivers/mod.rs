@@ -13,6 +13,7 @@ pub mod block;
 pub mod framebuffer;
 pub mod fw_cfg;
 pub mod ramfb;
+pub mod rtc;
 pub mod selftest;
 pub mod uart;
 pub mod virtio_input;
