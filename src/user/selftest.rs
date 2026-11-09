@@ -37,7 +37,7 @@ use crate::user::stack;
 use crate::user::syscall;
 use crate::user::{
     self, Exit, UserError, ABI_ELF, ARGV_ELF, EXEC_CHILD_ELF, FAULT_ELF, HELLO_ELF, SPIN_ELF,
-    STACK_ELF, STACK_FORK_ELF, STACK_OVER_ELF, USER_STACK_PAGES,
+    STACK_ELF, STACK_FORK_ELF, STACK_OVER_ELF, TLS_ELF, USER_STACK_PAGES,
 };
 use crate::vfs::{self, VfsError, VfsNode};
 
@@ -1179,6 +1179,105 @@ fn user_run_large_file(_buf: &mut Vec<u8>) -> Outcome {
     }
 }
 
+/// The entropy source and the TLS syscalls, through a real user process.
+///
+/// `userland/tls.rs` calls `getrandom(278)` and every TLS syscall (1100–1103)
+/// against descriptors that must be refused: a free number, the console, an
+/// unconnected socket, a non-session descriptor, a bad host pointer, an empty
+/// and an over-long host name, and unknown flags. No server is needed, which is
+/// why this check runs on every boot; the *handshake* is verified by
+/// `tools/test_tls.py` with a real TLS 1.3 peer (`example.com` and the local
+/// negative cases), the one thing an in-guest suite cannot stand up by itself.
+///
+/// The kernel-side evidence is the exit code, the three markers, the
+/// `getrandom`/`faults` counters, and that no session is left allocated and the
+/// PMM and heap end where they started.
+fn user_tls_abi(_buf: &mut Vec<u8>) -> Outcome {
+    let (used_before, mapped_before, _) = crate::heap_stats();
+    let frames_before = frames();
+    let stats_before = syscall::stats();
+    let sessions_before = crate::net::tls::session_stats();
+
+    user::capture_start();
+    let result = user::run_image(TLS_ELF, "tls.elf");
+    let captured = user::capture_stop();
+    let stats = syscall::stats();
+    let sessions = crate::net::tls::session_stats();
+
+    let mut ok = true;
+    match result {
+        Ok(Exit::Code(0)) => {}
+        Ok(other) => {
+            crate::kprintln!("[selftest] user: the TLS fixture ended {other}");
+            ok = false;
+        }
+        Err(error) => {
+            crate::kprintln!("[selftest] user: the TLS fixture failed: {error}");
+            ok = false;
+        }
+    }
+    for marker in [
+        &b"tls: getrandom ok\n"[..],
+        &b"tls: abi ok\n"[..],
+        &b"tls: ok\n"[..],
+    ] {
+        if !captured_contains(&captured, marker) {
+            crate::kprintln!(
+                "[selftest] user: TLS fixture marker {:?} missing",
+                core::str::from_utf8(marker).unwrap_or("<non-UTF-8>")
+            );
+            ok = false;
+        }
+    }
+    if stats.getrandoms <= stats_before.getrandoms
+        || stats.random_bytes <= stats_before.random_bytes
+    {
+        crate::kprintln!(
+            "[selftest] user: getrandom counters did not move (before {:?}, after {:?})",
+            stats_before,
+            stats
+        );
+        ok = false;
+    }
+    // The fixture's `-EFAULT` cases must have been answered by the pointer
+    // validator, not by an earlier argument check.
+    if stats.faults <= stats_before.faults {
+        crate::kprintln!(
+            "[selftest] user: the TLS fixture did not produce a single -EFAULT (faults {} -> {})",
+            stats_before.faults,
+            stats.faults
+        );
+        ok = false;
+    }
+    // A refused handshake and a refused `tls_close` must leave no session
+    // behind: the table is a fixed resource and a leak would be invisible to the
+    // frame ledger (its buffers are heap, not PMM frames).
+    if sessions.live != sessions_before.live {
+        crate::kprintln!(
+            "[selftest] user: the TLS fixture left {} live session(s), expected {}",
+            sessions.live,
+            sessions_before.live
+        );
+        ok = false;
+    }
+    if frames() != frames_before {
+        crate::kprintln!(
+            "[selftest] user: the TLS fixture left the PMM at {} (was {frames_before})",
+            frames()
+        );
+        ok = false;
+    }
+    let (used, mapped, _) = crate::heap_stats();
+    if used != used_before || mapped != mapped_before {
+        crate::kprintln!(
+            "[selftest] user: the TLS fixture left the heap at {used} B used / {mapped} B mapped \
+             (was {used_before}/{mapped_before} B)"
+        );
+        ok = false;
+    }
+    verdict(ok)
+}
+
 /// Run every check, print `SELFTEST user-<name> PASS|FAIL|SKIP`, and return how
 /// many passed.
 pub fn run() -> usize {
@@ -1204,7 +1303,7 @@ pub fn run() -> usize {
         total
     );
 
-    let checks: [(&str, fn(&mut Vec<u8>) -> Outcome); 13] = [
+    let checks: [(&str, fn(&mut Vec<u8>) -> Outcome); 14] = [
         ("user-abi-argv", user_abi_argv),
         ("user-abi-syscalls", user_abi_syscalls),
         ("user-elf-accept", |buf| verdict(elf_accept(buf))),
@@ -1222,6 +1321,7 @@ pub fn run() -> usize {
         ("user-stack-cap", |buf| verdict(user_stack_cap(buf))),
         ("user-stack-fork", |buf| verdict(user_stack_fork(buf))),
         ("user-run-large-file", user_run_large_file),
+        ("user-tls-abi", user_tls_abi),
     ];
     let mut passed = 0usize;
     let mut skipped = 0usize;

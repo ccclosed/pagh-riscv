@@ -137,6 +137,13 @@ pub const STACK_OVER_ELF: &[u8] = include_bytes!("../../userland/stack-over.elf"
 /// `SELFTEST user-stack-fork`.
 pub const STACK_FORK_ELF: &[u8] = include_bytes!("../../userland/stack-fork.elf");
 
+/// Embedded entropy/TLS-ABI fixture: `getrandom` (278) fills, flags, `-EFAULT`
+/// and the per-call short read, then the fail-closed answer of every TLS
+/// syscall (1100–1103) on a descriptor that is not a session. It needs no
+/// server and no filesystem, so it runs on every boot; the live handshake is
+/// `tools/test_tls.py`'s. See `userland/tls.rs` and `SELFTEST user-tls-abi`.
+pub const TLS_ELF: &[u8] = include_bytes!("../../userland/tls.elf");
+
 pub use elf::{ElfError, ImageSource, SourceError, USER_STACK_BASE, USER_STACK_PAGES, USER_TOP};
 
 /// Longest program name kept for the fault diagnostic; the shell's path may be

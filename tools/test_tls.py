@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import pathlib
+import shutil
 import socket
 import ssl
 import subprocess
@@ -48,6 +49,12 @@ KERNEL_DEBUG = ROOT / "target/riscv64gc-unknown-none-elf/debug/pagh"
 KERNEL_RELEASE = ROOT / "target/riscv64gc-unknown-none-elf/release/pagh"
 PROOF_HOST = "example.com"
 PROOF_MARKER = "Example Domain"
+# The libpagh example that drives the same TLS syscalls from userland.
+DEFAULT_EXAMPLE = (
+    ROOT.parent
+    / "pagh-api"
+    / "target/riscv64gc-unknown-none-elf/release/examples/https_get"
+)
 # Host used for the SAN negative: its certificate chain anchors at a pinned
 # root (GTS Root R1) while its SANs are Google's, not the requested name.
 MISMATCH_HOST = "www.google.com"
@@ -205,6 +212,7 @@ def run_qemu(
     attach: bool = False,
     keep: bool = False,
     tolerate: bool = False,
+    disk: pathlib.Path | None = None,
 ) -> str:
     """Run `tools/run.py` once and return its serial transcript.
 
@@ -224,6 +232,8 @@ def run_qemu(
         "--settle", str(settle),
         "--timeout", str(timeout),
     ]
+    if disk is not None:
+        command += ["--disk", str(disk)]
     if attach:
         command.append("--attach")
     else:
@@ -252,6 +262,8 @@ def run_guest(
     commands: list[tuple[str, float]],
     work: pathlib.Path,
     timeout: float,
+    disk: pathlib.Path | None = None,
+    tag: str = "boot",
 ) -> str:
     """Boot once, then type one command per attach.
 
@@ -262,15 +274,43 @@ def run_guest(
     is also how a human drives it.
     """
     transcript = run_qemu(
-        kernel, keys="", settle=1.0, work=work, tag="boot", timeout=timeout, keep=True,
+        kernel, keys="", settle=1.0, work=work, tag=tag, timeout=timeout, keep=True,
+        disk=disk,
     )
     for index, (command, settle) in enumerate(commands):
         transcript += run_qemu(
             kernel, keys=command + "\r", settle=settle, work=work,
-            tag=f"cmd{index}", timeout=timeout, attach=True,
-            tolerate=command == "halt",
+            tag=f"{tag}-cmd{index}", timeout=timeout, attach=True,
+            tolerate=command == "halt", disk=disk,
         )
     return transcript
+
+
+def make_image(work: pathlib.Path, elf: pathlib.Path) -> pathlib.Path:
+    """Format a 64 MiB ext2 image with `mke2fs -d`, the example inside.
+
+    No first boot is needed to format: the image already has a filesystem and
+    the kernel's format policy mounts an existing ext2 rather than erasing it.
+    """
+    mke2fs = shutil.which("mke2fs")
+    if mke2fs is None:
+        die("mke2fs (e2fsprogs) is required to build the example image")
+    root = work / "root"
+    root.mkdir(exist_ok=True)
+    target = root / "https_get"
+    shutil.copyfile(elf, target)
+    target.chmod(0o755)
+    disk = work / "disk.img"
+    with disk.open("wb") as file:
+        file.truncate(64 * 1024 * 1024)
+    command = [
+        mke2fs, "-q", "-t", "ext2", "-b", "1024", "-F", "-d", str(root), str(disk),
+    ]
+    print("+", " ".join(command))
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        die(f"mke2fs failed: {result.stderr.strip()}\n{result.stdout.strip()}")
+    return disk
 
 
 def shut_down(work: pathlib.Path) -> None:
@@ -391,6 +431,58 @@ def run(args: argparse.Namespace) -> int:
     check("tls: FAILED stage=resolve" in resolve, "an unresolvable name did not fail at resolve", transcript)
     check("tls: tcp connected" not in resolve, "a socket was opened for a name that cannot resolve", transcript)
 
+    # ── 6. the same handshake from userland (libpagh, no shell help) ──────
+    #
+    # This is the phase that proves the TLS syscalls are *reachable*: a normal
+    # program resolves the name itself, connects a socket, hands it to the
+    # kernel for the handshake and reads the body through the descriptor. The
+    # certificate decision is the kernel's — the transcript has to show the
+    # verifier's own line for the userland session, not just the shell's.
+    userland = ""
+    if not args.no_userland:
+        elf = pathlib.Path(args.example).resolve()
+        if not elf.is_file():
+            die(
+                f"{elf} not found — build it with\n"
+                "  (cd ../pagh-api && cargo build --release --example https_get \\"
+                "\n      --target riscv64gc-unknown-none-elf)"
+            )
+        disk = make_image(work, elf)
+        userland = run_guest(
+            kernel,
+            [(f"run /mnt/https_get {PROOF_HOST} /", args.settle), ("halt", 5.0)],
+            work,
+            args.timeout,
+            disk=disk,
+            tag="user",
+        )
+        transcript += userland
+
+    if not args.no_userland:
+        guest = section(userland, "run /mnt/https_get")
+        check(
+            "tls: verified leaf=sha256:" in guest,
+            "the userland handshake did not verify a certificate",
+            userland,
+        )
+        check(
+            "tls: user session 0 open tcp=" in guest,
+            "the kernel did not publish a userland TLS session",
+            userland,
+        )
+        check(
+            "https_get: TLS 1.3 session up (server authenticated by the kernel)" in guest,
+            "the example did not report an authenticated session",
+            userland,
+        )
+        check("https_get: OK" in guest, "the example did not finish", userland)
+        check(PROOF_MARKER in guest, f"the userland body does not contain {PROOF_MARKER!r}", userland)
+        check(
+            "run: /mnt/https_get exited with code 0" in guest,
+            "the example did not exit 0",
+            userland,
+        )
+
     body = (
         "# Live HTTPS (TLS 1.3) acceptance for pagh-riscv\n"
         f"# kernel: {kernel} ({kernel.stat().st_size} bytes)\n"
@@ -402,7 +494,13 @@ def run(args: argparse.Namespace) -> int:
         "\n== guest transcript ==\n"
         f"{transcript}\n"
         "RESULT: PASS — verified HTTPS fetch, untrusted chain refused, "
-        "mismatched SAN refused, unresolvable name refused\n"
+        "mismatched SAN refused, unresolvable name refused"
+        + (
+            ", and the libpagh https_get example performed the same verified\n"
+            "fetch from userland through the TLS syscalls\n"
+            if not args.no_userland
+            else "\n"
+        )
     )
     text = "\n".join(line.rstrip() for line in body.splitlines()) + "\n"
     path = pathlib.Path(args.transcript)
@@ -420,6 +518,16 @@ def main() -> int:
     parser.add_argument("--settle", type=float, default=90.0, help="seconds to let the guest run the commands")
     parser.add_argument("--timeout", type=float, default=120.0, help="seconds to wait for the shell prompt")
     parser.add_argument("--transcript", default="docs/live-tls.txt", help="where to write the evidence transcript")
+    parser.add_argument(
+        "--example",
+        default=str(DEFAULT_EXAMPLE),
+        help="libpagh https_get ELF for the userland phase",
+    )
+    parser.add_argument(
+        "--no-userland",
+        action="store_true",
+        help="skip the libpagh example phase (no disk image is built)",
+    )
     args = parser.parse_args()
     if args.release and args.kernel == str(KERNEL_DEBUG):
         args.kernel = str(KERNEL_RELEASE)

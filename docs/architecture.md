@@ -620,7 +620,11 @@ refused_frames`) читает `user-stack-grows`/`user-stack-cap`.
 | 206 | `sendto` | TCP: `send` на connected-сокете; `write` на socket fd идёт сюда же; `tcp::send` синхронный (ждёт ACK). UDP: `dest` обязателен, payload ≤ 1024 B, первый send авто-привязывает порт, `net::udp_send_from`; `-ENOTCONN`/`-EDESTADDRREQ`/`-EMSGSIZE`/`-EHOSTUNREACH`/`-EPIPE`/`-ECONNRESET`/`-ETIMEDOUT` |
 | 207 | `recvfrom` | TCP: `recv` на connected-сокете; `read` на socket fd идёт сюда же; `tcp::recv_nonblocking` опрашивает NIC один раз, `-EAGAIN` — повторить, 0 — EOF; опциональный `src` заполняется peer'ом. UDP: `net::udp_wait_into`/`udp_take_into`, блокирующий опрос до 1000 тиков или `MSG_DONTWAIT`/`SOCK_NONBLOCK` → `-EAGAIN`; `src` заполняется отправителем; очередь порта — 4×1024 B |
 | 208/209 | `setsockopt`/`getsockopt` | типовые `SO_*`/`TCP_NODELAY` принимаются/отвечаются фиксированными значениями (`SO_TYPE` — `SOCK_STREAM`/`SOCK_DGRAM`), остальное — `-ENOPROTOOPT` |
-| 210 | `shutdown` | `tcp::close()` (оба направления, без half-close), fd остаётся; последующий `read` — 0, `write` — `-EPIPE`; `close` освобождает слот |
+| 210 | `shutdown` | `tcp::close()` (оба направления, без half-close), fd остаётся; последующий `read` — 0, `write` — `-EPIPE`; `close` освобождает слот; на TLS-fd — `close_notify` |
+| 278 | `getrandom` | `entropy::fill` (тот же SHA-256-ratchet, что у TLS): `flags != 0` — `-EINVAL`, пул без seed'а — `-EAGAIN` **до** первой генерации, диапазон проверяется на запись целиком (`-EFAULT` без частичной записи), за вызов ≤ `MAX_GETRANDOM` = 64 KiB (больше — короткое чтение) |
+| 1100 | `tls_connect` | `tcp_fd` — connected stream (`FdEntry::Socket{connected}`/`FdEntry::TcpConn`), `host` — 1..255 байт без NUL/control; `flags != 0` — `-EINVAL`. Вызывает `net::tls::user_open` (тот же `KernelVerifier`: цепочка/SAN/clock gate/`CertificateVerify` + счётчик `VERIFIED_HANDSHAKES`) под `with_network_interrupts`, затем заменяет запись на `FdEntry::Tls { session, tcp }`. Провал — `-EPROTO`/`-EKEYREJECTED`/`-EAGAIN`/`-ENOTSUP`/`-ENOSPC` и закрытие соединения (fd — `Unsupported`) |
+| 1101/1102 | `tls_write`/`tls_read` | те же тела, что `write`/`read` на TLS-fd: чанки по 4 KiB, `net::tls::user_write`/`user_read` под `with_network_interrupts`; `0` у чтения — `close_notify`, обрыв без него — `-ECONNRESET` |
+| 1103 | `tls_close` | `net::tls::user_close(session, notify=true)` (шлёт `close_notify`) + `tcp::close_id`, fd освобождается; `close(2)` на TLS-fd освобождает сессию без алерта |
 
 **Мутации путей** (`mkdirat`, `unlinkat`, `symlinkat`, `linkat`, `renameat2`,
 `fchmodat`) устроены одинаково: `read_user_path` → `read_path` (UTF-8 +
@@ -635,6 +639,16 @@ refused_frames`) читает `user-stack-grows`/`user-stack-cap`.
 (в `VfsNode` нет `set_mode`): режим хранится в статической таблице прогона по
 `fs_ino` (до 16 inode'ов, затем `-ENOSPC`), `fstat` отдаёт его до конца
 прогона, на диск и на права он не влияет — это задокументированный разрыв ABI.
+
+TLS-сессии живут в `net::tls` (`USER_SESSIONS`, 4 слота): `UserSession` держит
+`TlsConnection<'static, TlsTransport, Aes128GcmSha256>`, который заимствует
+heap-блоки собственных `read_buf`/`write_buf` (поля объявлены после `conn`, а
+буферы в `Box`, поэтому адреса не двигаются, — это записано в `net/tls.rs`).
+Блокирующий вызов **вынимает** сессию из таблицы и кладёт обратно: лок — это
+спинлок, а `block_on` спит на тике; слот остаётся занятым, поэтому вторая
+одновременная операция получает `-EAGAIN`. `fork`/`dup` сессию не копируют
+(`FdEntry::Unsupported`), teardown (`reset_fds`/`release_fds`/`drop_entry`)
+освобождает её без `close_notify`.
 
 **Fd-таблица** — по одной на процесс (`FdTables`, строка `MAX_PROCESSES`), 16
 слотов: 0 stdin, 1/2 stdout/stderr, 3.. — `Arc<dyn VfsNode>` + offset + flags,
@@ -1068,8 +1082,12 @@ exec проверяет сброс `SIG_IGN` в `SIG_DFL` и сохранени�
 файл даёт `-ENOEXEC`, процесс выживает.
 `SELFTEST user-abi-syscalls` требует, чтобы `forks`/`waits`/`getppids`/
 `execs` выросли, `live_processes() == 0`, `live_pipes() == 0`, а selftest с
-диском проходит 13/13 (11/13 + 2 SKIP без `/mnt`); PMM-ledger в двух прогонах
-совпадает.
+диском проходит 14/14 (12/14 + 2 SKIP без `/mnt`); PMM-ledger в двух прогонах
+совпадает. Отдельная проверка `user-tls-abi` гоняет `userland/tls.elf`:
+`getrandom(278)` (нули/флаги/`-EFAULT`/короткое чтение на 64 KiB-потолке) и
+fail-closed ответ всех четырёх TLS-вызовов (1100–1103) на дескрипторе, который
+не является сессией, — без сервера и без `/mnt`, с проверкой счётчиков
+`getrandoms`/`faults`, отсутствия живых сессий и неизменных PMM/heap-ledger'ов.
 
 ## 10. Консоль, экран и шелл
 
@@ -1197,8 +1215,8 @@ exec проверяет сброс `SIG_IGN` в `SIG_DFL` и сохранени�
   поэтому образ можно проверять хостовыми инструментами.
 * **Нет SMP**: работает один hart.
 * **Нет host-тестов**: есть in-QEMU selftests (7 памяти, 3 блочного слоя, 11
-  ext2/VFS, 4 таймера/PLIC, 5 планировщика, 13 user-mode — с диском 13/13, без
-  `/mnt` 11/13 + 2 SKIP), QEMU-smoke в шести режимах (serial, ramfb, диск
+  ext2/VFS, 4 таймера/PLIC, 5 планировщика, 14 user-mode — с диском 14/14, без
+  `/mnt` 12/14 + 2 SKIP, 12 сети), QEMU-smoke в шести режимах (serial, ramfb, диск
   fresh/existing, net, keyboard) и проверка пикселей `tools/font_check.py`;
   чистая логика (`fdt.rs`) тестами не покрыта.
 * **Инструментов сборки нет**: `run.sh` — единственный лаунчер; в `tools/` только
@@ -1231,9 +1249,10 @@ fork/exec/wait подтверждены живыми прогонами (`run de
 killed, `run spin` → 7 с таймером в U; маркеры `abi: threads ok`,
 `abi: signals ok`, `abi: altstack ok`, `abi: siginfo ok`, `abi: jobcontrol ok`,
 `abi: fork ok`, `abi: wait ok`, `abi: exec ok`, `abi: exec wait ok`),
-`SELFTEST user-* 13/13` с диском (`user-run-large-file`: 100 KiB образ с нулевым
+`SELFTEST user-* 14/14` с диском (`user-run-large-file`: 100 KiB образ с нулевым
 хвостом через `run_file`; `user-stack-grows`/`user-stack-cap`/`user-stack-fork`:
-рост до 1 MiB, guard и fork на выросшем стеке; без `/mnt` — 11/13 + 2 SKIP), PMM-ledger до/после
+рост до 1 MiB, guard и fork на выросшем стеке; `user-tls-abi`: `getrandom` и
+fail-closed матрица TLS-вызовов; без `/mnt` — 12/14 + 2 SKIP), PMM-ledger до/после
 каждого блока совпадает в двух прогонах, smoke проходит serial/net/ramfb/
 disk-fresh/disk-existing. Следующие шаги —
 из `docs/roadmap.md`:
@@ -1320,11 +1339,13 @@ queue ≤ 4, backlog зажимается, восемь слотов соеди�
 
 ### 13.3 Как проверяется
 
-* `SELFTEST net-* 11/11` (без NIC): контрольные суммы (вектор RFC 1071),
+* `SELFTEST net-* 12/12` (без NIC): контрольные суммы (вектор RFC 1071),
   round-trip Ethernet/IPv4/UDP/ICMP/ARP/TCP, отказ на испорченном байте,
   разбор «серверного» DHCP-сообщения и DNS-ответа с compression pointer,
   текст/подсети; `net-udp` биндит порт, заливает на одну дейтаграмму больше
-  глубины очереди и проверяет FIFO с вытеснением старшей.
+  глубины очереди и проверяет FIFO с вытеснением старшей; `net-tls-session-gate`
+  требует отказа всех точек входа таблицы userland-TLS-сессий на свободном id
+  (ядровая сторона того же контракта, что `user-tls-abi`).
 * Живой QEMU: `virtio-net: virtio-net0 at … MAC …` и
   `net         DHCP ip 10.0.2.15/…`; `ping 10.0.2.2` → reply; `dns example.com`;
   `http 10.0.2.2 <port> /` к слушателю на хосте (QEMU user network: `10.0.2.2` —

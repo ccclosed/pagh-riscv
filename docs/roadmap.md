@@ -15,7 +15,7 @@
 | M4 | ramfb + шрифт покрытия Fira Code, съёмка скриншотов | **готов** | экран рисует ядро, шрифт сверен с ассетом, `docs/shell.png` снимается скриптом |
 | M5 | virtio-mmio блочное устройство, ext2, VFS | **готов** | диск читается и пишется, ФС монтируется, файл доступен из шелла и переживает перезагрузку |
 | M6 | Задачи, syscalls, Linux-compat из x86-ветки | **готов (M6a + M6b)** | планировщик переключает задачи, ELF из userland исполняется в U-mode через syscall-слой |
-| M7 | Сеть: virtio-net и свой TCP/IP | **готов** | DHCP, ping, DNS и TCP-клиент работают живьём на QEMU user network; `selftest net 11/11` |
+| M7 | Сеть: virtio-net и свой TCP/IP | **готов** | DHCP, ping, DNS и TCP-клиент работают живьём на QEMU user network; `selftest net 12/12` |
 | M8 | Указатель и software-курсор | **готов** | virtio-input (tablet/mouse) найден по device tree, курсор рисуется в кадре и двигается по QMP-событиям; `selftest input-device PASS` |
 
 «Готов» = критерии подтверждены живым запуском; «почти готов» = большая часть
@@ -134,7 +134,7 @@ TTF-парсер (только офлайн-растетризованный а�
 | Round-robin и вытеснение по таймеру | **готово** | квант 8 тиков, готовые потоки FIFO; одна строка `timer::set_tick_handler(tick_from_timer)`; `sleep 1` двигает счётчики демо-потоков без `yield` (258 → 358 тиков, 32 → 44 переключения) |
 | Планировщик не аллоцирует и не берёт лок через switch | **готово** | `schedule()` выбирает под локом, отпускает и только потом `task_switch`; тик/switch без аллокаций; контракт в `src/task/README.md` |
 | Проверки машинные и идемпотентные | **готово** | `SELFTEST task-* 5/5`: interleave (130 switch-out), exit-stack, layout/guard, canary, idle; ledger `62650 -> 62650` в двух прогонах |
-| User mode + syscall'ы + ELF из шелла | **готово** | M6b: `sret` с `SPP=0`/`SPIE=1`/`SUM=0`, `sscratch`-контракт ловушек, `ecall`-диспетчер (52 номера, `sepc+4`, проверка user-указателей по PTE U\|R), ELF64-загрузчик с откатом кадров и потоковым чтением `ImageSource` (≤ 512 B за чтение, без буфера размером с файл), per-process Sv39-root/ASID, `run <path>` до 1 MiB и фикстуры `demo`/`fault`/`spin`/`argv`/`abi`/`exec-child`/`stack`/`stack-over`/`stack-fork`, деманд-рост user-стека до 1 MiB на процесс (`src/user/stack.rs`, guard ниже `USER_STACK_FLOOR`); `SELFTEST user-* 13/13` с диском (11/13 + 2 SKIP без `/mnt`), включая `user-stack-grows` (160 KiB цепочка возвращается), `user-stack-cap` (1.2 MiB цепочка умирает `store page fault`), `user-stack-fork` (fork на выросшем стеке, обе стороны доходят, `wait4` возвращает pid) и `user-run-large-file` (100 KiB образ с нулевым хвостом через `run_file`), ledger совпадает в двух прогонах; `run demo` → 42, `run fault` → killed, `run spin` → 7 (таймер-in-U), маркеры `abi: threads/signals/altstack/siginfo/jobcontrol/fork/wait/exec/exec wait ok` |
+| User mode + syscall'ы + ELF из шелла | **готово** | M6b: `sret` с `SPP=0`/`SPIE=1`/`SUM=0`, `sscratch`-контракт ловушек, `ecall`-диспетчер (57 номеров, `sepc+4`, проверка user-указателей по PTE U\|R), ELF64-загрузчик с откатом кадров и потоковым чтением `ImageSource` (≤ 512 B за чтение, без буфера размером с файл), per-process Sv39-root/ASID, `run <path>` до 1 MiB и фикстуры `demo`/`fault`/`spin`/`argv`/`abi`/`exec-child`/`stack`/`stack-over`/`stack-fork`, деманд-рост user-стека до 1 MiB на процесс (`src/user/stack.rs`, guard ниже `USER_STACK_FLOOR`); `SELFTEST user-* 14/14` с диском (12/14 + 2 SKIP без `/mnt`), включая `user-stack-grows` (160 KiB цепочка возвращается), `user-stack-cap` (1.2 MiB цепочка умирает `store page fault`), `user-stack-fork` (fork на выросшем стеке, обе стороны доходят, `wait4` возвращает pid) и `user-run-large-file` (100 KiB образ с нулевым хвостом через `run_file`), ledger совпадает в двух прогонах; `run demo` → 42, `run fault` → killed, `run spin` → 7 (таймер-in-U), маркеры `abi: threads/signals/altstack/siginfo/jobcontrol/fork/wait/exec/exec wait ok` |
 | Прерывание таймера, взятое в U-mode | **готово** | `trap_entry` U-путь + `SPP`-разбор эпилога; счётчик `traps::user_timer_ticks()` растёт на `run spin` (0.2 s в U-mode), selftest это проверяет |
 | Linux-compat слой из x86 | **нет** | после M6b и только когда есть userland, которому он нужен |
 
@@ -165,7 +165,7 @@ TCP-клиент для HTTP/1.0. Ни smoltcp, ни внешних крейто
 | DNS-резолвер | **готово** | `dns example.com` → A-запись через DNS из lease |
 | TCP-клиент | **готово** | `src/net/tcp.rs`: handshake/seq/ack/FIN, один active-open сокет; `http 10.0.2.2 <port> /` получает ответ от сервера на хосте |
 | TCP-сервер | **готово** | `bind` stream-сокета, `listen(201)`, `accept(202)`, один listener с очередью на 4, 8 слотов соединений; живая libpagh-фикстура `tcp_echo` + `tools/test_tcp_server.py` (`mke2fs -d`, QEMU `hostfwd`) |
-| Логика проверяется без железа | **готово** | `SELFTEST net-* 11/11` (без NIC): checksum-вектор, round-trip заголовков, отказ на порче, DHCP/DNS из фиксированных байт |
+| Логика проверяется без железа | **готово** | `SELFTEST net-* 12/12` (без NIC): checksum-вектор, round-trip заголовков, отказ на порче, DHCP/DNS из фиксированных байт |
 | CI и живой прогон | **готово** | `smoke.py --net` (DHCP+net+ping+halt) в CI; `selftest` дважды с одинаковым PMM-ledger; `docs/net.png` проверен `font_check` |
 
 Не входит в M7: TLS/apt (следующий майлстоун, нужен крипто-слой), IPv6,

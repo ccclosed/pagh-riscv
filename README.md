@@ -104,13 +104,31 @@ IPv4-литералу → `send`/`recv` → `shutdown`/`close`; `read`/`write` �
 peer-адрес в `sockaddr_in`; ожидание опрашивает NIC до 30 s, `SOCK_NONBLOCK`
 даёт `-EAGAIN` сразу. Рядом — `SOCK_DGRAM`: `socket` → `bind(200)` →
 `sendto`/`recvfrom`, с per-port bounded-очередью, блокирующим `recvfrom` и
-`MSG_DONTWAIT`/`SOCK_NONBLOCK` для `-EAGAIN`. DNS-syscall отсутствует; TLS 1.3 работает (`https <url>`, fail-closed проверка цепочки/SAN/срока/`CertificateVerify`).
+`MSG_DONTWAIT`/`SOCK_NONBLOCK` для `-EAGAIN`. DNS-syscall отсутствует (в libpagh
+резолвер `dns::resolve` — один A-запрос поверх UDP); TLS 1.3 работает и в шелле
+(`https <url>`), и из userland: `tls_connect(1100)` на подключённом TCP-сокете
+делает то же fail-closed рукопожатие (цепочка/SAN/срок/`CertificateVerify`),
+после чего `read`/`write` на том же fd — открытый текст, `tls_close(1103)` шлёт
+`close_notify`. Рядом — `getrandom(278)` из того же пула энтропии.
 Живые прогоны — `python3 tools/test_sockets.py` (HTTP),
 `python3 tools/test_udp.py` (UDP-эхо) и `python3 tools/test_tcp_server.py`
 (TCP-сервер: `mke2fs -d` + QEMU `hostfwd`); транскрипты —
 `docs/live-sockets.txt`, `docs/live-udp.txt`, `docs/live-tcp-server.txt`.
 
-Версия **0.20.0** добавляет **растущий по требованию user-стек**: страница,
+Версия **0.21.0** делает TLS и энтропию доступными из userland:
+`getrandom(278)` (тот же SHA-256-пул из `/chosen/rng-seed`, короткое чтение
+выше 64 KiB, `-EINVAL` на неизвестные флаги, `-EAGAIN` без seed'а) и
+pagh-native семейство `tls_connect(1100)`/`tls_write(1101)`/`tls_read(1102)`/
+`tls_close(1103)` — рукопожатие выполняет **ядро** тем же проверяющим слоем,
+что и `https`, а дескриптор после него несёт открытый текст (`read`/`write`/
+`poll`/`shutdown`/`close` работают как с сокетом). Флага, отключающего проверку
+сертификата, нет; обрыв TCP без `close_notify` — `-ECONNRESET`, а не EOF.
+In-QEMU проверка — `user-tls-abi` (`userland/tls.elf`: getrandom + fail-closed
+матрица всех четырёх TLS-вызовов) и `net-tls-session-gate`; живая — фаза
+userland в `python3 tools/test_tls.py` (libpagh `https_get` против
+`example.com`, транскрипт `docs/live-tls.txt`).
+
+Версия **0.20.0** добавила **растущий по требованию user-стек**: страница,
 на которую пришёлся load/store page fault чуть ниже текущего дна стека,
 мапится и обнуляется в trap-обработчике, инструкция повторяется, и глубокая
 рекурсия перестаёт умирать на фиксированных 64 KiB. Потолок — **1 MiB на
@@ -255,7 +273,7 @@ SELFTEST SUMMARY: 7/7 passed
 | Сеть (M7) | готово | virtio-net (modern, polled) + свой стек: Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP-клиент, DNS-резолвер, `net`/`dhcp`/`ping`/`dns`/`http`; без smoltcp и внешних крейтов. Для userland — один active-open TCP-сокет (`AF_INET`/`SOCK_STREAM`, IPv4-литерал) и UDP-сокеты (`AF_INET`/`SOCK_DGRAM`, `bind`/per-port-очередь/`sendto`/`recvfrom`); syscall'ы сами опрашивают NIC; `read`/`write`/`poll` работают на сокете | `src/net/`, `src/drivers/virtio_net.rs`, `src/user/syscall.rs` |
 | Пакеты (`pkg`) | MVP | нативный установщик (не apt): плоский `index` и `.ppkg` с репозитория по **plain HTTP** (`http://IP:port/`, в QEMU хост — `10.0.2.2`), потоковая загрузка в `/mnt/pkg` кусками 4 KiB, шлюз «размер + SHA-256 из индекса» **до** разбора `PPKG0001`; `kind=app` → `/mnt/bin/<name>`, `applet-bundle` → `/mnt/bin/paghbox` + симлинки; манифест в `/mnt/pkg/<name>.manifest`; TLS/OpenPGP/apt по-прежнему нет | `src/pkg/` |
 | apt / TLS / OpenPGP | **нет** | apt намеренно не подключён, пока нет vendored TLS + проверки подписей Debian; `pkg` — отдельный нативный путь для портов | — |
-| Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 4 блока/указателя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 13 user-mode (ABI-фикстуры `argv`/`abi` с секциями потоков/фьютексов, сигналов и TCP-сервера: bind/listen/nonblocking accept/EAGAIN/dup-ENOTSUP; `user-stack-grows` — цепочка 160 KiB возвращается через `stack: deep recursion ok`, `user-stack-cap` — цепочка 1.2 MiB умирает `store page fault` на guard-странице, `user-stack-fork` — fork на выросшем стеке, обе стороны доходят до конца, `wait4` возвращает pid; 13/13 с диском, 11/13 + 2 SKIP без `/mnt`) + 11 сети (идемпотентность по ledger'у), QEMU-smoke в шести режимах (serial, ramfb, диск-fresh, диск-existing, net, keyboard), установка пакета проверяется отдельным тестом `pkg`, живые сокетные прогоны — `tools/test_sockets.py` (TCP-клиент), `tools/test_udp.py` (UDP) и `tools/test_tcp_server.py` (TCP-сервер: `mke2fs -d` + QEMU `hostfwd`; libpagh-фикстуры, не в CI); проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/net/selftest.rs`, `src/pkg/`, `.github/smoke.py`, `tools/` |
+| Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 4 блока/указателя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 14 user-mode (включая `user-tls-abi` — `getrandom` и fail-closed матрица 1100–1103; ABI-фикстуры `argv`/`abi` с секциями потоков/фьютексов, сигналов и TCP-сервера: bind/listen/nonblocking accept/EAGAIN/dup-ENOTSUP; `user-stack-grows` — цепочка 160 KiB возвращается через `stack: deep recursion ok`, `user-stack-cap` — цепочка 1.2 MiB умирает `store page fault` на guard-странице, `user-stack-fork` — fork на выросшем стеке, обе стороны доходят до конца, `wait4` возвращает pid; 14/14 с диском, 12/14 + 2 SKIP без `/mnt`) + 12 сети (идемпотентность по ledger'у, `net-tls-session-gate`), QEMU-smoke в шести режимах (serial, ramfb, диск-fresh, диск-existing, net, keyboard), установка пакета проверяется отдельным тестом `pkg`, живые сокетные прогоны — `tools/test_sockets.py` (TCP-клиент), `tools/test_udp.py` (UDP), `tools/test_tcp_server.py` (TCP-сервер: `mke2fs -d` + QEMU `hostfwd`) и `tools/test_tls.py` (живой TLS 1.3 + userland `https_get`; libpagh-фикстуры, не в CI); проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/net/selftest.rs`, `src/pkg/`, `.github/smoke.py`, `tools/` |
 | CI | готово | `fmt`, debug/release build, QEMU-smoke в шести режимах: serial, ramfb, диск-fresh (формат/монтирование/запись), диск-existing (повторная загрузка читает файл), net (DHCP + ping шлюза), keyboard (virtio-keyboard печатает `help`/`halt` через монитор QEMU); во всех приложен virtio-tablet, в keyboard — ещё и virtio-keyboard | `.github/workflows/ci.yml` |
 
 ---
@@ -326,7 +344,7 @@ run demo        # hello from user mode + run: demo exited with code 42
 run demo a b    # то же: у фикстуры по контракту argc=1, лишние слова не мешают
 run fault       # [user] fault killed: load page fault ... ; шелл жив
 run spin        # 0.2 s в U-mode (таймер вытесняет) -> exit 7
-selftest        # + SELFTEST user-*: 13/13 с /mnt (без диска 11/13 + 2 SKIP)
+selftest        # + SELFTEST user-*: 14/14 с /mnt (без диска 12/14 + 2 SKIP)
 ```
 
 ### Native ABI для libpagh
@@ -397,6 +415,17 @@ selftest        # + SELFTEST user-*: 13/13 с /mnt (без диска 11/13 + 2 
 | 208 | `setsockopt` | `SO_REUSEADDR`/`SO_KEEPALIVE`/`SO_RCVTIMEO`/`SO_SNDTIMEO`/`TCP_NODELAY` принимаются и игнорируются (границы ядра фиксированы), остальное — `-ENOPROTOOPT` |
 | 209 | `getsockopt` | `SO_TYPE` → `SOCK_STREAM`/`SOCK_DGRAM`, `SO_ERROR` → 0, таймауты → 0, `TCP_NODELAY` → 0; остальное — `-ENOPROTOOPT` |
 | 210 | `shutdown` | `how` 0/1/2 валидируется, но half-close нет: закрываются оба направления, fd остаётся открытым (последующий `read` → 0, `write` → `-EPIPE`) до `close` |
+| 278 | `getrandom` | заполнить буфер из пула энтропии (`src/entropy.rs`, тот же SHA-256-ratchet, что и у TLS): `flags` обязан быть 0 (иначе `-EINVAL`), без seed'а — `-EAGAIN` и **ни одного записанного байта**, непроходимый указатель — `-EFAULT` до первой генерации; за вызов не больше 64 KiB (больше — короткое чтение, вызывающий повторяет) |
+| 1100 | `tls_connect` | `tcp_fd` — **подключённый** stream-сокет или принятое соединение, `host`/`host_len` — имя без NUL (1..255 байт), `flags` обязан быть 0 (флага «не проверять» нет). Ядро делает рукопожатие TLS 1.3 тем же проверяющим слоем, что и `https`: цепочка до закоммиченного CA-бандла, SAN по `host`, clock gate, `CertificateVerify`, плюс независимая проверка счётчика `VERIFIED_HANDSHAKES`. Успех — 0, тот же fd теперь TLS-сессия. Ошибки: `-EBADF`/`-ENOTSOCK`/`-ENOTCONN`/`-EISCONN`/`-ENOTSUP`/`-EINVAL`/`-EFAULT`, `-EAGAIN` (нет seed'а), `-ENOTSUP` (нет часов), `-EPROTO` (рукопожатие), `-EKEYREJECTED` (сертификат), `-ENOSPC` (все 4 сессии заняты). Провал закрывает соединение: fd — «надгробие», `close` его освобождает |
+| 1101 | `tls_write` | `fd` — TLS-сессия, шифрует и отдаёт в record layer; возвращает число принятых байт открытого текста (короткое — только после сбоя); `-EINVAL` (не TLS-fd), `-EFAULT`, `-EPIPE`, `-ECONNRESET`, `-ETIMEDOUT`, `-EAGAIN` (параллельный вызов из другого потока) |
+| 1102 | `tls_read` | расшифровывает в буфер; **блокирует** (бюджет простоя ~20 s) до первых байт, максимум 4096 за вызов; `0` — `close_notify`, `-ECONNRESET` — обрыв TCP **без** него (обрезанный поток не выглядит дочитанным), `-ETIMEDOUT`/`-EINVAL`/`-EFAULT`/`-EAGAIN` |
+| 1103 | `tls_close` | `close_notify` (best effort), освобождение буферов сессии и дескриптора; `-EINVAL` — не сессия, `-EBADF` — закрытый fd. `close(2)` на TLS-fd освобождает сессию **без** алерта (он же и teardown) |
+
+На TLS-дескрипторе `read`/`recv` — 1102, `write`/`send` — 1101 (поэтому `send`
+с непустым `dest` — `-ENOTSUP`: у сессии уже есть peer), `poll` даёт `POLLIN`,
+когда есть открытый текст **или** байты в сокете (возможно, половина записи —
+тогда `read` подождёт остаток, это записано в контракте), `POLLHUP` — после
+`close_notify`. `dup`/`fork` сессию не копируют (`-ENOTSUP` в копии).
 
 Пределы и отличия, которые важно знать userland'у: 16 дескрипторов **на
 процесс** включая 0/1/2 (кончились — `-ENOSPC`); путь ≤ 256 байт с NUL;
@@ -406,7 +435,9 @@ selftest        # + SELFTEST user-*: 13/13 с /mnt (без диска 11/13 + 2 
 (главный + 13 `clone`; 16 слотов планировщика минус `shell` и `idle`); у каждого
 потока свой kernel-стек 16 KiB + guard из PMM, user-стек передаёт вызывающий и
 ядро его не освобождает; futex-таблица — 32 ожидающих на 16 адресов; TLS/PI/
-requeue и `join`/`waitid` нет. Сигналы — узкое POSIX-подмножество: 31 номер, один pending-бит
+requeue и `join`/`waitid` нет. TLS-сессий — не больше 4 одновременно
+(`MAX_USER_SESSIONS`), каждая ~50 KiB кучи до `tls_close`/`close`; TLS — только
+клиент; разрешение имён — дело программы (`libpagh::dns` — один A-запрос). Сигналы — узкое POSIX-подмножество: 31 номер, один pending-бит
 на сигнал и один кадр 736 B на активный обработчик (вложенность допустима),
 per-thread alt-стек через `sigaltstack`/`SA_ONSTACK`, полный 128-байтный
 `siginfo_t` (`si_pid`/`si_uid`/`si_code`/`si_addr`/`si_status`) и 288-байтный
@@ -532,7 +563,7 @@ backspace работает, всё остальное — команды:
 |---|---|
 | `help` | список команд |
 | `mem` | память из device tree **и** статистика PMM и кучи (свободно/всего кадров, диапазон пула, байты кучи) |
-| `selftest` | in-QEMU self-tests: 7 памяти, 4 блока/указателя, 11 ext2/VFS, 4 таймера/PLIC, 5 планировщика, 13 user-mode (включая мутационную половину ABI-фикстуры, сокетную секцию и секцию потоков: `clone`/`gettid`/futex/`exit`/`exit_group`; `user-stack-grows`/`user-stack-cap`/`user-stack-fork` — рост до 1 MiB, guard ниже `USER_STACK_FLOOR` и fork на выросшем стеке; с живым сервером на `10.0.2.2:8000` — connect/send/recv/shutdown/EOF, без него — `SKIP`; без `/mnt` два SKIP — `user-run-large-file` и `user-abi-syscalls`, итог 11/13); печатает ledger свободных кадров до и после каждого блока |
+| `selftest` | in-QEMU self-tests: 7 памяти, 4 блока/указателя, 11 ext2/VFS, 4 таймера/PLIC, 5 планировщика, 14 user-mode (включая мутационную половину ABI-фикстуры, сокетную секцию и секцию потоков: `clone`/`gettid`/futex/`exit`/`exit_group`; `user-stack-grows`/`user-stack-cap`/`user-stack-fork` — рост до 1 MiB, guard ниже `USER_STACK_FLOOR` и fork на выросшем стеке; `user-tls-abi` — `getrandom` и fail-closed матрица TLS-вызовов, без сервера; с живым сервером на `10.0.2.2:8000` — connect/send/recv/shutdown/EOF, без него — `SKIP`; без `/mnt` два SKIP — `user-run-large-file` и `user-abi-syscalls`, итог 12/14), 12 сети (включая `net-tls-session-gate`); печатает ledger свободных кадров до и после каждого блока |
 | `disk` | блочное устройство: имя, ёмкость, живая проверка чтения сектора 0 |
 | `ls [path]` | листинг каталога (каталоги с `/`) |
 | `cat <path>` | содержимое файла |
@@ -741,7 +772,7 @@ IPv4, ICMP и UDP, а `dhcp`/`dns`/`tcp` — маленькие клиенты. 
 * **Нет журнала/WAL в ext2.** Сбой между двумя записями может оставить операцию
   недоделанной; crash-consistency не заявляется.
 * **Один блочный слот, нет разделов/hot-plug.** Второй диск — изменение дизайна.
-* **Нет TLS, подписей пакетов и apt.** Нативный `pkg` говорит по plain HTTP и
+* **Нет подписей пакетов и apt.** Нативный `pkg` говорит по plain HTTP и
   проверяет только размер + SHA-256 из индекса: это целостность, а не
   аутентификация источника. TLS-стек и OpenPGP-проверка подписей — следующий
   майлстоун; `apt` намеренно не подключается, пока их нет: «скачали и поставили
@@ -792,11 +823,11 @@ src/user/process.rs            таблица процессов: root/satp/asid
 src/user/elf.rs                ELF64-загрузчик: load_in(root), PT_LOAD с U=1, откат кадров
 src/user/syscall.rs            ecall-диспетчер: 55 номеров — файлы/ФС, mmap/munmap/mprotect, pipe/dup/poll, сигналы, сокеты, clone/fork/execve/wait4/getppid
 src/user/futex.rs              статическая futex-очередь (32 ожидающих / 16 адресов) поверх block_current/wake_task
-src/user/selftest.rs           in-QEMU self-tests user mode (10 проверок)
+src/user/selftest.rs           in-QEMU self-tests user mode (14 проверок)
 src/net/mod.rs                 сетевой стек: poll, ARP-кэш, диспетчер кадров, ping
 src/net/wire.rs                чистые форматы Ethernet/ARP/IPv4/ICMP/UDP/TCP/DHCP/DNS
 src/net/{dhcp,dns,tcp}.rs      DHCP-клиент, DNS-резолвер, минимальный TCP-клиент
-src/net/selftest.rs            in-QEMU self-tests сети (11 проверок)
+src/net/selftest.rs            in-QEMU self-tests сети (12 проверок)
 src/net/README.md              дизайн стека: опрос, wire, DHCP/DNS/TCP, чего нет
 userland/{hello,fault,spin,argv,abi}.rs статические RV64-фикстуры + user.ld + build.sh
 userland/README.md             как пересобрать и что доказывает каждая фикстура

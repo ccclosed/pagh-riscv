@@ -67,6 +67,7 @@
 //! * the CA bundle carries two extra anchors (the SSL.com 2022 roots), because
 //!   `example.com` — the port's live proof host — chains to one of them.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -557,27 +558,49 @@ fn trace_reset() {
 /// socket holds in one pass; writes go through the bounded, ACK-waiting
 /// `send_id`. No lock is held across an `await` — the TCP module takes and
 /// releases its own state lock inside each call — and an inactivity deadline
-/// (re-armed on every byte moved) bounds stalls.
+/// bounds stalls.
+///
+/// The deadline is armed **lazily, at the first `Pending` poll of a wait**, and
+/// disarmed by every byte that moves. Arming it in `new()` would instead make
+/// the budget a property of the session's whole lifetime: a userland session
+/// that idles for a minute and then asks for a read would find its deadline long
+/// past and fail instantly instead of waiting for the peer. With lazy arming,
+/// every handshake and every `tls_read`/`tls_write` gets the full
+/// [`TLS_IDLE_TIMEOUT_TICKS`] budget, and a stall inside one call still aborts.
 struct TlsTransport {
     handle: u8,
-    /// Tick at which an idle transport gives up. Re-armed whenever bytes move.
+    /// Tick at which the current wait gives up; meaningful while `waiting`.
     deadline: u64,
+    /// A wait is in progress (the deadline has been armed for this call).
+    waiting: bool,
 }
 
 impl TlsTransport {
     fn new(handle: u8) -> Self {
         TlsTransport {
             handle,
-            deadline: crate::arch::riscv64::timer::ticks() + TLS_IDLE_TIMEOUT_TICKS,
+            deadline: 0,
+            waiting: false,
         }
     }
 
-    /// Re-arm the inactivity deadline after observable progress.
+    /// Observable progress: end the current wait and re-arm the budget.
     fn touch(&mut self) {
         self.deadline = crate::arch::riscv64::timer::ticks() + TLS_IDLE_TIMEOUT_TICKS;
+        self.waiting = false;
     }
 
-    /// Return `true` once the inactivity budget has elapsed.
+    /// Arm the budget for a wait that is starting. A no-op while one is already
+    /// in progress, so repeated `Pending` polls of the same call share one
+    /// deadline.
+    fn begin_wait(&mut self) {
+        if !self.waiting {
+            self.deadline = crate::arch::riscv64::timer::ticks() + TLS_IDLE_TIMEOUT_TICKS;
+            self.waiting = true;
+        }
+    }
+
+    /// Return `true` once the current wait's budget has elapsed.
     fn timed_out(&self) -> bool {
         crate::arch::riscv64::timer::ticks() >= self.deadline
     }
@@ -627,12 +650,16 @@ impl TlsTransport {
             return Poll::Ready(Ok(filled));
         }
         if reset {
+            self.waiting = false;
             return Poll::Ready(Err(ErrorKind::ConnectionReset));
         }
         if eof {
+            self.waiting = false;
             return Poll::Ready(Ok(0));
         }
+        self.begin_wait();
         if self.timed_out() {
+            self.waiting = false;
             return Poll::Ready(Err(ErrorKind::TimedOut));
         }
         TLS_READ_PENDING.fetch_add(1, Relaxed);
@@ -651,15 +678,26 @@ impl TlsTransport {
             return Poll::Ready(Ok(0));
         }
         match tcp::send_id(self.handle, buf) {
-            Ok(0) => Poll::Ready(Err(ErrorKind::BrokenPipe)),
+            Ok(0) => {
+                self.waiting = false;
+                Poll::Ready(Err(ErrorKind::BrokenPipe))
+            }
             Ok(n) => {
                 self.touch();
                 Poll::Ready(Ok(n))
             }
-            Err(tcp::Error::Closed) => Poll::Ready(Err(ErrorKind::BrokenPipe)),
-            Err(tcp::Error::Reset) => Poll::Ready(Err(ErrorKind::ConnectionReset)),
+            Err(tcp::Error::Closed) => {
+                self.waiting = false;
+                Poll::Ready(Err(ErrorKind::BrokenPipe))
+            }
+            Err(tcp::Error::Reset) => {
+                self.waiting = false;
+                Poll::Ready(Err(ErrorKind::ConnectionReset))
+            }
             Err(_) => {
+                self.begin_wait();
                 if self.timed_out() {
+                    self.waiting = false;
                     Poll::Ready(Err(ErrorKind::TimedOut))
                 } else {
                     cx.waker().wake_by_ref();
@@ -1013,6 +1051,644 @@ pub fn https_get_at(
             crate::kprintln!("tls: FAILED cause={error:?}");
             Err(error)
         }
+    }
+}
+
+// ───────────────── userland TLS sessions (syscalls 1100–1103) ─────────────────
+//
+// The shell's `https` path is one-shot by design: `https_get_at` owns the socket
+// from `connect` to `close` and buffers the whole body. A userland program needs
+// the other shape — a *session* it drives: connect a socket it owns, hand that
+// socket to the kernel for the handshake, then read and write plaintext through
+// the descriptor until it decides to close.
+//
+// That is what this section implements. A session is a `TlsConnection` plus the
+// three things the one-shot path never needed: the record buffers (now owned, so
+// they outlive the fetch), a plaintext window (so a small `read` cannot lose the
+// rest of a record) and the release state (`eof`/`closed`).
+//
+// # Security shape
+//
+// `user_open` runs the **same** handshake as `https_get`: the same
+// `KernelProvider`, whose `verifier()` always returns `KernelVerifier`, so
+// `embedded-tls`'s "no verifier ⇒ skip verification" branch is unreachable; the
+// same committed CA bundle, SAN authorization, clock gate and
+// `CertificateVerify`; the same belt-and-braces check that
+// [`VERIFIED_HANDSHAKES`] advanced during *this* handshake. There is no flag on
+// `tls_connect` that relaxes any of it — the ABI defines `flags = 0` and answers
+// `-EINVAL` for anything else, so a future "insecure" bit cannot be smuggled in
+// without changing the documented contract.
+//
+// # Locking and the timer
+//
+// A session is *taken out* of the table for the duration of a blocking call and
+// put back afterwards: the table lock is a spinlock (interrupts masked), and
+// `block_on` sleeps on the timer tick, so holding it across a handshake would
+// deadlock the boot. While a call is in flight its slot stays `used` with an
+// empty payload, which is how a second, concurrent call on the same session gets
+// `-EAGAIN` instead of a second connection to the same peer.
+//
+// The caller must run these with interrupts enabled when it is a syscall (the
+// trap entry masks them); `syscall::with_network_interrupts` is that wrapper.
+
+/// TLS sessions the kernel holds for userland at once.
+///
+/// A memory bound, not a policy: a session owns two 16 KiB record buffers and a
+/// 16 KiB plaintext window until it is closed, so four sessions cap the feature
+/// at ~200 KiB of heap. A program that needs a fifth closes one — `tls_close`
+/// frees the buffers immediately, it does not pool them.
+pub const MAX_USER_SESSIONS: usize = 4;
+
+/// Plaintext window per session: one whole record. `embedded-tls` hands back at
+/// most one decrypted record per `read`, so a window this wide means a
+/// userland `read` never throws plaintext away, however small its buffer is.
+const SESSION_WINDOW: usize = APP_READ_BUF;
+
+/// Why a userland TLS operation did not complete. The syscall layer maps these
+/// onto the ABI's errno set (`syscall::tls_errno`); nothing here is a partial
+/// success — a short read/write is reported as `Ok` with a smaller count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionError {
+    /// The descriptor is not a TLS session (or its slot is free).
+    NoSession,
+    /// Another thread of the same process is inside a call on this session.
+    Busy,
+    /// No free session slot.
+    NoSpace,
+    /// The entropy pool has no seed: refused before any socket work.
+    NoEntropy,
+    /// No wall clock: certificate validity windows cannot be judged.
+    NoClock,
+    /// The handshake failed (protocol, transport or timeout).
+    Handshake,
+    /// The server certificate was rejected (chain, SAN, clock or signature).
+    Certificate,
+    /// The session was shut down for writing (`tls_close`/`shutdown`).
+    Closed,
+    /// The peer reset the connection, or the stream ended without a
+    /// `close_notify`.
+    Reset,
+    /// The inactivity budget expired.
+    Timeout,
+    /// A TLS record/protocol failure.
+    Protocol,
+    /// A transport failure.
+    Io,
+}
+
+/// How a session looks to `poll(2)` right now, without blocking.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionReady {
+    /// Plaintext is buffered, or the socket has bytes (possibly a partial
+    /// record), or the session reached end-of-stream (`read` returns 0).
+    pub readable: bool,
+    /// The session can accept application data.
+    pub writable: bool,
+    /// The peer sent `close_notify`, or the stream ended.
+    pub eof: bool,
+}
+
+/// One userland TLS session.
+///
+/// SELF-REFERENTIAL BY CONSTRUCTION: `conn` borrows the heap blocks owned by
+/// `read_buf`/`write_buf`. Two rules keep that sound and both are visible here:
+/// the borrowed blocks are **boxed** (so the address of the data does not move
+/// when this struct moves), and `conn` is declared **first** (so `Drop` runs it
+/// before the boxes it borrows). No `Drop` impl and no `mem::swap` of the
+/// buffers may be added without revisiting this.
+struct UserSession {
+    /// The connection; `None` only after `shutdown` consumed it via `close`.
+    conn: Option<TlsConnection<'static, TlsTransport, Aes128GcmSha256>>,
+    /// Record read buffer borrowed by `conn` (see the type-level note). Never
+    /// read directly — it exists so the block `conn` borrows stays alive.
+    #[allow(dead_code)]
+    read_buf: Box<[u8]>,
+    /// Record write buffer borrowed by `conn` (see the type-level note).
+    #[allow(dead_code)]
+    write_buf: Box<[u8]>,
+    /// Decrypted, not yet delivered to userland (`window_at..window_len`).
+    window: Box<[u8]>,
+    /// Read cursor into `window`.
+    window_at: usize,
+    /// Valid bytes in `window`.
+    window_len: usize,
+    /// TCP slot this session encrypts onto; released with the session.
+    tcp: u8,
+    /// Host name the handshake authenticated (SNI + SAN). Diagnostics only.
+    host: String,
+    /// The peer's `close_notify` arrived, or the stream ended: reads return 0.
+    eof: bool,
+    /// The session was shut down for writing.
+    closed: bool,
+}
+
+impl UserSession {
+    /// Build a session over TCP slot `tcp_id` for `host`.
+    fn new(tcp_id: u8, host: &str) -> Box<Self> {
+        let mut read_buf = vec![0u8; RECORD_BUF].into_boxed_slice();
+        let mut write_buf = vec![0u8; RECORD_BUF].into_boxed_slice();
+        // SAFETY: the two slices are the heap blocks of `read_buf`/`write_buf`,
+        // which are moved into the returned `UserSession` immediately below and
+        // are never reallocated, moved or freed while the connection exists.
+        // Extending their lifetime to `'static` is what lets the connection live
+        // in the session table instead of on one stack frame; the field order
+        // and the boxed allocation are what make the extension sound (see the
+        // struct-level note).
+        let read: &'static mut [u8] =
+            unsafe { core::mem::transmute::<&mut [u8], &'static mut [u8]>(&mut read_buf[..]) };
+        let write: &'static mut [u8] =
+            unsafe { core::mem::transmute::<&mut [u8], &'static mut [u8]>(&mut write_buf[..]) };
+        let conn = TlsConnection::new(TlsTransport::new(tcp_id), read, write);
+        Box::new(UserSession {
+            conn: Some(conn),
+            read_buf,
+            write_buf,
+            window: vec![0u8; SESSION_WINDOW].into_boxed_slice(),
+            window_at: 0,
+            window_len: 0,
+            tcp: tcp_id,
+            host: String::from(host),
+            eof: false,
+            closed: false,
+        })
+    }
+}
+
+/// One row of the session table. `used` outlives the payload: a blocking call
+/// takes the `Box` out and leaves the slot claimed, which is what stops a second
+/// `tls_connect` from taking the same id while the first is in flight.
+struct SessionSlot {
+    used: bool,
+    session: Option<Box<UserSession>>,
+}
+
+impl SessionSlot {
+    const fn free() -> Self {
+        SessionSlot {
+            used: false,
+            session: None,
+        }
+    }
+}
+
+static USER_SESSIONS: crate::sync::Spinlock<[SessionSlot; MAX_USER_SESSIONS]> =
+    crate::sync::Spinlock::new([const { SessionSlot::free() }; MAX_USER_SESSIONS]);
+
+/// Counters the selftest and the shell read as evidence that the path ran; also
+/// what a stuck session would move. Relaxed: evidence, not synchronisation.
+static SESSION_OPENS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SESSION_REFUSALS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SESSION_BYTES_OUT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SESSION_BYTES_IN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SESSION_CLOSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// A snapshot of the userland session counters and the live session count.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SessionStats {
+    /// Handshakes that completed and were published to a descriptor.
+    pub opened: u64,
+    /// Handshakes refused (preflight, protocol or certificate).
+    pub refusals: u64,
+    /// Plaintext bytes handed to `tls_write`.
+    pub bytes_out: u64,
+    /// Plaintext bytes returned by `tls_read`.
+    pub bytes_in: u64,
+    /// Sessions released (`tls_close`, `close`, or process teardown).
+    pub closes: u64,
+    /// Sessions live right now.
+    pub live: usize,
+}
+
+/// Snapshot the session table's counters and occupancy.
+pub fn session_stats() -> SessionStats {
+    use core::sync::atomic::Ordering::Relaxed;
+    let live = USER_SESSIONS.lock().iter().filter(|slot| slot.used).count();
+    SessionStats {
+        opened: SESSION_OPENS.load(Relaxed),
+        refusals: SESSION_REFUSALS.load(Relaxed),
+        bytes_out: SESSION_BYTES_OUT.load(Relaxed),
+        bytes_in: SESSION_BYTES_IN.load(Relaxed),
+        closes: SESSION_CLOSES.load(Relaxed),
+        live,
+    }
+}
+
+/// Claim a free session id, or `None` when all of them are in use.
+fn reserve_session() -> Option<u8> {
+    let mut table = USER_SESSIONS.lock();
+    for (id, slot) in table.iter_mut().enumerate() {
+        if !slot.used {
+            slot.used = true;
+            slot.session = None;
+            return Some(id as u8);
+        }
+    }
+    None
+}
+
+/// Publish a freshly handshaked session under its reserved id.
+fn publish_session(id: u8, session: Box<UserSession>) {
+    if let Some(slot) = USER_SESSIONS.lock().get_mut(id as usize) {
+        slot.session = Some(session);
+    }
+}
+
+/// Take the session out for a blocking call.
+///
+/// `Err(Busy)` when another call is already in flight (the slot is claimed but
+/// its payload is out), `Err(NoSession)` when the id names no live session.
+fn take_session(id: u8) -> Result<Box<UserSession>, SessionError> {
+    let mut table = USER_SESSIONS.lock();
+    let slot = table.get_mut(id as usize).ok_or(SessionError::NoSession)?;
+    if !slot.used {
+        return Err(SessionError::NoSession);
+    }
+    slot.session.take().ok_or(SessionError::Busy)
+}
+
+/// Put a session back after a blocking call.
+///
+/// A slot that was released while the call was in flight (`tls_close` from
+/// another thread, or process teardown) is *not* resurrected: the session is
+/// dropped, which frees its buffers and, through the caller, its socket.
+fn put_session(id: u8, session: Box<UserSession>) {
+    let mut table = USER_SESSIONS.lock();
+    if let Some(slot) = table.get_mut(id as usize) {
+        if slot.used {
+            slot.session = Some(session);
+            return;
+        }
+    }
+    drop(session);
+}
+
+/// Free a session id. Idempotent: freeing a free id is a no-op.
+fn release_session(id: u8) {
+    if let Some(slot) = USER_SESSIONS.lock().get_mut(id as usize) {
+        slot.used = false;
+        slot.session = None;
+    }
+}
+
+/// Whether `id` names a live session (used by `poll` to answer `POLLNVAL`).
+pub fn session_live(id: u8) -> bool {
+    USER_SESSIONS
+        .lock()
+        .get(id as usize)
+        .is_some_and(|slot| slot.used)
+}
+
+/// Perform the fail-closed TLS 1.3 handshake on an already-connected TCP client
+/// (`tcp_id`) and publish the session under a fresh id.
+///
+/// Everything the one-shot path guarantees holds here: the entropy pool must be
+/// seeded (else [`SessionError::NoEntropy`]), the RTC must give a wall clock
+/// (else [`SessionError::NoClock`]), the certificate chain must reach the
+/// committed CA bundle, the SAN must authorize `host`, and `CertificateVerify`
+/// must prove possession of the leaf key — plus the independent check that
+/// [`VERIFIED_HANDSHAKES`] advanced during this handshake.
+///
+/// A refusal releases the reserved slot before returning, so a failed handshake
+/// costs no session and no buffers.
+pub fn user_open(tcp_id: u8, host: &str) -> Result<u8, SessionError> {
+    // Fail-closed preflight, before a single record is built. The verifier
+    // repeats the clock decision (a `None` clock fails the chain gate), but
+    // saying it here names the refusal instead of reporting a chain error.
+    if !crate::entropy::is_available() {
+        SESSION_REFUSALS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        crate::kprintln!(
+            "tls: user session host={host} REFUSED cause=NoEntropy (the kernel entropy pool has \
+             no seed)"
+        );
+        return Err(SessionError::NoEntropy);
+    }
+    if crate::drivers::rtc::now_unix().is_none() {
+        SESSION_REFUSALS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        crate::kprintln!(
+            "tls: user session host={host} REFUSED cause=NoClock (no wall clock: certificate \
+             validity is unjudgeable)"
+        );
+        return Err(SessionError::NoClock);
+    }
+
+    let Some(id) = reserve_session() else {
+        return Err(SessionError::NoSpace);
+    };
+    let mut session = UserSession::new(tcp_id, host);
+
+    let auth_before = verified_handshakes();
+    *VERIFY_FAILURE.lock() = None;
+    trace_reset();
+    let started = crate::arch::riscv64::timer::ticks();
+
+    let future = async {
+        let config = TlsConfig::new().with_server_name(host);
+        let context = TlsContext::new(
+            &config,
+            KernelProvider {
+                rng: KernelRng,
+                verifier: KernelVerifier::default(),
+            },
+        );
+        let conn = session.conn.as_mut().ok_or(SessionError::Closed)?;
+        conn.open(context).await.map_err(|error| {
+            crate::kprintln!("tls: user session host={host} FAILED stage=handshake ({error:?})");
+            match *VERIFY_FAILURE.lock() {
+                Some(_) => SessionError::Certificate,
+                None => SessionError::Handshake,
+            }
+        })?;
+
+        // Belt to the state machine's braces, exactly as `https_get_at` does it:
+        // refuse to expose a session unless a certificate was verified for THIS
+        // handshake.
+        if verified_handshakes() == auth_before {
+            crate::kprintln!(
+                "tls: user session host={host} FAILED stage=verify (handshake completed without \
+                 a verified server certificate)"
+            );
+            return Err(SessionError::Certificate);
+        }
+        Ok(())
+    };
+    crate::kprintln!(
+        "[stack] tls user_open future = {} bytes",
+        core::mem::size_of_val(&future)
+    );
+    let result = block_on(future);
+
+    match result {
+        Ok(()) => {
+            let elapsed = crate::arch::riscv64::timer::ticks()
+                .saturating_sub(started)
+                .max(1);
+            crate::kprintln!(
+                "tls: user session {id} open tcp={tcp_id} host={host} (TLS 1.3, \
+                 AES-128-GCM-SHA256, server authenticated, {} ms)",
+                elapsed * 10
+            );
+            SESSION_OPENS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            publish_session(id, session);
+            Ok(id)
+        }
+        Err(error) => {
+            SESSION_REFUSALS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            crate::kprintln!("tls: user session host={host} refused ({error:?})");
+            drop(session);
+            release_session(id);
+            Err(error)
+        }
+    }
+}
+
+/// Encrypt `data` and send it as TLS records. Blocks (bounded by the idle
+/// budget) until the record layer accepted every byte.
+///
+/// A short count is `Ok`: the bytes the record layer took are on their way, and
+/// reporting them as an error would make a caller re-send data the peer may
+/// already have.
+pub fn user_write(id: u8, data: &[u8]) -> Result<usize, SessionError> {
+    if data.is_empty() {
+        return Ok(0);
+    }
+    let mut session = take_session(id)?;
+    let result = session_write(id, &mut session, data);
+    put_session(id, session);
+    result
+}
+
+fn session_write(id: u8, session: &mut UserSession, data: &[u8]) -> Result<usize, SessionError> {
+    if session.closed || session.eof {
+        return Err(SessionError::Closed);
+    }
+    let host = session.host.clone();
+    let mut sent = 0usize;
+    let future = async {
+        let conn = session.conn.as_mut().ok_or(SessionError::Closed)?;
+        while sent < data.len() {
+            match conn.write(&data[sent..]).await {
+                Ok(0) => return Err(SessionError::Closed),
+                Ok(n) => sent += n,
+                Err(error) => return Err(map_record_error(&error)),
+            }
+        }
+        conn.flush().await.map_err(|error| map_record_error(&error))
+    };
+    crate::kprintln!(
+        "[stack] tls write future = {} bytes",
+        core::mem::size_of_val(&future)
+    );
+    let outcome = block_on(future);
+
+    match outcome {
+        Ok(()) => {
+            SESSION_BYTES_OUT.fetch_add(sent as u64, core::sync::atomic::Ordering::Relaxed);
+            Ok(sent)
+        }
+        Err(error) if sent > 0 => {
+            crate::kprintln!("tls: session {id} write stopped after {sent} bytes ({error:?})");
+            SESSION_BYTES_OUT.fetch_add(sent as u64, core::sync::atomic::Ordering::Relaxed);
+            Ok(sent)
+        }
+        Err(error) => {
+            crate::kprintln!("tls: session {id} write failed host={host} ({error:?})");
+            Err(error)
+        }
+    }
+}
+
+/// Decrypt application data into `out`. Blocks (bounded by the idle budget)
+/// until at least one byte is available; returns `Ok(0)` at end-of-stream —
+/// a `close_notify` from the peer, or the stream ending.
+pub fn user_read(id: u8, out: &mut [u8]) -> Result<usize, SessionError> {
+    if out.is_empty() {
+        return Ok(0);
+    }
+    let mut session = take_session(id)?;
+    let result = session_read(id, &mut session, out);
+    put_session(id, session);
+    result
+}
+
+fn session_read(id: u8, session: &mut UserSession, out: &mut [u8]) -> Result<usize, SessionError> {
+    // Buffered plaintext first: a second, smaller read must not block and must
+    // not discard the rest of the record.
+    if session.window_at < session.window_len {
+        let available = &session.window[session.window_at..session.window_len];
+        let take = available.len().min(out.len());
+        out[..take].copy_from_slice(&available[..take]);
+        session.window_at += take;
+        SESSION_BYTES_IN.fetch_add(take as u64, core::sync::atomic::Ordering::Relaxed);
+        return Ok(take);
+    }
+    if session.eof {
+        return Ok(0);
+    }
+
+    // One blocking record. `embedded-tls` returns at most one decrypted record
+    // per `read`, and the window is a full record wide, so nothing is lost.
+    let UserSession {
+        conn,
+        window,
+        window_at,
+        window_len,
+        eof,
+        host,
+        ..
+    } = session;
+    let host = host.as_str();
+    let conn = conn.as_mut().ok_or(SessionError::Closed)?;
+    let future = conn.read(&mut window[..]);
+    crate::kprintln!(
+        "[stack] tls read future = {} bytes",
+        core::mem::size_of_val(&future)
+    );
+    match block_on(future) {
+        Ok(0) => {
+            *eof = true;
+            Ok(0)
+        }
+        Ok(n) => {
+            *window_at = 0;
+            *window_len = n;
+            let take = n.min(out.len());
+            out[..take].copy_from_slice(&window[..take]);
+            *window_at = take;
+            SESSION_BYTES_IN.fetch_add(take as u64, core::sync::atomic::Ordering::Relaxed);
+            Ok(take)
+        }
+        // A `close_notify` is the protocol's end-of-stream: clean EOF, not an
+        // error. (`embedded-tls` reports it as an error because its own read
+        // loop has no other way to say "the peer is done".)
+        Err(TlsError::ConnectionClosed) => {
+            crate::kprintln!("tls: session {id} peer sent close_notify (clean end of stream)");
+            *eof = true;
+            *window_at = 0;
+            *window_len = 0;
+            Ok(0)
+        }
+        Err(error) => {
+            let mapped = map_record_error(&error);
+            crate::kprintln!("tls: session {id} read failed host={host} ({error:?})");
+            Err(mapped)
+        }
+    }
+}
+
+/// Whether a session has anything to report to `poll(2)` right now.
+///
+/// `readable` is deliberately "plaintext buffered **or** the socket has bytes":
+/// a socket-level byte may be the first half of a record, and answering "not
+/// readable" until a whole record arrived would make a `poll`-then-`read` loop
+/// sleep through the only wakeup it gets. The price is that a `tls_read` after
+/// `POLLIN` may still wait for the rest of the record — bounded by the idle
+/// budget — and that is stated in the ABI document.
+pub fn user_ready(id: u8) -> Option<SessionReady> {
+    let mut table = USER_SESSIONS.lock();
+    let slot = table.get_mut(id as usize)?;
+    if !slot.used {
+        return None;
+    }
+    match slot.session.as_ref() {
+        Some(session) => Some(SessionReady {
+            readable: session.window_at < session.window_len
+                || tcp::readable_id(session.tcp)
+                || session.eof,
+            writable: !session.closed && !session.eof && !tcp::reset_id_state(session.tcp),
+            eof: session.eof,
+        }),
+        // A call is in flight and holds the payload. Nothing about the record
+        // layer is knowable without waiting for it, so report the conservative
+        // answer: not readable, writable. The caller polls again when the
+        // in-flight call returns.
+        None => Some(SessionReady {
+            readable: false,
+            writable: true,
+            eof: false,
+        }),
+    }
+}
+
+/// Send `close_notify` and stop writing, keeping the session (and its
+/// descriptor) alive: later reads return 0, later writes are refused.
+///
+/// The connection is *consumed* by `embedded-tls`'s `close()`, so a session that
+/// was shut down has no connection left — which is exactly the "both directions
+/// close" contract the socket `shutdown` already documents.
+pub fn user_shutdown(id: u8) -> Result<(), SessionError> {
+    let mut session = take_session(id)?;
+    let result = session_shutdown(id, &mut session);
+    put_session(id, session);
+    result
+}
+
+fn session_shutdown(id: u8, session: &mut UserSession) -> Result<(), SessionError> {
+    if session.closed {
+        return Ok(());
+    }
+    session.closed = true;
+    session.window_at = 0;
+    session.window_len = 0;
+    if session.eof {
+        return Ok(());
+    }
+    session.eof = true;
+    if let Some(conn) = session.conn.take() {
+        match block_on(conn.close()) {
+            Ok(transport) => drop(transport),
+            // The alert could not be delivered — the peer is gone or the socket
+            // is dead. The session is still closed locally; say so on serial
+            // rather than pretend the peer saw a clean shutdown.
+            Err((transport, error)) => {
+                drop(transport);
+                crate::kprintln!(
+                    "tls: session {id} close_notify could not be delivered ({error:?})"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Release a session: free its buffers and its id. `notify` sends the
+/// `close_notify` first (what `tls_close` does); without it the release is
+/// immediate (what `close(2)` and process teardown do, because neither may block
+/// on a peer).
+pub fn user_close(id: u8, notify: bool) -> bool {
+    let Ok(mut session) = take_session(id) else {
+        // Either the id is free (nothing to do) or a call is in flight: free the
+        // slot anyway. `put_session` sees the released slot and drops the
+        // payload when the call returns.
+        let existed = session_live(id);
+        release_session(id);
+        return existed;
+    };
+    if notify {
+        let _ = session_shutdown(id, &mut session);
+    }
+    drop(session);
+    release_session(id);
+    SESSION_CLOSES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// Map an `embedded-tls` record error onto the ABI-facing [`SessionError`].
+fn map_record_error(error: &TlsError) -> SessionError {
+    match error {
+        TlsError::Io(kind) => match kind {
+            ErrorKind::TimedOut => SessionError::Timeout,
+            ErrorKind::ConnectionReset | ErrorKind::BrokenPipe | ErrorKind::ConnectionAborted => {
+                SessionError::Reset
+            }
+            _ => SessionError::Io,
+        },
+        // A stream that ends without `close_notify` is reported as `IoError`:
+        // the truncation case RFC 8446 §6.1 says must not look like EOF.
+        TlsError::IoError => SessionError::Reset,
+        TlsError::InvalidCertificate => SessionError::Certificate,
+        TlsError::MissingHandshake => SessionError::Closed,
+        TlsError::ConnectionClosed => SessionError::Closed,
+        _ => SessionError::Protocol,
     }
 }
 

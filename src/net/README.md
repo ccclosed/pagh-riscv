@@ -13,7 +13,10 @@
 | `dhcp.rs` | DHCP-клиент: DISCOVER/OFFER/REQUEST/ACK, опции 1/3/6/50/51/53/54 |
 | `dns.rs` | stub-резолвер: A-запрос по UDP, разбор ответа с компрессией имён |
 | `tcp.rs` | TCP: один active-open клиент для HTTP/1.0, пассивный open (`bind`/`listen`/`accept`) с очередью на 4, таблица из 8 соединений (seq/ack, 4 KiB приёма, FIN); `recv_nonblocking[_id]` — один `poll()` и `WouldBlock`, `peer[_id]` — адрес для `recvfrom`/`accept` |
-| `selftest.rs` | 11 проверок для `selftest`: контрольные суммы, round-trip всех заголовков, разбор DHCP/DNS из фиксированных байт, TCP-сегмент |
+| `tls.rs` | TLS 1.3 клиент: fail-closed проверка сервера, `KernelRng`/`KernelVerifier`/`KernelProvider`, транспорт `TlsTransport` поверх `tcp.rs`, `block_on`, one-shot `https_get[_at]` **и** userland-сессии (`user_open`/`user_write`/`user_read`/`user_ready`/`user_shutdown`/`user_close`) для syscall'ов 1100–1103 |
+| `tls_chain.rs`, `tls_auth.rs`, `tls_verify.rs`, `x509.rs`, `hostname.rs`, `ca_bundle.rs` | решение «доверять ли серверу»: сборка цепочки, подписи, SAN по RFC 6125, закоммиченные корни |
+| `http.rs` | чистые `build_get_request` / `parse_http_head` + инкрементальный декодер `chunked` |
+| `selftest.rs` | 12 проверок для `selftest`: контрольные суммы, round-trip всех заголовков, разбор DHCP/DNS из фиксированных байт, TCP-сегмент, fail-closed поверхность таблицы TLS-сессий |
 
 Драйвер — `src/drivers/virtio_net.rs`; его контракт с этим модулем: `mac()`,
 `send(frame)`, `recv(out)` и одна строка лога при загрузке.
@@ -114,12 +117,15 @@ out-of-order reassembly, congestion control, keepalive, TIME_WAIT и half-close
 
 ## Как проверяется
 
-- `selftest` → `SELFTEST net-* 11/11`: контрольные суммы (вектор RFC 1071),
+- `selftest` → `SELFTEST net-* 12/12`: контрольные суммы (вектор RFC 1071),
   Ethernet/IPv4/UDP/ICMP/ARP/TCP round-trip + отказ на испорченном байте,
   DHCP-парсер на «серверном» сообщении, DNS-ответ с compression pointer,
   текст/подсети. `net-udp` дополнительно биндит порт, заливает в
   `handle_udp` на одну дейтаграмму больше глубины очереди и проверяет FIFO с
-  вытеснением старшей. Без NIC — набор работает на любой машине.
+  вытеснением старшей. `net-tls-session-gate` берёт свободный id таблицы
+  userland-TLS-сессий и требует отказа от всех её точек входа
+  (`user_read`/`user_write`/`user_shutdown`/`user_ready`/`user_close`) — без
+  сервера и без единой сессии. Без NIC — набор работает на любой машине.
 - Живой прогон: `run.sh` (сеть включена по умолчанию) → в логе
   `virtio-net: virtio-net0 … MAC …` и `net         DHCP ip 10.0.2.15/24 …`;
   `ping 10.0.2.2` → 4/4 reply; `dns example.com`; `http` к серверу на хосте

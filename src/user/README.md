@@ -105,6 +105,7 @@ UDP-порт остаются у родителя; чтение/запись/`po
 | 1, 2 | консольный вывод (один UART/экран) |
 | 3..15 | `Arc<dyn VfsNode>` + offset + flags `openat`; каталог хранит снимок детей |
 | 3..15 | один слот может быть `FdEntry::Socket { id, connected }`: TCP-сокет, `read`/`write`/`close` маршрутизируются в `net::tcp` |
+| 3..15 | `FdEntry::Tls { session, tcp }`: тот же fd после `tls_connect` (1100). `read`/`write`/`send`/`recv`/`poll`/`shutdown` работают с **открытым текстом**, запись/чтение шифрует `net::tls`; `close` освобождает сессию без `close_notify`, `tls_close` (1103) — с ним |
 
 `close` освобождает узел и отпускает pipe-ссылку; закрыть 0/1/2 можно, и до
 конца процесса это `-EBADF`. Лок таблицы **не держится** через VFS/block: `Arc`
@@ -113,6 +114,34 @@ UDP-порт остаются у родителя; чтение/запись/`po
 драйвер опрашивает устройство и может уйти в `wfi`. `release_fds` собирает
 pipe-ссылки и признак сокета под локом, а отпускает их/закрывает TCP уже без
 него (закрытие сокета шлёт FIN и может опрашивать NIC).
+
+### TLS-дескрипторы (`tls_connect` 1100 — `tls_close` 1103)
+
+`tls_connect(tcp_fd, host, host_len, flags)` берёт **уже подключённый** потоковый
+сокет, выполняет на нём рукопожатие TLS 1.3 через тот же `net::tls`, что и
+shell'овый `https` (цепочка до закоммиченного CA-бандла, SAN по `host`, clock
+gate, `CertificateVerify` + счётчик `VERIFIED_HANDSHAKES` как вторая проверка), и
+заменяет запись fd на `FdEntry::Tls { session, tcp }`. Разрешение имени и
+`connect` — дело программы: в ABI нет ни DNS, ни `getaddrinfo` (в libpagh есть
+`dns::resolve` поверх UDP). `flags` обязан быть 0 — **нет флага, отключающего
+проверку**, и это записано в контракте, а не только в коде.
+
+Сессия живёт в `net::tls` (`MAX_USER_SESSIONS = 4`, у каждой два record-буфера
+по 16640 B и окно открытого текста 16 KiB на куче, ~50 KiB). Блокирующая
+операция **вынимает** сессию из таблицы (спинлок нельзя держать через
+`block_on`, который спит на тике) и возвращает обратно; слот при этом остаётся
+занятым, поэтому вторая одновременная операция над той же сессией получает
+`-EAGAIN`, а не второй читатель одного потока записей. `fork`/`dup` сессию не
+копируют — в копии `FdEntry::Unsupported` (`-ENOTSUP`).
+
+Провалившееся рукопожатие закрывает соединение (RFC 8446 §6.1): сокет
+освобождается, fd остаётся «надгробием» (`-ENOTSUP` на I/O, `close` освобождает).
+`tls_read` при `close_notify` возвращает 0, а при обрыве TCP **без** него —
+`-ECONNRESET`: обрезанный поток не должен выглядеть как дочитанный.
+
+Энтропия для userland — `getrandom(278)`: тот же пул `src/entropy.rs`, что и у
+TLS, до 64 KiB за вызов (больше — короткое чтение), `flags != 0` → `-EINVAL`,
+непросеянный пул → `-EAGAIN` без единого записанного байта.
 
 ## User heap (`brk`)
 
@@ -579,10 +608,16 @@ root: тег — пространство имён TLB, а не обещание
   фьютексы, `join`/`waitid` и приоритеты отсутствуют; futex-таблица 32/16;
   `exit_group` снимает `Ready` и `Blocked`, но не может прервать поток, который
   в этот момент исполняется (на одном hart его нет — это текущий syscall);
+- TLS-сессий одновременно ≤ 4 (`MAX_USER_SESSIONS`), каждая ~50 KiB кучи до
+  `tls_close`/`close`; повторный `tls_connect` на уже TLS-дескрипторе —
+  `-EISCONN`, параллельный вызов из другого потока — `-EAGAIN`; своего
+  TLS-*сервера* нет (только клиент), а `tls_get`-обёртки нет — программа сама
+  решает, что слать;
 - один **активный** TCP-клиент, один listener и таблица из восьми соединений
   (`AF_INET`/`SOCK_STREAM`, IPv4-литерал); backlog ≤ 4, принятые соединения —
   отдельные `FdEntry::TcpConn`; UDP — до 8 bind, 4 дейтаграммы на порт,
-  payload ≤ 1024 B, один интерфейс; без UDP-`connect`, IPv6, DNS и TLS.
+  payload ≤ 1024 B, один интерфейс; без UDP-`connect`, IPv6 и DNS (DNS — в
+  libpagh поверх UDP). TLS есть, но только как клиент на готовом TCP-сокете.
   TCP `recv` неблокирующий, `accept` без `SOCK_NONBLOCK` ждёт до 30 s; UDP
   `recvfrom` блокируется (бюджет ~10 s) или `-EAGAIN` с `MSG_DONTWAIT`;
   `shutdown` без half-close; ребёнок после `fork`/`dup` видит сокет как
@@ -595,7 +630,9 @@ run demo         # hello: write + sched_yield + exit 42
 run demo a b     # то же: у фикстуры argc = 1, лишние слова игнорируются
 run fault        # getpid, затем load с адреса 0 -> killed: load page fault; машина жива
 run spin         # 0.2 s в U-mode (~20 timer interrupts из U), getpid, exit 7
-selftest         # SELFTEST user-*: 13/13 с /mnt (11/13 + 2 SKIP без диска), ledger одинаковый
+selftest         # SELFTEST user-*: 14/14 с /mnt (12/14 + 2 SKIP без диска), ledger одинаковый
+                 # user-tls-abi: getrandom(278) + fail-closed матрица 1100..1103
+                 #   (маркеры "tls: getrandom ok" / "tls: abi ok" / "tls: ok")
                  # user-stack-grows: 160 KiB цепочка -> "stack: deep recursion ok"
                  # user-stack-cap:   1.2 MiB цепочка -> killed: store page fault (stval 0x3fef_ffc8)
                  # user-stack-fork:  fork на выросшем стеке -> "stack: fork child/parent ok"

@@ -137,6 +137,15 @@ DISK_EXPECTED_FRESH = [
     "size:",
     "SELFTEST SUMMARY: 7/7 passed",
     "SELFTEST ext2 summary: 11/11 passed",
+    # The entropy + TLS surface, exercised in-guest by `userland/tls.elf`:
+    # `getrandom(278)` and the fail-closed answer of every TLS syscall
+    # (1100-1103) on a descriptor that is not a session, with the PMM/heap
+    # ledger unchanged -- no server, no extra boot mode. The net suite's
+    # session-table gate is the kernel-side view of the same table.
+    "SELFTEST user-tls-abi PASS",
+    "SELFTEST SUMMARY (user): 14/14 passed",
+    "SELFTEST net-tls-session-gate PASS",
+    "SELFTEST SUMMARY (net): 12/12 passed",
     "halt: powering off",
 ]
 # ── the network mode (M7) ─────────────────────────────────────────────────
@@ -161,6 +170,8 @@ DISK_EXPECTED_EXISTING = [
     "pagh:rv64> cat /mnt/ci/marker.txt",
     "hello-from-ci",
     "SELFTEST ext2 summary: 11/11 passed",
+    "SELFTEST user-tls-abi PASS",
+    "SELFTEST SUMMARY (user): 14/14 passed",
     "halt: powering off",
 ]
 

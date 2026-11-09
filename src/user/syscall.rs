@@ -142,6 +142,18 @@ const SYS_RECVFROM: usize = 207;
 const SYS_SETSOCKOPT: usize = 208;
 const SYS_GETSOCKOPT: usize = 209;
 const SYS_SHUTDOWN: usize = 210;
+// `getrandom(278)` keeps its Linux/asm-generic number: the signature and the
+// "may return a short read" contract are the same, and there is no reason to
+// invent a private number for a call every runtime already knows.
+const SYS_GETRANDOM: usize = 278;
+// The userland TLS family. TLS has no Linux syscall to borrow a number from, so
+// these are pagh-native extensions outside the asm-generic table (like
+// `fork = 1000`), in a block of their own so a reader can see they are ours.
+// See `docs/abi.md` §2 for the signatures and `net::tls` for the implementation.
+const SYS_TLS_CONNECT: usize = 1100;
+const SYS_TLS_WRITE: usize = 1101;
+const SYS_TLS_READ: usize = 1102;
+const SYS_TLS_CLOSE: usize = 1103;
 
 // ─── errno values (negated in `a0`) ────────────────────────────────────────
 const ENOENT: isize = -2;
@@ -163,6 +175,11 @@ const EADDRNOTAVAIL: isize = -99;
 const EDESTADDRREQ: isize = -89;
 const ENAMETOOLONG: isize = -36;
 const EOVERFLOW: isize = -75;
+const EPROTO: isize = -71;
+/// The server certificate was rejected (chain, SAN, clock or signature). Linux's
+/// "key was rejected by service"; chosen so a caller can tell a trust refusal
+/// from a broken handshake.
+const EKEYREJECTED: isize = -129;
 const ENOSYS: isize = -38;
 const ENOTEMPTY: isize = -39;
 const ENOTSUP: isize = -95;
@@ -232,6 +249,12 @@ const PATH_CAPACITY: usize = 256;
 /// Bytes copied from/to a user page per chunk. Small enough for the trap stack,
 /// large enough that the UART, not the copy, is the cost.
 const COPY_CHUNK: usize = 256;
+
+/// Most bytes one `getrandom` call returns. A larger request is answered with
+/// this many bytes and a short count — Linux's contract for `getrandom` beyond
+/// 256 bytes — which also keeps the user-range walk (one step per page) bounded
+/// by a constant instead of by the caller's `len`.
+const MAX_GETRANDOM: usize = 64 * 1024;
 
 /// Counters the selftest reads as evidence that the ABI actually ran.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -326,6 +349,18 @@ pub struct Stats {
     pub waits: u64,
     /// `getppid` calls.
     pub getppids: u64,
+    /// `tls_connect` calls that completed a handshake (1100).
+    pub tls_connects: u64,
+    /// `tls_read` calls that returned plaintext (1102).
+    pub tls_reads: u64,
+    /// `tls_write` calls that handed plaintext to the record layer (1101).
+    pub tls_writes: u64,
+    /// `tls_close` calls that released a session (1103).
+    pub tls_closes: u64,
+    /// `getrandom` calls that filled a user buffer.
+    pub getrandoms: u64,
+    /// Bytes handed to userland by `getrandom`.
+    pub random_bytes: u64,
     /// Unknown syscall numbers answered with `-ENOSYS`.
     pub unknown: u64,
     /// Bad user buffers answered with `-EFAULT`.
@@ -377,6 +412,12 @@ static FORKS: AtomicU64 = AtomicU64::new(0);
 static EXECS: AtomicU64 = AtomicU64::new(0);
 static WAITS: AtomicU64 = AtomicU64::new(0);
 static GETPPIDS: AtomicU64 = AtomicU64::new(0);
+static TLS_CONNECTS: AtomicU64 = AtomicU64::new(0);
+static TLS_READS: AtomicU64 = AtomicU64::new(0);
+static TLS_WRITES: AtomicU64 = AtomicU64::new(0);
+static TLS_CLOSES: AtomicU64 = AtomicU64::new(0);
+static GETRANDOMS: AtomicU64 = AtomicU64::new(0);
+static RANDOM_BYTES: AtomicU64 = AtomicU64::new(0);
 static UNKNOWN: AtomicU64 = AtomicU64::new(0);
 static FAULTS: AtomicU64 = AtomicU64::new(0);
 
@@ -429,6 +470,12 @@ pub fn stats() -> Stats {
         execs: EXECS.load(Ordering::Relaxed),
         waits: WAITS.load(Ordering::Relaxed),
         getppids: GETPPIDS.load(Ordering::Relaxed),
+        tls_connects: TLS_CONNECTS.load(Ordering::Relaxed),
+        tls_reads: TLS_READS.load(Ordering::Relaxed),
+        tls_writes: TLS_WRITES.load(Ordering::Relaxed),
+        tls_closes: TLS_CLOSES.load(Ordering::Relaxed),
+        getrandoms: GETRANDOMS.load(Ordering::Relaxed),
+        random_bytes: RANDOM_BYTES.load(Ordering::Relaxed),
         unknown: UNKNOWN.load(Ordering::Relaxed),
         faults: FAULTS.load(Ordering::Relaxed),
     }
@@ -630,6 +677,15 @@ enum FdEntry {
     TcpConn {
         id: u8,
     },
+    /// A descriptor with a TLS session on it (`tls_connect`, 1100). `session`
+    /// names a slot in `net::tls`'s userland session table and `tcp` the TCP
+    /// connection the session encrypts onto; the session owns the connection,
+    /// and releasing the descriptor releases both. Reads and writes on this
+    /// descriptor are plaintext: the record layer is below the syscall ABI.
+    Tls {
+        session: u8,
+        tcp: u8,
+    },
     /// A userland UDP socket. `port == 0` is unbound; `bind` sets it, and the
     /// first `sendto` auto-binds an ephemeral port. `nonblocking` is the
     /// `SOCK_NONBLOCK` bit from `socket()`, so `recvfrom` can answer `-EAGAIN`
@@ -659,10 +715,13 @@ impl Clone for FdEntry {
             // A dup/fork of a socket would be a second owner of one
             // connection or binding; without a reference count, closing either
             // copy would tear the shared state down under the other. The
-            // child/copy gets the same tombstone UDP has always used.
+            // child/copy gets the same tombstone UDP has always used. A TLS
+            // session is in the same position, only more so: it owns heap
+            // buffers and a key schedule.
             FdEntry::Socket { .. }
             | FdEntry::Listener { .. }
             | FdEntry::TcpConn { .. }
+            | FdEntry::Tls { .. }
             | FdEntry::UdpSocket { .. } => FdEntry::Unsupported,
             FdEntry::Unsupported => FdEntry::Unsupported,
         }
@@ -723,6 +782,8 @@ pub(crate) fn reset_fds(slot: usize) {
     let mut conn_count = 0usize;
     let mut bound_ports = [0u16; MAX_FDS];
     let mut bound_count = 0usize;
+    let mut tls_sessions = [0u8; MAX_FDS];
+    let mut tls_count = 0usize;
     let mut had_listener = false;
     {
         let mut tables = FDS.lock();
@@ -749,6 +810,19 @@ pub(crate) fn reset_fds(slot: usize) {
                         conn_count += 1;
                     }
                 }
+                // A TLS session owns its TCP connection: the session goes first
+                // (its buffers are freed there and no alert is attempted — this
+                // is teardown, not a graceful close), then the connection.
+                Some(FdEntry::Tls { session, tcp }) => {
+                    if tls_count < tls_sessions.len() {
+                        tls_sessions[tls_count] = *session;
+                        tls_count += 1;
+                    }
+                    if conn_count < conn_ids.len() {
+                        conn_ids[conn_count] = *tcp;
+                        conn_count += 1;
+                    }
+                }
                 Some(FdEntry::UdpSocket { port, .. }) if *port != 0 => {
                     if udp_count < udp_ports.len() {
                         udp_ports[udp_count] = *port;
@@ -759,6 +833,9 @@ pub(crate) fn reset_fds(slot: usize) {
             }
         }
         tables.rows[slot] = FdTable::console();
+    }
+    for &session in tls_sessions[..tls_count].iter() {
+        crate::net::tls::user_close(session, false);
     }
     for &port in udp_ports[..udp_count].iter() {
         crate::net::udp_unbind(port);
@@ -791,6 +868,8 @@ pub(crate) fn release_fds(slot: usize) {
     let mut conn_count = 0usize;
     let mut bound_ports = [0u16; MAX_FDS];
     let mut bound_count = 0usize;
+    let mut tls_sessions = [0u8; MAX_FDS];
+    let mut tls_count = 0usize;
     let mut had_listener = false;
     {
         let mut tables = FDS.lock();
@@ -826,6 +905,16 @@ pub(crate) fn release_fds(slot: usize) {
                         conn_count += 1;
                     }
                 }
+                Some(FdEntry::Tls { session, tcp }) => {
+                    if tls_count < tls_sessions.len() {
+                        tls_sessions[tls_count] = session;
+                        tls_count += 1;
+                    }
+                    if conn_count < conn_ids.len() {
+                        conn_ids[conn_count] = tcp;
+                        conn_count += 1;
+                    }
+                }
                 Some(FdEntry::UdpSocket { port, .. }) if port != 0 => {
                     if udp_count < udp_ports.len() {
                         udp_ports[udp_count] = port;
@@ -838,6 +927,11 @@ pub(crate) fn release_fds(slot: usize) {
     }
     for &(id, read) in pipes[..pipe_count].iter() {
         pipe_release(id, read);
+    }
+    // Sessions before connections: the session owns the connection's TLS state
+    // and its record buffers, and releasing it does not touch the socket.
+    for &session in tls_sessions[..tls_count].iter() {
+        crate::net::tls::user_close(session, false);
     }
     for &port in udp_ports[..udp_count].iter() {
         crate::net::udp_unbind(port);
@@ -875,6 +969,7 @@ pub(crate) fn fork_fds(parent: usize, child: usize) -> bool {
             Some(FdEntry::Socket { .. })
             | Some(FdEntry::Listener { .. })
             | Some(FdEntry::TcpConn { .. })
+            | Some(FdEntry::Tls { .. })
             | Some(FdEntry::UdpSocket { .. }) => Some(FdEntry::Unsupported),
             Some(entry) => Some(entry.clone()),
             None => None,
@@ -911,6 +1006,12 @@ enum OpenFd {
     },
     TcpConn {
         id: u8,
+    },
+    /// A descriptor with a TLS session (`tls_connect`, 1100): `session` names
+    /// the session in `net::tls`. The TCP connection underneath it is owned by
+    /// the session, so nothing above this layer needs its id.
+    Tls {
+        session: u8,
     },
     UdpSocket {
         port: u16,
@@ -951,6 +1052,7 @@ fn lookup(fd: usize) -> Result<OpenFd, isize> {
                 nonblocking: *nonblocking,
             }),
             Some(FdEntry::TcpConn { id }) => Ok(OpenFd::TcpConn { id: *id }),
+            Some(FdEntry::Tls { session, .. }) => Ok(OpenFd::Tls { session: *session }),
             Some(FdEntry::UdpSocket { port, nonblocking }) => Ok(OpenFd::UdpSocket {
                 port: *port,
                 nonblocking: *nonblocking,
@@ -992,6 +1094,13 @@ fn drop_entry(entry: FdEntry) {
         FdEntry::Listener { .. } => with_network_interrupts(crate::net::tcp::close_listener),
         FdEntry::TcpConn { id } => {
             with_network_interrupts(|| crate::net::tcp::close_id(id));
+        }
+        // `close(2)` on a TLS descriptor releases the session without a
+        // `close_notify`: this path is also process teardown, and neither may
+        // block on a peer. `tls_close(1103)` is the graceful close.
+        FdEntry::Tls { session, tcp } => {
+            crate::net::tls::user_close(session, false);
+            with_network_interrupts(|| crate::net::tcp::close_id(tcp));
         }
         FdEntry::UdpSocket { port, .. } => {
             if port != 0 {
@@ -1139,12 +1248,6 @@ fn install_tcp_conn(id: u8) -> Result<usize, isize> {
         Err(ENOSPC)
     })
     .unwrap_or(Err(EBADF))
-}
-
-/// Remove a descriptor from the table and return it, so its resources (an
-/// `Arc`, a socket's connection) are handled without the table lock held.
-fn take_entry(fd: usize) -> Option<FdEntry> {
-    with_fds(|table| table.slots.get_mut(fd).and_then(|slot| slot.take())).flatten()
 }
 
 /// Install a node in the first free slot at or above 3.
@@ -1300,9 +1403,17 @@ pub fn dispatch(frame: &mut TrapFrame) {
         SYS_SETSOCKOPT => setsockopt(frame.a0, frame.a1, frame.a2, frame.a3, frame.a4),
         SYS_GETSOCKOPT => getsockopt(frame.a0, frame.a1, frame.a2, frame.a3, frame.a4),
         SYS_SHUTDOWN => shutdown(frame.a0, frame.a1),
+        // pagh-native TLS sessions: the handshake is the kernel's (fail-closed,
+        // same verifier as the shell's `https`), the I/O is plaintext on the
+        // same descriptor.
+        SYS_TLS_CONNECT => tls_connect(frame.a0, frame.a1, frame.a2, frame.a3),
+        SYS_TLS_WRITE => tls_write(frame.a0, frame.a1, frame.a2),
+        SYS_TLS_READ => tls_read(frame.a0, frame.a1, frame.a2),
+        SYS_TLS_CLOSE => tls_close(frame.a0),
         SYS_CLOCK_GETTIME => clock_gettime(frame.a0, frame.a1),
         SYS_NANOSLEEP => nanosleep(frame.a0, frame.a1),
         SYS_UNAME => uname(frame.a0),
+        SYS_GETRANDOM => getrandom(frame.a0, frame.a1, frame.a2),
         SYS_BRK => match crate::user::brk(frame.a0) {
             Ok(current) => {
                 BRKS.fetch_add(1, Ordering::Relaxed);
@@ -1648,6 +1759,8 @@ fn read(fd: usize, buf: usize, len: usize) -> isize {
             ..
         })
         | Ok(OpenFd::TcpConn { id }) => read_socket(buf, len, id),
+        // A TLS descriptor reads decrypted plaintext (see `tls_read`).
+        Ok(OpenFd::Tls { session, .. }) => tls_read_session(session, buf, len),
         Ok(OpenFd::Socket { .. }) | Ok(OpenFd::Listener { .. }) => ENOTCONN,
         Ok(OpenFd::File {
             node,
@@ -1740,6 +1853,9 @@ fn write(fd: usize, buf: usize, len: usize) -> isize {
             ..
         })
         | Ok(OpenFd::TcpConn { id }) => write_socket(buf, len, id),
+        // A TLS descriptor writes plaintext: the record layer is inside
+        // `net::tls`, below this ABI.
+        Ok(OpenFd::Tls { session, .. }) => tls_write_session(session, buf, len),
         Ok(OpenFd::Socket { .. }) | Ok(OpenFd::Listener { .. }) => ENOTCONN,
         Ok(OpenFd::File {
             node,
@@ -2134,6 +2250,27 @@ fn poll_one(fd: usize, events: i16) -> i16 {
             revents
         }
         Ok(OpenFd::Unsupported) => POLLNVAL,
+        // A TLS session is readable when plaintext is buffered *or* the socket
+        // has bytes — the second can be a partial record, so a `read` after
+        // `POLLIN` may still wait for the rest of it (bounded by the session's
+        // idle budget; the exact rule is in `net::tls::user_ready` and in the
+        // ABI document). `POLLHUP` is reported once the peer closed.
+        Ok(OpenFd::Tls { session, .. }) => {
+            let Some(ready) = crate::net::tls::user_ready(session) else {
+                return POLLNVAL;
+            };
+            let mut revents = 0;
+            if events & POLLIN != 0 && ready.readable {
+                revents |= POLLIN;
+            }
+            if events & POLLOUT != 0 && ready.writable {
+                revents |= POLLOUT;
+            }
+            if ready.eof {
+                revents |= POLLHUP;
+            }
+            revents
+        }
         Ok(OpenFd::Listener { .. }) => {
             if events & POLLIN != 0 && crate::net::tcp::accept_pending() {
                 POLLIN
@@ -2881,6 +3018,17 @@ fn send_socket(
         }
         Ok(OpenFd::Socket { .. }) | Ok(OpenFd::Listener { .. }) => ENOTCONN,
         Ok(OpenFd::Unsupported) => ENOTSUP,
+        // `send` on a TLS descriptor encrypts; a destination is refused for the
+        // same reason `recv` refuses a source: the session already has a peer.
+        Ok(OpenFd::Tls { session, .. }) => {
+            if flags != 0 {
+                return EINVAL;
+            }
+            if dest != 0 {
+                return ENOTSUP;
+            }
+            tls_write_session(session, buf, len)
+        }
         Ok(_) => ENOTSOCK,
         Err(error) => error,
     }
@@ -3011,6 +3159,19 @@ fn recv_socket(
         }
         Ok(OpenFd::Socket { .. }) | Ok(OpenFd::Listener { .. }) => ENOTCONN,
         Ok(OpenFd::Unsupported) => ENOTSUP,
+        // `recv` on a TLS descriptor decrypts one buffer of plaintext. The
+        // optional source address is refused rather than filled with a guess:
+        // `tls_read` reports bytes, not peers, and inventing one would be worse
+        // than saying no.
+        Ok(OpenFd::Tls { session, .. }) => {
+            if flags != 0 {
+                return EINVAL;
+            }
+            if src != 0 {
+                return ENOTSUP;
+            }
+            tls_read_session(session, buf, len)
+        }
         Ok(_) => ENOTSOCK,
         Err(error) => error,
     }
@@ -3166,6 +3327,7 @@ fn write_socket(buf: usize, len: usize, id: u8) -> isize {
         }
     }
     if total > 0 {
+        TLS_WRITES.fetch_add(1, Ordering::Relaxed);
         SOCKET_SENDS.fetch_add(1, Ordering::Relaxed);
     }
     total as isize
@@ -3189,6 +3351,19 @@ fn shutdown(fd: usize, how: usize) -> isize {
             ..
         })
         | Ok(OpenFd::TcpConn { id }) => id,
+        // A TLS session shuts down by sending `close_notify`: both directions
+        // close, the descriptor stays open, a later `read` returns 0 and a later
+        // `write` is `-EPIPE` — the same contract the socket path documents, with
+        // the alert as the TLS half of it.
+        Ok(OpenFd::Tls { session, .. }) => {
+            return match with_network_interrupts(|| crate::net::tls::user_shutdown(session)) {
+                Ok(()) => {
+                    SHUTDOWNS.fetch_add(1, Ordering::Relaxed);
+                    0
+                }
+                Err(error) => tls_errno(error),
+            };
+        }
         Ok(OpenFd::Socket { .. }) | Ok(OpenFd::Listener { .. }) => return ENOTCONN,
         Ok(OpenFd::UdpSocket { .. }) => return ENOTCONN,
         Ok(OpenFd::Unsupported) => return ENOTSUP,
@@ -3211,6 +3386,7 @@ fn setsockopt(fd: usize, level: usize, name: usize, value: usize, length: usize)
         Ok(OpenFd::Socket { .. })
         | Ok(OpenFd::Listener { .. })
         | Ok(OpenFd::TcpConn { .. })
+        | Ok(OpenFd::Tls { .. })
         | Ok(OpenFd::UdpSocket { .. }) => {}
         Ok(OpenFd::Unsupported) => return ENOTSUP,
         Ok(_) => return ENOTSOCK,
@@ -3249,9 +3425,10 @@ fn setsockopt(fd: usize, level: usize, name: usize, value: usize, length: usize)
 /// truncated to it, then `optlen` is updated to the bytes written.
 fn getsockopt(fd: usize, level: usize, name: usize, value: usize, length: usize) -> isize {
     let socket_type = match lookup(fd) {
-        Ok(OpenFd::Socket { .. }) | Ok(OpenFd::Listener { .. }) | Ok(OpenFd::TcpConn { .. }) => {
-            SOCK_STREAM
-        }
+        Ok(OpenFd::Socket { .. })
+        | Ok(OpenFd::Listener { .. })
+        | Ok(OpenFd::TcpConn { .. })
+        | Ok(OpenFd::Tls { .. }) => SOCK_STREAM,
         Ok(OpenFd::UdpSocket { .. }) => SOCK_DGRAM,
         Ok(OpenFd::Unsupported) => return ENOTSUP,
         Ok(_) => return ENOTSOCK,
@@ -3286,6 +3463,304 @@ fn getsockopt(fd: usize, level: usize, name: usize, value: usize, length: usize)
     }
     SOCKOPTS.fetch_add(1, Ordering::Relaxed);
     0
+}
+
+// ─── userland TLS (1100–1103) ──────────────────────────────────────────────
+
+/// Longest host name `tls_connect` accepts, including no terminator: a DNS name
+/// is at most 253 bytes and the ABI's own path limit is 255, so one constant
+/// covers both and keeps the copy a stack buffer.
+const TLS_HOST_MAX: usize = 255;
+
+/// Bytes copied from/to a user buffer per `tls_write`/`tls_read` chunk. One page
+/// keeps the trap stack small; a larger request is answered with a short count
+/// and the caller loops, exactly like the socket path's `SOCKET_CHUNK`.
+const TLS_COPY_CHUNK: usize = 4096;
+
+/// Map a session failure onto the ABI's errno set. Exhaustive on purpose: a new
+/// [`crate::net::tls::SessionError`] variant must pick a number here, so the
+/// mapping cannot drift silently.
+///
+/// `NoEntropy` is `-EAGAIN` ("try again later") because that is what Linux's
+/// `getrandom` answers without a seed, and the seed is a boot-time property;
+/// `NoClock` is `-ENOTSUP` because a machine with no RTC cannot do TLS at all
+/// rather than "not yet". `Certificate` is `-EKEYREJECTED` — Linux's "the key
+/// was rejected by service" — so a caller can tell "the server is not who it
+/// claims" from "the handshake broke" (`-EPROTO`).
+fn tls_errno(error: crate::net::tls::SessionError) -> isize {
+    use crate::net::tls::SessionError;
+    match error {
+        SessionError::NoSession => EINVAL,
+        SessionError::Busy => EAGAIN,
+        SessionError::NoSpace => ENOSPC,
+        SessionError::NoEntropy => EAGAIN,
+        SessionError::NoClock => ENOTSUP,
+        SessionError::Handshake | SessionError::Protocol => EPROTO,
+        SessionError::Certificate => EKEYREJECTED,
+        SessionError::Closed => EPIPE,
+        SessionError::Reset => ECONNRESET,
+        SessionError::Timeout => ETIMEDOUT,
+        SessionError::Io => EIO,
+    }
+}
+
+/// `tls_connect(tcp_fd, host, host_len, flags)` — syscall 1100.
+///
+/// Perform the fail-closed TLS 1.3 handshake on the stream socket `tcp_fd`
+/// (a connected client socket or an accepted connection) and turn the
+/// descriptor into a TLS session. `host` is **not** resolved and no connection
+/// is opened: the caller connects the socket first, exactly as it would for
+/// plain TCP, and passes the name the certificate must authorize (SNI + SAN).
+///
+/// What is verified, in order, before a single application byte can move:
+/// the entropy pool has a seed, the RTC gives a wall clock, the certificate
+/// chain reaches the committed CA bundle, the SAN authorizes `host`, and the
+/// handshake's `CertificateVerify` proves possession of the leaf key — plus the
+/// independent check that a certificate was verified during *this* handshake.
+/// There is no flag that relaxes any of it: `flags` must be 0 and anything else
+/// is `-EINVAL`, which is also what keeps a future "insecure" bit from slipping
+/// in without a documented ABI change.
+///
+/// The descriptor must be a **connected stream**: an unconnected socket is
+/// `-ENOTCONN`, a listener `-EISCONN`, a UDP socket `-ENOTSUP`, a non-socket
+/// `-ENOTSOCK`, a bad number `-EBADF`. `host` must be 1..=[`TLS_HOST_MAX`] bytes
+/// with no NUL or control byte (`-EINVAL`), in a user-readable page (`-EFAULT`).
+///
+/// On success the same fd number now carries the session: `read`/`write`/
+/// `send`/`recv`/`poll` treat it as plaintext, `shutdown` sends `close_notify`,
+/// and `tls_close`/`close` release it. On failure RFC 8446 requires the
+/// connection to be abandoned, so the socket is torn down and the descriptor is
+/// left as a tombstone (`-ENOTSUP` for I/O, `close` releases it): close it and
+/// open a new socket to retry.
+fn tls_connect(fd: usize, host: usize, host_len: usize, flags: usize) -> isize {
+    if flags != 0 {
+        return EINVAL;
+    }
+    if host_len == 0 || host_len > TLS_HOST_MAX {
+        return EINVAL;
+    }
+    let Some(end) = host.checked_add(host_len) else {
+        return fault();
+    };
+    if !user_range_valid(host, end, false) {
+        return fault();
+    }
+    let mut buffer = [0u8; TLS_HOST_MAX];
+    if let Err(error) = copy_from_user(&mut buffer[..host_len], host) {
+        return error;
+    }
+    let Ok(name) = core::str::from_utf8(&buffer[..host_len]) else {
+        return EINVAL;
+    };
+    // A host name is handed to the SNI extension and to the SAN matcher; a NUL
+    // or a control byte in it could only mean the caller meant something else.
+    if name
+        .bytes()
+        .any(|byte| byte == 0 || byte < 0x20 || byte == 0x7f)
+    {
+        return EINVAL;
+    }
+
+    let tcp_id = match lookup(fd) {
+        Ok(OpenFd::Socket {
+            id,
+            connected: true,
+            ..
+        })
+        | Ok(OpenFd::TcpConn { id }) => id,
+        Ok(OpenFd::Socket { .. }) => return ENOTCONN,
+        Ok(OpenFd::Listener { .. }) | Ok(OpenFd::Tls { .. }) => return EISCONN,
+        Ok(OpenFd::UdpSocket { .. }) => return ENOTSUP,
+        Ok(OpenFd::Unsupported) => return ENOTSUP,
+        Ok(_) => return ENOTSOCK,
+        Err(error) => return error,
+    };
+
+    match with_network_interrupts(|| crate::net::tls::user_open(tcp_id, name)) {
+        Ok(session) => {
+            let installed = with_fds(|table| {
+                let slot = table.slots.get_mut(fd)?;
+                // The old entry is just data (no `Drop`): its TCP connection is
+                // now owned by the session, not closed by the replacement.
+                *slot = Some(FdEntry::Tls {
+                    session,
+                    tcp: tcp_id,
+                });
+                Some(())
+            })
+            .flatten()
+            .is_some();
+            if !installed {
+                // Unreachable in practice: the descriptor was looked up a moment
+                // ago and this task owns it. Release everything rather than leak.
+                crate::net::tls::user_close(session, false);
+                with_network_interrupts(|| crate::net::tcp::close_id(tcp_id));
+                return EBADF;
+            }
+            TLS_CONNECTS.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        Err(error) => {
+            // Fail closed: abandon the connection (RFC 8446 §6.1) and leave a
+            // tombstone so the descriptor number still closes cleanly.
+            let _ = with_fds(|table| {
+                if let Some(slot) = table.slots.get_mut(fd) {
+                    *slot = Some(FdEntry::Unsupported);
+                }
+            });
+            with_network_interrupts(|| crate::net::tcp::close_id(tcp_id));
+            tls_errno(error)
+        }
+    }
+}
+
+/// `tls_write(fd, buf, len)` — syscall 1101.
+///
+/// Encrypt `len` plaintext bytes from `buf` into TLS records and hand them to
+/// the connection. Blocks (bounded by the session's idle budget) until the
+/// record layer accepted them; the return value is the number of plaintext
+/// bytes accepted, which is `len` unless the connection failed part-way.
+///
+/// `-EINVAL` when `fd` is not a TLS session, `-EFAULT` for a bad buffer (the
+/// whole range is validated first, so a failure never means "some bytes went"),
+/// `-EPIPE` after `tls_close`/`shutdown` or a received `close_notify`,
+/// `-ECONNRESET` for a reset or a stream that ended without `close_notify`,
+/// `-ETIMEDOUT` when the peer stops acknowledging, `-EAGAIN` when another thread
+/// of this process is already inside a call on the same session.
+fn tls_write(fd: usize, buf: usize, len: usize) -> isize {
+    let session = match lookup(fd) {
+        Ok(OpenFd::Tls { session, .. }) => session,
+        // Not a TLS descriptor: there is no session to write on. The ABI names
+        // one answer for every such descriptor rather than guessing which
+        // socket-ish errno fits better.
+        Ok(_) => return EINVAL,
+        Err(error) => return error,
+    };
+    tls_write_session(session, buf, len)
+}
+
+/// The shared body of `tls_write` and of `write`/`send` on a TLS descriptor.
+fn tls_write_session(session: u8, buf: usize, len: usize) -> isize {
+    if len == 0 {
+        return 0;
+    }
+    let Some(end) = buf.checked_add(len) else {
+        return fault();
+    };
+    if !user_range_valid(buf, end, false) {
+        return fault();
+    }
+
+    let mut chunk = [0u8; TLS_COPY_CHUNK];
+    let mut total = 0usize;
+    while total < len {
+        let want = (len - total).min(TLS_COPY_CHUNK);
+        if let Err(error) = copy_from_user(&mut chunk[..want], buf + total) {
+            return if total > 0 { total as isize } else { error };
+        }
+        match with_network_interrupts(|| crate::net::tls::user_write(session, &chunk[..want])) {
+            Ok(written) => {
+                total += written;
+                if written < want {
+                    break;
+                }
+            }
+            Err(error) => {
+                return if total > 0 {
+                    total as isize
+                } else {
+                    tls_errno(error)
+                }
+            }
+        }
+    }
+    if total > 0 {
+        SOCKET_SENDS.fetch_add(1, Ordering::Relaxed);
+    }
+    total as isize
+}
+
+/// `tls_read(fd, buf, len)` — syscall 1102.
+///
+/// Decrypt application data into `buf` and return the byte count. **Blocks**
+/// (bounded by the session's idle budget) until at least one byte is available,
+/// then returns up to [`TLS_COPY_CHUNK`] of what it has — a caller loops until
+/// it sees `0`, which is end-of-stream (`close_notify` or the peer closing the
+/// TCP connection cleanly).
+///
+/// `-EINVAL` when `fd` is not a TLS session, `-EFAULT` for a bad buffer,
+/// `-ECONNRESET` for a reset or a truncated stream (a TCP FIN **without**
+/// `close_notify` is *not* reported as 0 — that is the truncation RFC 8446
+/// §6.1 warns about), `-ETIMEDOUT` when the idle budget expires, `-EAGAIN` for
+/// a concurrent call by another thread of the same process.
+fn tls_read(fd: usize, buf: usize, len: usize) -> isize {
+    let session = match lookup(fd) {
+        Ok(OpenFd::Tls { session, .. }) => session,
+        Ok(_) => return EINVAL,
+        Err(error) => return error,
+    };
+    tls_read_session(session, buf, len)
+}
+
+/// The shared body of `tls_read` and of `read`/`recv` on a TLS descriptor.
+fn tls_read_session(session: u8, buf: usize, len: usize) -> isize {
+    if len == 0 {
+        return 0;
+    }
+    let Some(end) = buf.checked_add(len) else {
+        return fault();
+    };
+    if !user_range_valid(buf, end, true) {
+        return fault();
+    }
+
+    let mut chunk = [0u8; TLS_COPY_CHUNK];
+    let want = len.min(TLS_COPY_CHUNK);
+    match with_network_interrupts(|| crate::net::tls::user_read(session, &mut chunk[..want])) {
+        Ok(0) => 0,
+        Ok(read) => {
+            if let Err(error) = copy_to_user(buf, &chunk[..read]) {
+                return error;
+            }
+            TLS_READS.fetch_add(1, Ordering::Relaxed);
+            SOCKET_RECVS.fetch_add(1, Ordering::Relaxed);
+            read as isize
+        }
+        Err(error) => tls_errno(error),
+    }
+}
+
+/// `tls_close(fd)` — syscall 1103.
+///
+/// Close a TLS session: send `close_notify` (best effort, bounded by the idle
+/// budget), release the record buffers and the key schedule, close the
+/// underlying TCP connection and release the descriptor. `0` means the session
+/// is gone — it does not promise the peer received the alert; a failure to
+/// deliver it is printed on the serial line and leaves the descriptor closed
+/// all the same.
+///
+/// Unlike `close(2)` (which releases a TLS descriptor *without* the alert, since
+/// `close` also runs at process teardown and may not wait for a peer), this is
+/// the graceful close. `-EINVAL` when `fd` is not a TLS session; a
+/// non-descriptor is `-EBADF`.
+fn tls_close(fd: usize) -> isize {
+    let entry = take_slot(fd);
+    match entry {
+        Some(FdEntry::Tls { session, tcp }) => {
+            with_network_interrupts(|| crate::net::tls::user_close(session, true));
+            with_network_interrupts(|| crate::net::tcp::close_id(tcp));
+            TLS_CLOSES.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        // Not a TLS descriptor: put it back untouched and say so. Taking it out
+        // first and restoring it keeps this a single table operation.
+        Some(entry) => {
+            let restored = put_slot(fd, entry);
+            debug_assert!(restored);
+            EINVAL
+        }
+        None => EBADF,
+    }
 }
 
 // ─── open / close ──────────────────────────────────────────────────────────
@@ -3452,7 +3927,8 @@ fn lseek(fd: usize, offset: usize, whence: usize) -> isize {
         | Ok(OpenFd::UdpSocket { .. })
         | Ok(OpenFd::Socket { .. })
         | Ok(OpenFd::Listener { .. })
-        | Ok(OpenFd::TcpConn { .. }) => EINVAL,
+        | Ok(OpenFd::TcpConn { .. })
+        | Ok(OpenFd::Tls { .. }) => EINVAL,
         Ok(OpenFd::File { node, offset, .. }) => {
             if node.is_directory() {
                 return EINVAL;
@@ -3514,6 +3990,7 @@ fn fstat(fd: usize, pointer: usize) -> isize {
         Ok(OpenFd::Socket { .. })
         | Ok(OpenFd::Listener { .. })
         | Ok(OpenFd::TcpConn { .. })
+        | Ok(OpenFd::Tls { .. })
         | Ok(OpenFd::UdpSocket { .. }) => (KIND_OTHER, 0o644u32, 0u64, 0u64),
         Ok(OpenFd::File { node, .. }) => {
             let is_dir = node.is_directory();
@@ -3960,7 +4437,8 @@ fn ftruncate(fd: usize, length: usize) -> isize {
         | Ok(OpenFd::UdpSocket { .. })
         | Ok(OpenFd::Socket { .. })
         | Ok(OpenFd::Listener { .. })
-        | Ok(OpenFd::TcpConn { .. }) => EINVAL,
+        | Ok(OpenFd::TcpConn { .. })
+        | Ok(OpenFd::Tls { .. }) => EINVAL,
         Ok(OpenFd::File { node, flags, .. }) => {
             if node.is_directory() {
                 return EISDIR;
@@ -4099,6 +4577,72 @@ fn uname(pointer: usize) -> isize {
     }
     UNAMES.fetch_add(1, Ordering::Relaxed);
     0
+}
+
+// ─── entropy ───────────────────────────────────────────────────────────────
+
+/// `getrandom(buf, len, flags)`: fill a user buffer from the kernel entropy
+/// pool ([`crate::entropy`]) — the same SHA-256 ratchet that seeds every TLS
+/// session key, so userland and the kernel's own TLS client draw from one pool
+/// and one 256-bit `/chosen/rng-seed`.
+///
+/// # Contract
+///
+/// * `flags` — the ABI defines **no** flags: anything but `0` is `-EINVAL`.
+///   Linux's `GRND_NONBLOCK`/`GRND_RANDOM`/`GRND_INSECURE` are not implemented,
+///   and refusing them is the fail-closed answer: an ignored `GRND_INSECURE`
+///   would hand a caller bytes it believes are unpredictable.
+/// * `-EAGAIN` and nothing written — the pool was never seeded (no
+///   `/chosen/rng-seed` in the device tree). This is the same gate that makes a
+///   TLS handshake refuse; there is no "fall back to the counters" path.
+/// * a **short read** — at most [`MAX_GETRANDOM`] bytes are returned per call,
+///   so a larger request gets that many bytes and a count below `len`. Linux
+///   documents the same behaviour beyond 256 bytes; the caller loops.
+/// * `-EFAULT` with nothing written — the whole requested range is validated
+///   (user-readable *and* -writable) before the first byte is generated, so a
+///   bad pointer can never leave a half-filled buffer behind.
+/// * `len == 0` — `0`, and no counter moves.
+///
+/// Every byte comes from [`crate::entropy::fill`], which ratchets the pool
+/// state after each block: two calls never return the same stream, and learning
+/// a later block says nothing about earlier ones.
+fn getrandom(buf: usize, len: usize, flags: usize) -> isize {
+    if flags != 0 {
+        return EINVAL;
+    }
+    if len == 0 {
+        return 0;
+    }
+    let take = len.min(MAX_GETRANDOM);
+    let Some(end) = buf.checked_add(take) else {
+        return fault();
+    };
+    if !user_range_valid(buf, end, true) {
+        return fault();
+    }
+    if !crate::entropy::is_available() {
+        return EAGAIN;
+    }
+
+    let mut chunk = [0u8; COPY_CHUNK];
+    let mut total = 0usize;
+    while total < take {
+        let want = (take - total).min(COPY_CHUNK);
+        if !crate::entropy::fill(&mut chunk[..want]) {
+            // The pool became unavailable between the check and the draw. The
+            // bytes already delivered are real random bytes; report them as a
+            // short read instead of pretending the call failed.
+            return total as isize;
+        }
+        if let Err(error) = copy_to_user(buf + total, &chunk[..want]) {
+            return if total > 0 { total as isize } else { error };
+        }
+        total += want;
+    }
+
+    GETRANDOMS.fetch_add(1, Ordering::Relaxed);
+    RANDOM_BYTES.fetch_add(total as u64, Ordering::Relaxed);
+    total as isize
 }
 
 // ─── path helper ───────────────────────────────────────────────────────────

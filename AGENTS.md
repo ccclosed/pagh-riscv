@@ -19,6 +19,7 @@ Read in this order; do not rely on memory over these files:
 | `docs/architecture.md` | boot phases, trap frame layout with offsets, privilege model, memory (PMM/heap), console+screen, memory map — every claim cites file:line |
 | `docs/roadmap.md` | M1–M6, what "done" means for each, what is explicitly out of scope |
 | `docs/screenshot.md` | how a PNG of the screen is taken and how its pixels are verified |
+| `docs/tls.md` | TLS 1.3: the verifier's gates, the shell's `https`, and the userland session syscalls |
 | `src/README.md` | crate-root map and the boot sequence |
 | `src/<subsystem>/README.md` | each folder documents itself; update it when the design changes |
 | `CONTRIBUTING.md` | contributor guide (RU): build, run, adding a subsystem, house rules |
@@ -53,7 +54,7 @@ unknown argument is rejected, not ignored. Checks that are not part of CI:
 
 ```sh
 # at the `pagh:rv64>` prompt
-selftest                                        # in-QEMU suites: 7 mem + 4 block/pointer + 11 fs + 4 arch/timer + 5 task + 13 user (13/13 with /mnt, 11/13 + 2 skip without) + 11 net + ledgers
+selftest                                        # in-QEMU suites: 7 mem + 4 block/pointer + 11 fs + 4 arch/timer + 5 task + 14 user (14/14 with /mnt, 12/14 + 2 skip without) + 12 net + ledgers
 # from the host
 python3 tools/run.py --keys "help\n" --shot /tmp/shot.png --check-font --scan-all
 python3 tools/run.py --disk /tmp/pagh.img --keys "ls /mnt\n" --shot /tmp/fs.png
@@ -66,6 +67,9 @@ python3 tools/test_sockets.py                # port 8000 must be free; writes do
 python3 tools/test_udp.py                    # builds nothing; writes docs/live-udp.txt
 # live TCP server: mke2fs -d image + QEMU user net (hostfwd) + libpagh tcp_echo
 python3 tools/test_tcp_server.py             # builds nothing; writes docs/live-tcp-server.txt
+# live TLS 1.3: internet + shell https, negative chain/SAN/resolve cases, and the
+# libpagh https_get example in the guest (TLS syscalls 1100-1103); writes docs/live-tls.txt
+python3 tools/test_tls.py                    # needs host internet; --no-userland skips the example
 ```
 
 `rustup target add riscv64gc-unknown-none-elf` once; the nightly is pinned in
@@ -334,11 +338,14 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
 ## Testing philosophy
 
 What exists: the in-QEMU suites (shell `selftest`: 7 memory + 4 block/pointer + 11 ext2/VFS
-+ 4 interrupt/timer + 5 scheduler + 13 user-mode (including the native
-thread/futex and the signal/altstack/siginfo/job-control sections, and the three
-demand-grown-stack runs) + 11 network
++ 4 interrupt/timer + 5 scheduler + 14 user-mode (including the native
+thread/futex and the signal/altstack/siginfo/job-control sections, the three
+demand-grown-stack runs and `user-tls-abi` — `userland/tls.elf` exercising
+`getrandom(278)` and the fail-closed answer of every TLS syscall on a descriptor
+that is not a session, with no server and no `/mnt` needed) + 12 network
 checks, idempotent, each group prints a
-free-frame ledger), the headless QEMU smoke driver in six
+free-frame ledger; `net-tls-session-gate` adds the kernel-side view of the same
+session table), the headless QEMU smoke driver in six
 modes (serial, ramfb, disk-fresh, disk-existing, `--net`, `--keyboard`) — every mode attaches a
 virtio-tablet and the boot log must carry `virtio-input: tablet at 0x…` — including the M5
 format/mount/persist acceptance and the M7 DHCP/ping acceptance, and the pixel
@@ -369,7 +376,13 @@ unchanged ledger, so `fork`'s copy of `stack_low..USER_STACK_BASE` and `wait4`'s
 teardown of it are both exercised; all three compare the
 PMM ledger before and after) and the socket section (bad args/EBADF always; `connect` to `10.0.2.2:8000` plus
 send/recv/shutdown/EOF only when a host server is listening, otherwise a
-`SKIP`, never a failure). `run demo` must print
+`SKIP`, never a failure). The TLS *handshake* is not in this suite — it needs a
+server — so `tools/test_tls.py` is the acceptance run for it: the shell's
+`https` against `example.com` plus the two negative gates (a local self-signed
+server for the right name must fail `cause=chain`; a real server whose chain is
+trusted but whose SAN does not cover the name must fail `cause=hostname`), and
+the libpagh `https_get` example doing the same verified fetch from userland
+through syscalls 1100–1103 (transcript `docs/live-tls.txt`). `run demo` must print
 `run: demo exited with code 42`, `run fault` must be killed with cause 13 while
 the shell survives, `run spin` must exit 7. The package path has its own E2E
 (`tools/test_pkg.py`): a real `.ppkg`, a host HTTP mirror, a disk, and the
@@ -409,7 +422,7 @@ fuzzing. That is a gap, not a policy — the rule stands:
 
 ## Versioning
 
-Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.20.0`,
+Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.21.0`,
 which `Cargo.lock` mirrors. **The two move together in one commit**: CI builds with
 `--locked`, and cargo refuses to rewrite the lock (`cannot update the lock file …
 because --locked was passed`), so a `Cargo.toml`-only bump fails the build job in
@@ -462,7 +475,14 @@ seconds. Verify locally with `cargo build --locked` after any version change.
   (64 KiB initial window, page-at-a-time growth on a load/store fault below
   `stack_low` up to the 1 MiB per-process cap, a real guard below
   `USER_STACK_FLOOR`, `stack_low` bookkeeping carried through fork/exec/teardown
-  and the `user-stack-grows`/`user-stack-cap` selftests). The same rule applies
+  and the `user-stack-grows`/`user-stack-cap` selftests); `0.21.0` makes TLS and
+  entropy reachable from userland: `getrandom(278)` over the kernel entropy pool
+  and the pagh-native `tls_connect(1100)`/`tls_write(1101)`/`tls_read(1102)`/
+  `tls_close(1103)` family (kernel-side fail-closed handshake on a connected TCP
+  descriptor, plaintext `read`/`write`/`poll`/`shutdown`/`close` on it,
+  `-ECONNRESET` for a TCP close without `close_notify`, no flag that weakens
+  verification), the `user-tls-abi`/`net-tls-session-gate` selftests and the
+  libpagh `https_get` phase of `tools/test_tls.py`. The same rule applies
   to both: the tag equals the manifest and the `Cargo.lock` entry, and the
   release is not optional.
 
@@ -703,3 +723,25 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
     and the one teardown (`release_process_memory`) calls `stack::release`
     before the page tables go. Do not move the check after the first allocation,
     do not map an instruction-fetch fault, and do not grow past the floor.
+44. **TLS is fail-closed, and there is no flag that says otherwise.**
+    `net::tls::user_open` (syscall 1100) runs the *same* `KernelProvider`/
+    `KernelVerifier` as the shell's `https`: chain to the committed CA bundle, SAN
+    authorization of the requested name, the clock gate, `CertificateVerify`, and
+    the independent `VERIFIED_HANDSHAKES` counter check. `tls_connect` answers
+    `-EINVAL` for any non-zero `flags`, so an "insecure"/"skip verify" bit cannot
+    be added without changing the documented ABI — keep it that way. A refused
+    handshake abandons the connection (RFC 8446 §6.1): the fd becomes a tombstone,
+    and a TCP close *without* `close_notify` must surface as `-ECONNRESET`, never
+    as end-of-file.
+45. **A userland TLS session is self-referential and table-owned.**
+    `UserSession` (`src/net/tls.rs`) holds a `TlsConnection<'static, ..>` that
+    borrows the heap blocks of its own `read_buf`/`write_buf`: `conn` is declared
+    **first** (fields drop in declaration order) and the buffers are **boxed**
+    (their addresses do not move with the struct). Do not reorder those fields,
+    unbox them, or add a `Drop`. A blocking call *takes the session out* of
+    `USER_SESSIONS` and puts it back afterwards — the table lock is a spinlock and
+    `block_on` sleeps on the timer tick, so holding it across a handshake would
+    freeze the tick that makes progress. `put_session` must drop a session whose
+    slot was released meanwhile, never resurrect it; the slot's `used` bit stays
+    set while a call is in flight, which is what turns a concurrent second call
+    into `-EAGAIN`.

@@ -364,10 +364,35 @@ fn subnet_math() -> bool {
         && !wire::mac_is_broadcast([0x52, 0x54, 0x00, 0x12, 0x34, 0x56])
 }
 
+/// The userland TLS session table's fail-closed surface.
+///
+/// No server and no session are involved: the check finds an id that is not in
+/// use and requires every entry point to refuse it by name (`-EINVAL`-class in
+/// the ABI, `SessionError::NoSession` here), `user_ready` to say "no such
+/// session" and `user_close` to be a no-op rather than a panic. `userland/tls.rs`
+/// covers the same surface through the syscall ABI on every boot; this one keeps
+/// the kernel-side table honest even when no userland program ran.
+fn tls_session_gate() -> bool {
+    use super::tls::{self, SessionError};
+    let Some(id) = (0u8..tls::MAX_USER_SESSIONS as u8).find(|id| !tls::session_live(*id)) else {
+        // Every slot is busy — nothing to assert without disturbing a session.
+        return true;
+    };
+    let mut out = [0u8; 4];
+    let refused = |result: Result<usize, SessionError>| result == Err(SessionError::NoSession);
+    let live_before = tls::session_stats().live;
+    refused(tls::user_read(id, &mut out))
+        && refused(tls::user_write(id, &[0u8; 1]))
+        && tls::user_shutdown(id) == Err(SessionError::NoSession)
+        && tls::user_ready(id).is_none()
+        && !tls::user_close(id, false)
+        && tls::session_stats().live == live_before
+}
+
 /// Run every network check, print `SELFTEST net-<name> PASS|FAIL`, and return how
 /// many passed.
 pub fn run() -> usize {
-    let checks: [(&str, fn() -> bool); 11] = [
+    let checks: [(&str, fn() -> bool); 12] = [
         ("net-checksum", checksum_vector),
         ("net-ethernet", ethernet_roundtrip),
         ("net-ipv4", ipv4_roundtrip),
@@ -379,6 +404,7 @@ pub fn run() -> usize {
         ("net-tcp", tcp_roundtrip),
         ("net-text", text_roundtrip),
         ("net-subnet", subnet_math),
+        ("net-tls-session-gate", tls_session_gate),
     ];
     let mut passed = 0usize;
     for (name, check) in checks {
