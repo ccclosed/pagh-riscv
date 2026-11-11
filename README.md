@@ -583,8 +583,11 @@ backspace работает, всё остальное — команды:
 | `ping <ip> [n]` | до 4 ICMP echo через свой ARP/IPv4/ICMP-путь; печатает `seq`, время и итог |
 | `dns <name>` | A-запись через DNS-сервер из lease |
 | `http <ip> <port> <path>` | HTTP/1.0 GET через TCP-клиент; ответ печатается в консоль |
+| `https <url>` | TLS 1.3 GET через свой TCP-клиент: цепочка до закоммиченного CA-бандла, SAN, срок и `CertificateVerify` (fail-closed); формы `https <host> [path] [port]` и `https --ip <addr> <url>` для прибитого адреса |
+| `entropy` | пул энтропии: есть ли seed из `/chosen/rng-seed` и сколько байт сгенерировано; без seed'а `https` отказывает до открытия сокета |
 | `pkg repo [URL]` / `pkg index` / `pkg list` | показать/задать репозиторий (по умолчанию `http://10.0.2.2:8000/`), скачать и разобрать индекс, показать пакеты с `[installed]` |
 | `pkg install <name>` / `pkg remove <name>` / `pkg installed` | скачать, проверить размер+SHA-256, установить в `/mnt/bin`; удалить по манифесту; список установленного |
+| `fs` | что смонтировано в `/mnt`: ext2, размер блока, свободные блоки и inode'ы (иначе «not mounted» / «not an ext2 filesystem») |
 | `time` | два счётчика: CSR `time` (аппаратный) и тики ядра; uptime, число прерываний таймера, статистика PLIC/UART |
 | `hart` | id hart'а, на котором работает ядро |
 | `echo <text>` | печатает текст (слова через один пробел) |
