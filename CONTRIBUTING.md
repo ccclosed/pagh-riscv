@@ -80,8 +80,8 @@ qemu-system-riscv64 -machine virt -m 256M \
 ## 4. Проверка: гейты CI
 
 Перед PR должны быть зелёными все перечисленные команды; CI запускает ровно их
-(`.github/workflows/ci.yml`): `fmt` и обе сборки — отдельными job'ами, два режима
-smoke — двумя шагами одного job'а.
+(`.github/workflows/ci.yml`): `fmt` и обе сборки — отдельными job'ами, шесть
+режимов smoke — шестью шагами одного job'а.
 
 ```sh
 cargo fmt --all -- --check                                              # формат
@@ -89,25 +89,36 @@ cargo build --locked                                                    # debug
 cargo build --locked --release                                          # release
 python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh           # serial
 python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb   # + экран
+python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb --keyboard  # клавиатура: help/halt
+python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --net     # сеть: DHCP + ping шлюза
+qemu-img create -f raw /tmp/ci.img 64M                                  # M5: пустой диск
+python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb --disk /tmp/ci.img --fresh  # формат+запись
+python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb --disk /tmp/ci.img          # повторная загрузка
 ```
 
 Что проверяет smoke: ядро поднимается, печатает баннер, строки DTB и строку пула
 кадров, отвечает на `mem`, `hart`, `time`, `echo`, неизвестную команду и `help`,
 а после `halt` машина действительно выключается (QEMU exit code 0). Режим
 `--ramfb` дополнительно требует строку `framebuffer  ramfb …`, то есть проверяет
-и путь экрана. Команды отправляются **после** появления баннера: `uart::init`
-очищает FIFO, и всё, что пришло раньше, теряется.
+и путь экрана; `--keyboard` печатает `help`/`halt` через virtio-keyboard; `--net`
+требует DHCP-lease, `net` и ping шлюза на QEMU user network; два дисковых шага
+(`--fresh`, затем повторный запуск того же образа) прогоняют в госте `selftest` и
+требуют сводки `SELFTEST SUMMARY …`, а также сохранности файла между загрузками.
+Команды отправляются **после** появления баннера: `uart::init` очищает FIFO, и
+всё, что пришло раньше, теряется.
 
-Две проверки, которые запускаются вручную (в CI пока не входят):
+Что остаётся за пределами CI (запускается вручную):
 
 ```sh
 # в госте, на приглашении pagh:rv64>
-selftest                    # четыре проверки памяти: SELFTEST … PASS/FAIL + ledger кадров
+selftest                    # полный прогон: 7 проверок памяти + block/fs/arch/task/user/net + ledger кадров
 # на хосте
 python3 tools/run.py --keys "help\n" --shot /tmp/shot.png --check-font --scan-all
 ```
 
-`selftest` — образец для подсистем, владеющих состоянием: проверки
+Smoke прогоняет `selftest` только в двух дисковых шагах и проверяет маркеры
+сводок; полный интерактивный прогон и проверка пикселей (`--check-font`) в CI не
+входят. `selftest` — образец для подсистем, владеющих состоянием: проверки
 неразрушающие и идемпотентные, а в конце печатается ledger свободных кадров
 (`[selftest] PMM hygiene: free frames X -> Y`). Если routine что-то не вернул
 на место, два прогона в одной загрузке разойдутся — это и есть детектор утечки.

@@ -327,7 +327,8 @@ virtio-net-device`, ядро получает `10.0.2.15/24` по DHCP, шлюз
 Выход из QEMU — `Ctrl-A`, затем `X`. Изнутри гостя: команда `halt` (SBI SRST,
 машина действительно выключается, QEMU завершается с кодом 0).
 
-Автоматические проверки «ядро живо» — те же, что в CI:
+Быстрые автоматические проверки «ядро живо» (smoke-драйвер тот же, что в CI;
+полный список гейтов — в разделе «Качество и CI»):
 
 ```sh
 cargo build
@@ -850,7 +851,7 @@ assets/font8x18.bin            шрифт покрытия 8×18 (8 бит на 
 tools/run.py                   запуск + screendump + проверка шрифта
 tools/gen_font.py              офлайн-растеризация шрифта в ассет
 tools/font_check.py            сверка пикселей снимка с ассетом
-.github/smoke.py               QEMU-smoke: serial и ramfb режимы
+.github/smoke.py               QEMU-smoke: serial, ramfb, keyboard, net и дисковые режимы
 .github/workflows/ci.yml       fmt + debug/release build + smoke
 run.sh                         единственный лаунчер (QEMU virt + OpenSBI)
 linker.ld                      один сегмент, точка входа _start, 0x8020_0000
@@ -871,12 +872,18 @@ linker.ld                      один сегмент, точка входа _s
 | Дымовой тест: serial | `python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh` |
 | Дымовой тест: экран | `python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb` |
 | Дымовой тест: сеть | `python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --net` |
+| Дымовой тест: клавиатура | `python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb --keyboard` |
+| Дымовой тест: диск (формат и запись) | `qemu-img create -f raw /tmp/ci.img 64M`, затем `…/pagh --ramfb --disk /tmp/ci.img --fresh` |
+| Дымовой тест: диск (повторная загрузка) | `…/pagh --ramfb --disk /tmp/ci.img` |
 
 Всё это выполняется в CI (`.github/workflows/ci.yml`) на запиненном nightly из
-`rust-toolchain.toml`: `fmt` и обе сборки — отдельными job'ами, а smoke-режимы —
-шагами одного job'а. `--ramfb` добавляет `-device ramfb`, так что поднятие экрана
-проверяется без дисплея; `--net` добавляет virtio-net на QEMU user network и
-проверяет DHCP, `net` и ping шлюза, не завися от интернета раннера. Smoke-тест ждёт
+`rust-toolchain.toml`: `fmt` и обе сборки — отдельными job'ами, а шесть
+smoke-режимов — шагами одного job'а. `--ramfb` добавляет `-device ramfb`, так что
+поднятие экрана проверяется без дисплея; `--net` добавляет virtio-net на QEMU user
+network и
+проверяет DHCP, `net` и ping шлюза, не завися от интернета раннера; два дисковых
+шага проверяют формат/монтирование/запись и сохранность файла между загрузками,
+`--keyboard` — ввод через virtio-keyboard. Smoke-тест ждёт
 баннер (UART очищает FIFO при инициализации, поэтому команды, отправленные
 раньше, теряются), шлёт `mem`, `hart`, `time`, `echo`, неизвестную команду,
 `help` и `halt`, и требует, чтобы после `halt` QEMU завершился с кодом 0.
