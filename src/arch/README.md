@@ -6,7 +6,7 @@
 
 | Файл | Владеет | Не должен |
 |---|---|---|
-| `riscv64/boot.rs` | `_start`: стек, парковка hart'ов, захват hart id, вызов `kmain` | вызывать что-либо, кроме `kmain` |
+| `riscv64/boot.rs` | `_start`: стек, захват hart id, вызов `kmain` | вызывать что-либо, кроме `kmain` |
 | `riscv64/csr.rs` | типизированные чтение/запись CSR, `without_interrupts` | содержать логику: каждый хелпер — одна инструкция |
 | `riscv64/sbi.rs` | `ecall` в M-mode (сегодня — SRST shutdown) | трогать M-mode CSR напрямую |
 | `riscv64/traps.rs` | `stvec`, `trap_entry` (в т.ч. U-mode вход/возврат через `sscratch`), кадр ловушки, диспетчер | паниковать; возвращаться после S-mode исключения |

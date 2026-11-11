@@ -1165,7 +1165,7 @@ fail-closed ответ всех четырёх TLS-вызовов (1100–1103) 
 | Файл | Отвечает за | Не должен |
 |---|---|---|
 | `src/main.rs` | порядок фаз, баннер, `#[global_allocator]`, `heap_stats`, `panic_handler` | знать про устройство устройств: всё приходит из `fdt`/`drivers` |
-| `src/arch/riscv64/boot.rs` | `_start`, стек, парковка hart'ов, захват `a0` | вызывать что-либо, кроме `kmain` |
+| `src/arch/riscv64/boot.rs` | `_start`, стек, захват `a0`, вызов `kmain` | вызывать что-либо, кроме `kmain` |
 | `src/arch/riscv64/csr.rs` | типизированный доступ к CSR, `without_interrupts` | содержать логику: каждый хелпер — одна инструкция |
 | `src/arch/riscv64/traps.rs` | `stvec`, кадр, диспетчер | паниковать; возвращаться после исключения |
 | `src/arch/riscv64/sbi.rs` | `ecall` в M-mode (SRST; позже таймер) | трогать M-mode CSR напрямую |

@@ -806,7 +806,8 @@ IPv4, ICMP и UDP, а `dhcp`/`dns`/`tcp` — маленькие клиенты. 
   `recvfrom` имеет бюджет ~10 s и не прерывается сигналом (возвращает `-EAGAIN`
   по дедлайну). Этого достаточно HTTP/1.0-клиенту (`examples/http_get`),
   простому UDP-эху и TCP-эху, но не Python-рантайму целиком.
-* **Нет SMP.** Один hart, остальные запаркованы в `_start`; планировщик и локи
+* **Нет SMP.** Работает один hart: OpenSBI отдаёт S-mode ровно одному, остальные
+  firmware держит в HSM stopped — ядро их не паркует (`src/arch/riscv64/boot.rs`); планировщик и локи
   это предполагают.
 * **Нет восстановления после S-mode исключения.** Сбой в ядре — печать и
   остановка hart. Сбой в U-mode (page fault, illegal instruction) завершает
@@ -823,7 +824,7 @@ IPv4, ICMP и UDP, а `dhcp`/`dns`/`tcp` — маленькие клиенты. 
 
 ```text
 src/main.rs                    boot-фазы по порядку, баннер, panic_handler
-src/arch/riscv64/boot.rs       _start: стек, парковка hart'ов, вызов kmain
+src/arch/riscv64/boot.rs       _start: стек, захват hart id, вызов kmain
 src/arch/riscv64/csr.rs        типизированный доступ к CSR
 src/arch/riscv64/traps.rs      trap_entry, кадр на 264 байта, диспетчер
 src/arch/riscv64/sbi.rs        ecall в M-mode (SRST)

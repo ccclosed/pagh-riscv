@@ -179,7 +179,7 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
 5. **`mhartid` is an M-mode CSR.** Reading it from S-mode is an illegal instruction
    (this actually happened: `scause=2, stval=0xf1402573`, machine halted). Use
    `arch::riscv64::hart_id()`, which reads `BOOT_HART_ID`, captured in `_start` while
-   the id is still in `a0` (`boot.rs:23-28, 56-63`). The same applies to every other
+   the id is still in `a0` (`boot.rs:30-35`, static at `63-70`). The same applies to every other
    M-mode CSR: `ecall` (SBI) is the only door.
 6. **Device-tree honesty.** The FDT is the machine description; a parse failure is
    fatal and loud (`src/main.rs`), never a guess. The reader answers exactly five
@@ -194,7 +194,7 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
 7. **Boot phase order is load-bearing** (`docs/architecture.md` §3): console before
    any print, FDT before the shell (and before any device work), **frame pool before
    the first allocation**, paging before any MMIO beyond the console, traps before the
-   shell, hart parking before Rust. M3 adds two: the timer and the PLIC after the
+   shell (nothing to park: firmware already left the other harts in HSM stopped). M3 adds two: the timer and the PLIC after the
    trap vector is installed (`sie` must stay 0 until both compare register and
    controller are ready, and the PLIC must route the UART line before the UART
    raises it), M5 adds two more: the block driver after the map and traps (it
