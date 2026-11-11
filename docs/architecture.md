@@ -1214,7 +1214,7 @@ fail-closed ответ всех четырёх TLS-вызовов (1100–1103) 
   границы M5 названы в `docs/roadmap.md`; формат совместим с `mkfs.ext2`/`e2fsck`,
   поэтому образ можно проверять хостовыми инструментами.
 * **Нет SMP**: работает один hart.
-* **Нет host-тестов**: есть in-QEMU selftests (7 памяти, 3 блочного слоя, 11
+* **Нет host-тестов**: есть in-QEMU selftests (7 памяти, 4 блока/указателя, 11
   ext2/VFS, 4 таймера/PLIC, 5 планировщика, 14 user-mode — с диском 14/14, без
   `/mnt` 12/14 + 2 SKIP, 12 сети), QEMU-smoke в шести режимах (serial, ramfb, диск
   fresh/existing, net, keyboard) и проверка пикселей `tools/font_check.py`;
@@ -1254,7 +1254,7 @@ killed, `run spin` → 7 с таймером в U; маркеры `abi: threads 
 рост до 1 MiB, guard и fork на выросшем стеке; `user-tls-abi`: `getrandom` и
 fail-closed матрица TLS-вызовов; без `/mnt` — 12/14 + 2 SKIP), PMM-ledger до/после
 каждого блока совпадает в двух прогонах, smoke проходит serial/net/ramfb/
-disk-fresh/disk-existing. Следующие шаги —
+disk-fresh/disk-existing/keyboard. Следующие шаги —
 из `docs/roadmap.md`:
 
 * Linux-compat слой (перенос подхода x86: syscall-номера, `/proc`, Linux-ELF) —
