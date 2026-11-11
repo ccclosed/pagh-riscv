@@ -35,7 +35,7 @@
 | Шелл: команды и редактор строки | `src/shell.rs:21-59, 140-250` | `.github/smoke.py`: `mem`, `hart`, `time`, `echo`, неизвестная команда, `help`, `halt` |
 | `halt` действительно выключает машину | `src/shell.rs:221-227`, `src/arch/riscv64/sbi.rs:24-38` | QEMU завершается с кодом 0 (проверка в `smoke.py`) |
 | Нет паники в обработчике ловушек | `src/arch/riscv64/traps.rs:4-8, 195-201` | исключение печатает `[EXC] … halting` и паркует hart |
-| CI зелёный | `.github/workflows/ci.yml` | `fmt`, debug/release build, smoke в двух режимах (serial и `--ramfb`) |
+| CI зелёный | `.github/workflows/ci.yml` | `fmt`, debug/release build, smoke в шести режимах (serial, ramfb, keyboard, net, диск fresh/existing) |
 
 Открытый хвост M1: host-тестов нет, чистая логика (`fdt.rs`) не покрыта. Для
 состояния ядра тесты уже появились — это M2 (`selftest`).
@@ -66,7 +66,7 @@
 | Таймер программируется через SBI TIME (не через `mtimecmp` — он M-mode) | **готово** | `src/arch/riscv64/timer.rs`: `set_timer` (EID 0x54494D45), абсолютный дедлайн +10 мс на прерывание (дрейф не копится), `time` CSR для счёта; лог `timer 10 ms ticks (100 Hz, timebase 10000000 Hz)` |
 | `sie` включает нужные источники, `stvec` их обрабатывает | **готово** | `sie.STIE`/`sie.SEIE` после инициализации; диспетчер в `traps.rs` различает `scause` с битом прерывания: timer (5), external (9); возврат только через `sret`, исключения по-прежнему печатают и паркуют hart |
 | PLIC разведён: внешние прерывания доходят | **готово** | `src/arch/riscv64/plic.rs`: база и UART source из DTB, S-mode context, enable/priority/threshold, claim/complete, счётчики и unknown-source; лог `plic 0xc000000 context 1, uart irq 10 (rx interrupt on)`; в `time` видно `plic N claims, N completed` |
-| Консоль не теряет байты при прерываниях | **готово** | приём — IRQ → кольцевой буфер → `uart::wait_byte` (`wfi`); smoke-driver шлёт пачку команд после баннера и проходит в четырёх режимах; `0 uart rx overrun(s)` в логе; polled-путь остаётся запасным |
+| Консоль не теряет байты при прерываниях | **готово** | приём — IRQ → кольцевой буфер → `uart::wait_byte` (`wfi`); smoke-driver шлёт пачку команд после баннера и проходит в шести режимах; `0 uart rx overrun(s)` в логе; polled-путь остаётся запасным |
 | Критические секции маскируют прерывания | **готово** | `uart::put_byte` под `csr::without_interrupts` (коммит «mask interrupts around the UART transmitter lock»); правило записано в `docs/architecture.md` §12.1 и AGENTS.md |
 | Сон и uptime считаются от тиков, холостой цикл не жжёт CPU | **готово** | `sleep 1` → `uptime 1010 ms (101 timer ticks at 100 Hz, 101 timer interrupts)`, `wfi` в `sleep_ticks` и в ожидании ввода |
 | Счётчики прерываний проверяются машинно | **готово** | `SELFTEST timer-ticks / timer-interrupts / uart-ring / plic-uart-line PASS` + `SELFTEST SUMMARY (arch): 4/4 passed`; два прогона в одной загрузке дают один ledger |

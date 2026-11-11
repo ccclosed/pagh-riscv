@@ -40,6 +40,9 @@ qemu-img create -f raw /tmp/ci.img 64M
 python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb --disk /tmp/ci.img --fresh
 python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb --disk /tmp/ci.img
 python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb --keyboard  # type help/halt
+# M7 acceptance (the smoke job runs it too): virtio-net on QEMU's user network,
+# a DHCP lease at boot, then `net` and an ICMP echo to the gateway.
+python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --net
 ```
 
 `./run.sh` boots the kernel interactively (QEMU `virt` + OpenSBI, serial on stdio;
@@ -77,7 +80,7 @@ python3 tools/test_tls.py                    # needs host internet; --no-userlan
 `rust-toolchain.toml`.
 
 CI (`.github/workflows/ci.yml`) runs the commands above — the smoke job covers the
-four QEMU modes, including the two-run disk acceptance — and reads the toolchain pin
+six QEMU modes, including the two-run disk acceptance — and reads the toolchain pin
 out of `rust-toolchain.toml`. There are **no** other gates yet: no `tools/build.py`, no
 `tools/check_safety.py`, no host-test runner, no general E2E driver (those exist in the
 x86 repository and were deliberately not carried over). `tools/test_pkg.py` is a
@@ -95,7 +98,7 @@ path "for parity".
 kernel-build    -> cargo (target from .cargo/config.toml, linker.ld, -Tlinker.ld)
 kernel-run      -> run.sh                  # Linux/QEMU launcher; window by default, --headless for serial
 kernel-screen   -> tools/run.py            # boots with ramfb, screendump, font check
-kernel-smoke    -> .github/smoke.py        # headless QEMU driver used by CI (serial/ramfb/disk)
+kernel-smoke    -> .github/smoke.py        # headless QEMU driver used by CI (serial/ramfb/keyboard/net/disk)
 kernel-selftest -> the shell's `selftest`  # in-QEMU memory + block + filesystem checks
 package-e2e     -> tools/test_pkg.py       # .ppkg + HTTP mirror + QEMU disk, install/run/remove
 socket-live     -> tools/test_sockets.py   # host HTTP server + QEMU user net + libpagh http_get
