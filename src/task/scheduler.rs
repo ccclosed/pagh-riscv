@@ -95,8 +95,30 @@ pub const MAX_TASKS: usize = 16;
 /// Ticks a thread runs before the scheduler switches away from it.
 pub const QUANTUM_TICKS: u32 = 8;
 
-/// Usable bytes of a spawned thread's stack.
-pub const STACK_SIZE: usize = 16 * 1024;
+/// Usable bytes of a spawned thread's kernel stack (above its guard frame).
+///
+/// Sized from measurement, not from a round number. The deepest path these
+/// stacks serve is a userland TLS 1.3 session (syscall 1100): the handshake,
+/// the certificate-chain verifier and the vendored crypto backends run on the
+/// *caller's* kernel stack. A live `https_get example.com /` through QEMU's
+/// user net measured a high-water mark of ~16.3-17.1 KiB in release and
+/// ~64.9-70.1 KiB in debug (the async poll chain and unoptimized frames grow
+/// with the served certificate chain), on top of the ~5.5/17 KiB the preceding
+/// DNS+TCP syscalls already use. The previous fixed 16 KiB overflowed in
+/// *both* profiles: in release the ~0.7 KiB excess landed in the guard frame
+/// (invisible except as a reclaim-canary violation), in debug the ~54 KiB
+/// excess wrote through the guard into the next PMM frame, unmapping the
+/// user-stack page tables and turning the run into a page-fault cascade.
+///
+/// These sizes are a stopgap: the principled fix is to run the TLS handshake
+/// on a dedicated PMM stack so ordinary task stacks stay small. The guard
+/// frame and the reclaim canary stay in place either way — they are how the
+/// next overflow gets caught. Re-measure with the same repro before changing
+/// these numbers (docs/architecture.md §9.2).
+#[cfg(debug_assertions)]
+pub const STACK_SIZE: usize = 96 * 1024;
+#[cfg(not(debug_assertions))]
+pub const STACK_SIZE: usize = 24 * 1024;
 
 /// Guard frame below every stack: overflow lands here (and on the canary) first.
 pub const GUARD_SIZE: usize = FRAME_SIZE;

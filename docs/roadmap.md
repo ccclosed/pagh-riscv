@@ -130,7 +130,7 @@ TTF-парсер (только офлайн-растетризованный а�
 | Критерий «сделано» | Статус | Подтверждение |
 |---|---|---|
 | Контекстный switch — ABI, а не «сохранить побольше» | **готово** | `src/arch/riscv64/switch.rs`: `TaskContext` (`ra`, `sp`, `s0..s11`), смещения asm берутся из layout'а, `const _` проверяет размер; trap frame не трогается |
-| Потоки ядра со своими стеками из PMM | **готово** | `src/task/scheduler.rs`: 8 слотов, стек 16 KiB + guard 4 KiB (5 кадров), `spawn`/`exit`/`reap`; `SELFTEST task-exit-returns-stack PASS` (62650 -> 62645 -> 62650) |
+| Потоки ядра со своими стеками из PMM | **готово** | `src/task/scheduler.rs`: 8 слотов, стек 24 KiB release / 96 KiB debug + guard 4 KiB (7/25 кадров), `spawn`/`exit`/`reap`; `SELFTEST task-exit-returns-stack PASS` (62650 -> 62645 -> 62650) |
 | Round-robin и вытеснение по таймеру | **готово** | квант 8 тиков, готовые потоки FIFO; одна строка `timer::set_tick_handler(tick_from_timer)`; `sleep 1` двигает счётчики демо-потоков без `yield` (258 → 358 тиков, 32 → 44 переключения) |
 | Планировщик не аллоцирует и не берёт лок через switch | **готово** | `schedule()` выбирает под локом, отпускает и только потом `task_switch`; тик/switch без аллокаций; контракт в `src/task/README.md` |
 | Проверки машинные и идемпотентные | **готово** | `SELFTEST task-* 5/5`: interleave (130 switch-out), exit-stack, layout/guard, canary, idle; ledger `62650 -> 62650` в двух прогонах |

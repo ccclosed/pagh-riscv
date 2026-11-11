@@ -476,7 +476,7 @@ root/ASID своего процесса, а switch переключает адр
 | Что | Файлы | Контракт |
 |---|---|---|
 | контекст потока | `src/arch/riscv64/switch.rs` | второй ABI ядра: `TaskContext` = `ra`, `sp`, `s0`–`s11` (14 pointer-sized полей) и `task_switch(from, to)`. Сохраняются только callee-saved регистры: `switch` вызывается как обычная `extern "C"` функция, caller-saved регистры компилятор и так считает испорченными. Смещения asm берутся из layout'а структуры (`global_asm!` const-операнды), а `const _` ловит изменение размера. Trap frame не трогается: поток, вытесненный внутри обработчика, держит свой кадр на своём стеке и при возобновлении просто доходит до `sret` |
-| задачи | `src/task/scheduler.rs` | до `MAX_TASKS = 16` слотов: `shell`(0) на загрузочном стеке, `idle`(1) со стеком из PMM, `task-N`/`thread-N` — демо и user-потоки. Состояния `Free/Ready/Running/Blocked/Stopped/Exited`; FIFO ready-queue, квант `QUANTUM_TICKS = 8` тиков; `spawn(fn)`/`spawn_user_thread`/`spawn_user_frame` дают 16 KiB стек + 4 KiB guard (PMM, `alloc_frames_contiguous`), вышедший поток возвращает кадры (`reap`); `block_current`/`wake_task`/`kill_group` — примитивы user-потоков (9.2); `Task::satp` и `install_satp` — переключение root'а (9.4) |
+| задачи | `src/task/scheduler.rs` | до `MAX_TASKS = 16` слотов: `shell`(0) на загрузочном стеке, `idle`(1) со стеком из PMM, `task-N`/`thread-N` — демо и user-потоки. Состояния `Free/Ready/Running/Blocked/Stopped/Exited`; FIFO ready-queue, квант `QUANTUM_TICKS = 8` тиков; `spawn(fn)`/`spawn_user_thread`/`spawn_user_frame` дают 24 KiB стек (96 KiB в debug) + 4 KiB guard (PMM, `alloc_frames_contiguous`), вышедший поток возвращает кадры (`reap`); `block_current`/`wake_task`/`kill_group` — примитивы user-потоков (9.2); `Task::satp` и `install_satp` — переключение root'а (9.4) |
 | вытеснение | таймер (M3) | `timer::set_tick_handler(task::scheduler::tick_from_timer)` — одна строка в `kmain`. Тик срабатывает в trap-контексте: `tick_from_timer` помечает аппаратные часы привязанными и вызывает `schedule()`. Переключение из обработчика корректно именно потому, что кадр прерывания лежит на стеке вытесняемого потока; `install_satp` до `task_switch` успевает поставить root входящего потока |
 | программные часы | `scheduler::pump` | без таймера (машина без timebase) шелл и демо-потоки «тикают» сами; после привязки таймера `pump` — no-op. Это нужно, чтобы M6a проверялся и на машине без M3 |
 | lock-дисциплина | `scheduler.rs` | очередь под спинлоком с замаскированными прерываниями; `schedule()` берёт lock, выбирает следующий слот, отпускает lock и только потом делает `task_switch` — switch не выполняется с удержанным локом; в тике/switch нет аллокаций |
@@ -718,7 +718,7 @@ heap ровно 1 MiB, `getdents64` без места в
 ext2), `openat`/`mkdirat` игнорируют `mode`, `chmod` живёт только до конца
 процесса, `uname.release` намеренно `0.10.0` (стабильная строка ABI) при
 `Cargo.toml` 0.20.0. Процессов ≤ 6, потоков ≤ 14 на процесс (16 слотов минус
-`shell`/`idle`), у каждого свой kernel-стек 16 KiB + guard; user-стек —
+`shell`/`idle`), у каждого свой kernel-стек 24 KiB (96 KiB в debug) + guard; user-стек —
 память вызывающего, ядро её не освобождает (главный стек процесса ядро заводит
 само: 64 KiB + деманд-рост до 1 MiB, см. 9.1). TLS/PI/requeue, `join`/`waitid` и
 приоритеты отсутствуют; futex-таблица — 32 ожидающих на 16 адресов. `fork` —
@@ -737,7 +737,7 @@ User-программа — это **процесс** (`Process`) с групп�
 | Своё у потока | Общее у процесса |
 |---|---|
 | tid (`gettid`), запись в task-таблице планировщика | `Process`: root/ASID, heap, mmap, fd-таблица, сокет, таблица обработчиков |
-| kernel-стек 16 KiB + 4 KiB guard из PMM | user-стек **не** общий: адрес передаёт вызывающий, ядро его не выделяет и не освобождает |
+| kernel-стек 24 KiB release / 96 KiB debug + 4 KiB guard из PMM | user-стек **не** общий: адрес передаёт вызывающий, ядро его не выделяет и не освобождает |
 | сохранённый `TaskContext`/`satp` и trap frame (на своём kernel-стеке) | код образа, `.bss`/`.data` в root'е процесса |
 | user-регистры (вход `a0 = arg`, `sp = stack`), blocked/pending/altstack | pid (`getpid`), ppid, код выхода (код главного) |
 
@@ -1014,7 +1014,7 @@ SIGTSTP/SIGCONT на futex-ожидании. Маркеры — `abi: signals ok
 `threads`, `exit/signal`, `heap_end/heap_count`, `mmap_regions`, `stack_base`,
 `stack_low`, `wait_tid` и `ready`. Списки image- и heap-кадров лежат **вне** `Process`
 (`IMAGES`/`HEAPS`): процесс весит сотни байт, а перенос 2 KiB `Loaded` через
-16 KiB kernel-стек уже вызывал переполнение в ранней версии fork. Состояния:
+небольшой kernel-стек уже вызывал переполнение в ранней версии fork. Состояния:
 `Free -> Live -> Zombie -> Free`; `threads` уменьшается на каждом `exit`, а
 последний поток (или `exit_group`/fault) ставит `Exit`/`threads = 0` и будит
 родителя.
