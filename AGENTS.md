@@ -17,7 +17,7 @@ Read in this order; do not rely on memory over these files:
 |---|---|
 | `README.md` | pitch, honest status per subsystem, quickstart, what is *not* implemented |
 | `docs/architecture.md` | boot phases, trap frame layout with offsets, privilege model, memory (PMM/heap), console+screen, memory map — every claim cites file:line |
-| `docs/roadmap.md` | M1–M6, what "done" means for each, what is explicitly out of scope |
+| `docs/roadmap.md` | M1–M8, what "done" means for each, what is explicitly out of scope |
 | `docs/screenshot.md` | how a PNG of the screen is taken and how its pixels are verified |
 | `docs/tls.md` | TLS 1.3: the verifier's gates, the shell's `https`, and the userland session syscalls |
 | `src/README.md` | crate-root map and the boot sequence |

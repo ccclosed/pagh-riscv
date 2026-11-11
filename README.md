@@ -10,7 +10,7 @@
   <img alt="Target: riscv64gc-unknown-none-elf" src="https://img.shields.io/badge/target-riscv64gc--unknown--none--elf-blue.svg">
   <img alt="no_std" src="https://img.shields.io/badge/%23!%5Bno__std%5D-yes-informational.svg">
   <img alt="Boot: OpenSBI S-mode" src="https://img.shields.io/badge/boot-OpenSBI%20S--mode-purple.svg">
-  <img alt="Milestone: M1-M7 done" src="https://img.shields.io/badge/milestone-M1%E2%80%93M7%20done-brightgreen.svg">
+  <img alt="Milestone: M1-M8 done" src="https://img.shields.io/badge/milestone-M1%E2%80%93M8%20done-brightgreen.svg">
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green.svg">
 </p>
 
@@ -713,6 +713,7 @@ IPv4, ICMP и UDP, а `dhcp`/`dns`/`tcp` — маленькие клиенты. 
 | M5 | virtio-mmio блочное устройство, ext2, VFS | **готов** (virtio-mmio, ext2 rw + формат пустого диска, VFS, шелл-команды; журнала нет) |
 | M6 | Задачи, syscalls, Linux-compat-слой из x86-ветки | M6a (планировщик/потоки) — **готов**; M6b (user mode, syscalls, ELF) — **готов**; Linux-compat — нет |
 | M7 | Сеть: virtio-net и свой TCP/IP-стек | **готов** (Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP, DNS, `net`/`ping`/`dns`/`http`, `https` (TLS 1.3 с проверкой CA/SAN/срока/подписи); apt — следующий шаг) |
+| M8 | Указатель и software-курсор | **готов** (virtio-input: tablet/mouse и keyboard по device tree, курсор — часть кадра, события двигают стрелку; клики не используются) |
 
 Что считается «сделано» для каждого майлстоуна и что в него не входит —
 [`docs/roadmap.md`](docs/roadmap.md).
@@ -842,7 +843,7 @@ src/console.rs                 kprint!/kprintln!: UART + экран
 src/shell.rs                   редактор строки и команды
 src/sync.rs                    один нереентерабельный спинлок
 docs/architecture.md           загрузка, кадр ловушки, привилегии, карта памяти
-docs/roadmap.md                майлстоуны M1–M7 и их критерии
+docs/roadmap.md                майлстоуны M1–M8 и их критерии
 docs/shell.png                 снимок экрана из работающего QEMU
 docs/user.png                  снимок run demo / run fault / run spin
 docs/net.png                   снимок net / ping / dns через собственный стек
