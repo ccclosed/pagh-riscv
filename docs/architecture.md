@@ -49,8 +49,9 @@ OpenSBI при передаче управления сообщает (лог ж
   практике: `csrr a0, mhartid` из S-mode — это illegal instruction, и старая
   реализация команды `hart` убивала машину (`[EXC] illegal instruction
   (scause=2, stval=0xf1402573)`). Сейчас id захватывается один раз в `_start`,
-  пока он ещё в `a0` (`src/arch/riscv64/boot.rs:23-28, 56-63`), а `hart_id()`
-  читает статик (`src/arch/riscv64/mod.rs:23-33`).
+  пока он ещё в `a0` (`src/arch/riscv64/boot.rs:30-35`), в статик
+  `BOOT_HART_ID` (`boot.rs:63-70`), а `hart_id()` читает его
+  (`src/arch/riscv64/mod.rs:34-38`).
 * **S-mode — это мы.** Уровень, на котором исполняется ядро. Все CSR, к которым
   ядро обращается, супервизорные: `stvec`, `sepc`, `scause`, `stval`, `sstatus`,
   `time`, `sie`/`sip`, `sscratch` и `satp` (через `memory::paging`).
@@ -84,14 +85,14 @@ OpenSBI при передаче управления сообщает (лог ж
 |---|---|---|---|
 | 0 | OpenSBI (M-mode) отдаёт управление в S-mode на `_start`: `a0` = hart id, `a1` = физический адрес DTB, прерывания выключены, стека нет | — | единственное, что можно предполагать |
 | 1 | `_start`: продолжает единственный hart, которому OpenSBI отдал S-mode (id — из `a0`, не обязательно 0); остальные hart'ы firmware держит в HSM stopped | `src/arch/riscv64/boot.rs` | до любого Rust-кода; ни одна структура ядра не видится двумя hart'ами |
-| 2 | Стек: `sp = __stack_top`, выравнивание 16 байт | `src/arch/riscv64/boot.rs:18-21` | на входе `sp` произвольный; Rust ABI требует 16 |
-| 3 | Захват hart id в статик `BOOT_HART_ID` | `src/arch/riscv64/boot.rs:23-28` | пока `a0` ещё цел: `mhartid` из S-mode недоступен |
-| 4 | `call kmain(a0, a1)` | `src/arch/riscv64/boot.rs:30-31` | обычный C-ABI вызов, аргументы уже на местах |
-| 5 | `console::init()`: сначала UART, затем попытка поднять экран | `src/main.rs:53`, `src/console.rs:44-48`, `src/drivers/uart.rs:57-64`, `src/drivers/framebuffer.rs:862-901` | без UART не видно причины, по которой не появился экран; экран — не отдельная фаза, потому что его отсутствие не ошибка |
-| 6 | Баннер: `boot hart`, адрес DTB | `src/main.rs:55-60` | первая проверяемая строка лога |
-| 7 | Разбор DTB; при ошибке — печать и `park_forever` | `src/main.rs:65-72`, `src/fdt.rs:64-98` | описание машины нельзя угадывать |
-| 8 | Печать памяти, timebase и адреса консоли | `src/main.rs:73-81` | до шелла, чтобы человек видел, что ядро прочитало |
-| 9 | PMM: пул кадров по `/memory` минус образ ядра, стек и блоб DTB; затем печать статистики | `src/main.rs:83-107`, `src/memory/mod.rs:75-77`, `src/memory/pmm.rs:101-141` | `alloc` уже существует, поэтому аллокатор должен быть готов **до** первой аллокации; пустой пул отказал бы громко, а не отдал кадр из образа ядра |
+| 2 | Стек: `sp = __stack_top`, выравнивание 16 байт | `src/arch/riscv64/boot.rs:24-28` | на входе `sp` произвольный; Rust ABI требует 16 |
+| 3 | Захват hart id в статик `BOOT_HART_ID` | `src/arch/riscv64/boot.rs:30-35` | пока `a0` ещё цел: `mhartid` из S-mode недоступен |
+| 4 | `call kmain(a0, a1)` | `src/arch/riscv64/boot.rs:37-38` | обычный C-ABI вызов, аргументы уже на местах |
+| 5 | `console::init()`: сначала UART, затем попытка поднять экран | `src/main.rs:62`, `src/console.rs:44-48`, `src/drivers/uart.rs:170-177`, `src/drivers/framebuffer.rs:1065-1104` | без UART не видно причины, по которой не появился экран; экран — не отдельная фаза, потому что его отсутствие не ошибка |
+| 6 | Баннер: `boot hart`, адрес DTB | `src/main.rs:64-69` | первая проверяемая строка лога |
+| 7 | Разбор DTB; при ошибке — печать и `park_forever` | `src/main.rs:74-83`, `src/fdt.rs:136-170` | описание машины нельзя угадывать |
+| 8 | Печать памяти, timebase и адреса консоли | `src/main.rs:84-90` | до шелла, чтобы человек видел, что ядро прочитало |
+| 9 | PMM: пул кадров по `/memory` минус образ ядра, стек и блоб DTB; затем печать статистики | `src/main.rs:144-164`, `src/memory/mod.rs:67-82`, `src/memory/pmm.rs:101-141` | `alloc` уже существует, поэтому аллокатор должен быть готов **до** первой аллокации; пустой пул отказал бы громко, а не отдал кадр из образа ядра |
 | 10 | `paging::init`: identity-карта Sv39, `satp`; в карту входят RAM, страница UART и окна virtio-mmio из DTB | `src/main.rs`, `src/memory/paging.rs` | всё после этой фазы работает на карте, которую выбрало ядро; окно MMIO, не попавшее в карту, — это ловушка на первом же обращении |
 | 11 | `traps::init()`: `stvec = trap_entry`, `sstatus.SIE = 1` | `src/main.rs`, `src/arch/riscv64/traps.rs` | «ловушки раньше всего, что может ловиться» — сбой в шелле должен печататься, а не молча сбрасывать машину |
 | 12 | `timer::init(timebase)`: первый абсолютный дедлайн через SBI TIME, затем `sie.STIE` | `src/main.rs`, `src/arch/riscv64/timer.rs` | `sie` ещё 0, поэтому таймер не может выстрелить до того, как compare-регистр записан SBI |
@@ -104,7 +105,7 @@ OpenSBI при передаче управления сообщает (лог ж
 | 17 | `shell::run(tree)` — цикл консоли, запускается как поток 0 планировщика | `src/main.rs`, `src/shell.rs` | возвращаться некуда; idle-поток держит hart в `wfi`, а сеть опрашивается из idle-цикла |
 
 Глобальный аллокатор объявлен в корне крейта, а не в модуле кучи:
-`#[global_allocator] static ALLOCATOR: memory::heap::Heap` (`src/main.rs:35-36`) —
+`#[global_allocator] static ALLOCATOR: memory::heap::Heap` (`src/main.rs:43`) —
 это утверждение обо всём бинарнике. `extern crate alloc` там же (`src/main.rs:16`).
 
 Два исхода вне фаз:
@@ -127,9 +128,9 @@ OpenSBI при передаче управления сообщает (лог ж
 
 ### 4.1 Кадр — это ABI
 
-`trap_entry` (`src/arch/riscv64/traps.rs:57-140`) сохраняет 31 регистр общего
+`trap_entry` (`src/arch/riscv64/traps.rs:108-236`) сохраняет 31 регистр общего
 назначения и два CSR в фиксированном порядке; Rust видит это как
-`#[repr(C)] struct TrapFrame` (`src/arch/riscv64/traps.rs:20-55`). Порядок
+`#[repr(C)] struct TrapFrame` (`src/arch/riscv64/traps.rs:23-57`). Порядок
 объявления полей и порядок `sd` в ассемблере обязаны совпадать — по смещениям и
 построена таблица:
 
@@ -147,8 +148,9 @@ OpenSBI при передаче управления сообщает (лог ж
 | 72 | `a0` | 160 | `s5` | 248 | `sepc` |
 | 80 | `a1` | 168 | `s6` | 256 | `sstatus` |
 
-Размер кадра — 264 байта: `addi sp, sp, -264` (`traps.rs:63`), и то же число в
-эпилоге (`traps.rs:137`). 33 слота × 8 = 264, выравнивание не нужно.
+Размер кадра — 264 байта: `addi sp, sp, -264` (`traps.rs:128`, U-путь —
+`traps.rs:133`), и то же число в эпилоге (`traps.rs:226, 233`). 33 слота × 8 =
+264, выравнивание не нужно.
 
 ¹ Слот 8 имеет **двойной смысл** — это часть ABI ловушек (M6b):
 
@@ -208,8 +210,8 @@ stvec ──► trap_entry:
 
 ### 4.3 Диспетчер: что происходит с каждым `scause`
 
-`trap_dispatch` (`src/arch/riscv64/traps.rs:161-201`) различает прерывание по
-старшему биту `scause` (`CAUSE_INTERRUPT_BIT`, `traps.rs:147`).
+`trap_dispatch` (`src/arch/riscv64/traps.rs:324-416`) различает прерывание по
+старшему биту `scause` (`CAUSE_INTERRUPT_BIT`, `traps.rs:247`).
 
 | `scause` | Что это | Действие |
 |---|---|---|
@@ -1098,18 +1100,18 @@ fail-closed ответ всех четырёх TLS-вызовов (1100–1103) 
 экономит ничего при таком объёме вывода и добавило бы ещё один обработчик в
 картину. Подробности и порядок разрешения источников — раздел 4.4.
 
-**Один текстовый поток — два стока.** `kprint!`/`kprintln!` (`src/console.rs:107-124`)
+**Один текстовый поток — два стока.** `kprint!`/`kprintln!` (`src/console.rs:119-136`)
 пишут в `ConsoleSink`: сначала байты уходят в UART (`console.rs:78-89`), затем,
 если флаг `FRAMEBUFFER` поднят, — в экран (`framebuffer::write_str`). Границей
 кадра служит один форматированный вызов: `write_fmt` отдаёт UART текст, а экрану —
 текст плюс `framebuffer::_print(args)`, то есть `flush` ровно один раз на `kprint!`
-(`console.rs:91-104`) — иначе приглашение шелла появлялось бы на экране только со
+(`console.rs:103-117`) — иначе приглашение шелла появлялось бы на экране только со
 следующим переводом строки.
 
 **Подъём экрана — внутри `console::init`** (`console.rs:44-48`): UART первым (он
 сможет рассказать, почему экрана нет), затем флаг, затем `framebuffer::init`.
 Машина без устройства — не ошибка: проба не проходит, причина уходит в serial,
-дальше все вызовы экрана — no-op (`src/drivers/framebuffer.rs:862-901`).
+дальше все вызовы экрана — no-op (`src/drivers/framebuffer.rs:1065-1104, 1120-1140`).
 
 | Факт | Значение | Источник |
 |---|---|---|
@@ -1120,33 +1122,36 @@ fail-closed ответ всех четырёх TLS-вызовов (1100–1103) 
 | Шрифт | `assets/font8x18.bin` — покрытие 8 бит на пиксель, растеризован офлайн `tools/gen_font.py`; TrueType-парсера в ядре нет | `tools/gen_font.py`, `tools/font_check.py` |
 | Не-ASCII | глифов вне `0x20..0x7E` в шрифте нет, символы отбрасываются — поэтому длинное тире баннера видно в serial, но не на экране | `src/drivers/framebuffer.rs`, `docs/screenshot.md` |
 | Поверхности | `SHADOW` (в неё рисуем) и `SCANOUT` (её читает устройство), по 4 МиБ в `.bss` | `framebuffer.rs:138, 145` |
-| Включение экрана | нужен `-device ramfb`: `run.sh` его передаёт, QEMU без него даёт `framebuffer  ramfb: no such fw_cfg item — serial console only` | `framebuffer.rs:862-884`, `run.sh:59` |
+| Включение экрана | нужен `-device ramfb`: `run.sh` его передаёт, QEMU без него даёт `framebuffer  ramfb: no such fw_cfg item — serial console only` | `framebuffer.rs:1065-1104`, `run.sh:126` |
 | Снимок | `python3 tools/run.py --keys "help\n" --shot docs/shell.png --check-font --scan-all` | `tools/run.py`, `docs/screenshot.md` |
 
 **Путь вывода UART**: `uart::put_byte` побайтово, с ожиданием бита `LSR.THRE` и под
-спинлоком (`src/drivers/uart.rs:67-73`). **Ввод** — polled: `get_byte()` крутится
-на `LSR.DATA_READY` (`uart.rs:84-92`). `uart::init()` (`uart.rs:57-64`) ставит
+спинлоком (`src/drivers/uart.rs:236-244`). **Ввод** — polled: `get_byte()` крутится
+на `LSR.DATA_READY` (`uart.rs:305-312`). `uart::init()` (`uart.rs:170-177`) ставит
 `IER = 0`, `LCR = 0x80` (DLAB), делитель 1, `LCR = 0x03` (8N1), `FCR = 0x07`;
 порядок существенен (делитель до включения FIFO), а `FCR = 0x07` очищает оба FIFO —
 поэтому байты, отправленные в UART до инициализации, теряются, и тестовый драйвер
 ждёт баннер, а не пишет команды сразу.
 
-**Шелл** (`src/shell.rs:21-59`): промпт `pagh:rv64> `, буфер 128 байт (`shell.rs:15`),
+**Шелл** (`src/shell.rs:67-182`): промпт `pagh:rv64> `, буфер 128 байт (`shell.rs:38-40`),
 длинная строка отвергается целиком, backspace (`0x7f`/`0x08`) стирает символ и в
 буфере, и на терминале, печатаемые байты `0x20..0x7f` эхо-ятся, прочие управляющие
-игнорируются. Истории, автодополнения и стрелок нет (`shell.rs:5-7`).
+игнорируются. Истории, автодополнения и стрелок нет (`shell.rs:3-5`).
 
 | Команда | Что делает | Источник |
 |---|---|---|
-| `help` | список команд | `shell.rs:144-154` |
-| `mem` | диапазон из DTB + статистика PMM + статистика кучи (три строки) | `shell.rs:155-186` |
-| `selftest` | четыре проверки памяти (кадры, шаблон, куча, защиты кучи), PASS/FAIL, summary, ledger гигиены | `shell.rs:187-194`, `src/memory/selftest.rs` |
-| `time` | `time` CSR и частота timebase | `shell.rs:195-204` |
-| `hart` | id hart'а из `BOOT_HART_ID` | `shell.rs:205` |
-| `echo <text>` | печать слов через один пробел | `shell.rs:206-219` |
-| `clear` | ANSI `ESC[2J ESC[H` (чистит и экран, и терминал) | `shell.rs:220` |
-| `halt` | SBI SRST, машина выключается | `shell.rs:244-249` |
-| что угодно ещё | `<x>: unknown command (try 'help')` | `shell.rs:228-230` |
+| `help` | список команд | `shell.rs:217-272` |
+| `mem` | диапазон из DTB + статистика PMM и кучи + снимок таблицы страниц (sv39) | `shell.rs:273-330` |
+| `selftest` | все in-QEMU наборы: 7 проверок памяти + block/fs/arch/task/user/net, PASS/FAIL, сводки, ledger гигиены | `shell.rs:351-359`, `src/*/selftest.rs` |
+| `time` | `time` CSR и тики ядра; uptime, число прерываний таймера, статистика PLIC/UART | `shell.rs:418-462` |
+| `hart` | id hart'а из `BOOT_HART_ID` | `shell.rs:477` |
+| `echo <text>` | печать слов через один пробел | `shell.rs:478-491` |
+| `clear` | ANSI `ESC[2J ESC[H` (чистит и экран, и терминал) | `shell.rs:515` |
+| `halt` | SBI SRST, машина выключается | `shell.rs:516-522` |
+| что угодно ещё | `<x>: unknown command (try 'help')` | `shell.rs:523-525` |
+
+Полный список команд (с контрактами аргументов) — README, раздел «Как управлять
+шеллом»; выше — те, через которые проходит M1-поверхность.
 
 Строки баннера, промпта, `pmm`/`framebuffer` и `halt: powering off` — это
 **поверхность тестов**: их проверяет `.github/smoke.py` (шесть режимов: serial,
