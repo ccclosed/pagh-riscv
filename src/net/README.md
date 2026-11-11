@@ -1,8 +1,11 @@
 # `src/net/` — сеть: свой стек и virtio-net (M7)
 
-Сеть в pagh-riscv — это **свой** стек поверх своего TCP/IP, без smoltcp и без
-внешних крейтов, и драйвер virtio-net, написанный рядом с virtio-blk. Всё
-`core`+`alloc`, всё опрашивается: сетевого потока и прерываний у NIC нет.
+Сеть в pagh-riscv — это **свой** стек поверх своего TCP/IP (без smoltcp) и
+драйвер virtio-net, написанный рядом с virtio-blk. Всё `core`+`alloc`, всё
+опрашивается: сетевого потока и прерываний у NIC нет. Единственное исключение —
+TLS 1.3-клиент: рукопожатие ведёт vendored `embedded-tls` и X.509-стек из
+`vendor/`, а решение «доверять ли серверу» принимает свой слой ядра (`tls.rs`,
+`tls_verify.rs`).
 
 ## Карта
 
@@ -148,9 +151,10 @@ out-of-order reassembly, congestion control, keepalive, TIME_WAIT и half-close
 
 ## Чего нет (честно)
 
-- Нет TLS и apt: и то и другое — следующий майлстоун, требует крипто-слоя
-  (vendored `embedded-tls` + OpenPGP-проверка, как на x86). Сейчас `http`, а не
-  `https`.
+- Нет apt и нет проверки подписей (OpenPGP): TLS 1.3-клиент есть с 0.19.0
+  (`tls.rs`; шелл `https`, с 0.21.0 — userland-сессии 1100–1103) на vendored
+  `embedded-tls`, а `apt` — следующий майлстоун. `pkg` при этом ходит только по
+  `http` (см. `../pkg/README.md`).
 - IPv6, фрагментация, ICMP redirect/unreachable, UDP-`connect`/`sendmsg`/
   `recvmsg`, несколько TCP-listener'ов, keepalive, Nagle/окна больше
   фиксированного, out-of-order reassembly, congestion control, TIME_WAIT и
@@ -159,7 +163,8 @@ out-of-order reassembly, congestion control, keepalive, TIME_WAIT и half-close
   порт и payload ≤ 1024 B; блокирующий `recvfrom` не прерывается сигналом и
   отвечает `-EAGAIN` по ~10 s бюджету. `setsockopt`/`getsockopt` принимают
   типовые опции, но ничего не настраивают; DNS из userland вызывается только
-  shell-командой `dns`, не сокетным syscall'ом; TLS нет.
+  shell-командой `dns`, не сокетным syscall'ом. TLS-сессии живут в `tls.rs`
+  (отдельное семейство вызовов 1100–1103), а не в опциях сокета.
 - Прерывания NIC: всё polled, `wfi`-idle шелла просыпается на тик и сам
   опрашивает сеть.
 - DHCP renewal по таймеру: `dhcp` — ручная команда; lease не обновляется сам.

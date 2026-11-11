@@ -1,12 +1,14 @@
 # `src/` — карта кодовой базы ядра pagh-riscv
 
 Крейт `pagh`: **бинарный**, `#![no_std]` + `#![no_main]`
-(`src/main.rs:10-11`), без единой зависимости (`Cargo.toml:8-9`), один таргет —
-`riscv64gc-unknown-none-elf` (`.cargo/config.toml:2`). `alloc` подключён
-(`extern crate alloc`, `src/main.rs:16`) и опирается на `#[global_allocator]`
-в корне крейта (`src/main.rs:35-36`) — то есть на кучу из `src/memory/heap.rs`.
-Линкуется `linker.ld`, точка входа `_start` на `0x8020_0000`. Всё, что
-компилируется в это ядро, лежит в этом каталоге; чужих крейтов нет.
+(`src/main.rs:10-11`), один таргет — `riscv64gc-unknown-none-elf`
+(`.cargo/config.toml:2`). Зависимости — только vendored стек TLS 1.3/X.509
+(`Cargo.toml:8-55`, `vendor/`: 11 прямых пинов, 77 крейтов); остальной код свой.
+`alloc` подключён (`extern crate alloc`, `src/main.rs:16`) и опирается на
+`#[global_allocator]` в корне крейта (`src/main.rs:35-36`) — то есть на кучу из
+`src/memory/heap.rs`. Линкуется `linker.ld`, точка входа `_start` на
+`0x8020_0000`. Своего кода вне этого каталога нет; вместе с ним в ядро
+компилируются только vendored-крейты из `vendor/`.
 
 ## Карта
 
