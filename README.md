@@ -2,7 +2,8 @@
 
 <p align="center">
   Небольшое 64-битное ядро для RISC-V (RV64) на Rust: <code>#![no_std]</code>,
-  без единой внешней зависимости, загрузка через OpenSBI, запуск в QEMU.
+  весь код свой, кроме vendored-стека TLS 1.3/X.509 (<code>Cargo.toml</code>,
+  с 0.19.0), загрузка через OpenSBI, запуск в QEMU.
 </p>
 
 <p align="center">
@@ -270,9 +271,9 @@ SELFTEST SUMMARY: 7/7 passed
 | VFS | готово | `VfsNode`, синтетический корень, монтирование в `/mnt`, два примитива разрешения путей (`lookup_path` без последней симлинки / `walk` с переходом и бюджетом) | `src/vfs/mod.rs` |
 | Планировщик, потоки ядра (M6a) | готово | контекстный switch (callee-saved ABI), до 16 слотов (14 user-потоков на процесс), round-robin, квант 8 тиков, стек 16 KiB + guard из PMM, состояния `Ready/Running/Blocked/Stopped/Exited`, `block_current`/`wake_task` с тиковым дедлайном, `stop_current`/`continue_task` для job control, `Task::satp` + `install_satp` перед switch, вытеснение тиком таймера из trap-контекста (включая вытеснение U-mode), `tasks`/`spawn`/`yield`; exit возвращает кадры | `src/arch/riscv64/switch.rs`, `src/task/` |
 | User mode, syscalls, ELF, native ABI (M6b) | готово | `sret` в U-mode (`SPP=0`, `SPIE=1`, `SUM=0`, `sscratch`-контракт); **user-стек растёт по требованию**: load/store page fault ниже текущего дна (`Process::stack_low`) мапит и обнуляет страницы до адреса fault'а и повторяет инструкцию, потолок 1 MiB на процесс (64 KiB начального окна + 960 KiB, дно `0x3ff0_0000`), ниже дна — настоящий guard, на котором рекурсия сверх лимита умирает `store page fault`; `fork` копирует выросшие страницы, `execve` сбрасывает границу, teardown возвращает кадры в PMM; нативные потоки `clone`/`gettid`/`set_tid_address`/`exit`/`exit_group`/`futex` (общие Process/root, fd-таблица, heap и mmap; своё ядро-стек и user-стек вызывающего), фьютексы `WAIT`/`WAKE`; процессы `fork`(1000)/`execve`(221)/`wait4`(260)/`getppid`(173): свой Sv39-root/ASID, глубокая копия страниц, наследование fd/pipe/обработчиков, замена образа и статус `wait`, очистка сирот раннером; вход `a0=argc`, `a1=argv`, SysV-кадр `argc/argv/envp` с `argv[0]` как набран и `PWD=<cwd>`; `ecall`-диспетчер: `read`/`write`/`openat`/`close`/`lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/`readlinkat`/`exit`/`sched_yield`/`getpid` + `mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`/`ftruncate` (мутации через `parent_and_leaf` + `walk(parent, true)`, per-process режим для `fstat`), `sepc+4`, таблица 16 fd на процесс, `copy_from_user`/`copy_to_user` с проверкой `U/R/W` и `SUM` вокруг копии, heap-окно 1 MiB с возвратом кадров; ELF64-загрузчик с откатом кадров и **потоковым чтением** `ImageSource` (сегменты кусками ≤ 512 B, без буфера размером с файл), `run <path> [args...]` до 1 MiB и фикстуры `demo`/`fault`/`spin`/`argv`/`abi`; BSD-сокеты `socket`/`bind`/`connect`/`sendto`/`recvfrom`/`setsockopt`/`getsockopt`/`shutdown` (один TCP-клиент + UDP-сокеты, IPv4-литералы) и маршрутизация `read`/`write`/`close`/`poll` на сокет; POSIX-подобные сигналы `kill`/`tgkill`/`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`/`sigaltstack` (обработчики на процесс: fork копирует, exec сбрасывает; pending/blocked/altstack на поток; user-кадр 736 B с полным `siginfo_t` и `ucontext_t`; `SA_SIGINFO`/`SA_ONSTACK`/`SA_NODEFER`/`SA_RESETHAND`/`SA_RESTART`; job control `SIGSTOP`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU` + `SIGCONT`); synchronous SIGSEGV/SIGILL/SIGBUS/SIGTRAP при установленном обработчике; fault из U без обработчика убивает процесс; таймер вытесняет U-mode | `src/user/`, `src/user/stack.rs`, `src/user/process.rs`, `src/user/signal.rs`, `src/memory/paging.rs`, `userland/` |
-| Сеть (M7) | готово | virtio-net (modern, polled) + свой стек: Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP-клиент, DNS-резолвер, `net`/`dhcp`/`ping`/`dns`/`http`; без smoltcp и внешних крейтов. Для userland — один active-open TCP-сокет (`AF_INET`/`SOCK_STREAM`, IPv4-литерал) и UDP-сокеты (`AF_INET`/`SOCK_DGRAM`, `bind`/per-port-очередь/`sendto`/`recvfrom`); syscall'ы сами опрашивают NIC; `read`/`write`/`poll` работают на сокете | `src/net/`, `src/drivers/virtio_net.rs`, `src/user/syscall.rs` |
-| Пакеты (`pkg`) | MVP | нативный установщик (не apt): плоский `index` и `.ppkg` с репозитория по **plain HTTP** (`http://IP:port/`, в QEMU хост — `10.0.2.2`), потоковая загрузка в `/mnt/pkg` кусками 4 KiB, шлюз «размер + SHA-256 из индекса» **до** разбора `PPKG0001`; `kind=app` → `/mnt/bin/<name>`, `applet-bundle` → `/mnt/bin/paghbox` + симлинки; манифест в `/mnt/pkg/<name>.manifest`; TLS/OpenPGP/apt по-прежнему нет | `src/pkg/` |
-| apt / TLS / OpenPGP | **нет** | apt намеренно не подключён, пока нет vendored TLS + проверки подписей Debian; `pkg` — отдельный нативный путь для портов | — |
+| Сеть (M7) | готово | virtio-net (modern, polled) + свой стек: Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP-клиент, DNS-резолвер, `net`/`dhcp`/`ping`/`dns`/`http`; TCP/IP свой, без smoltcp (TLS-клиент — vendored `embedded-tls`, см. `docs/tls.md`). Для userland — один active-open TCP-сокет (`AF_INET`/`SOCK_STREAM`, IPv4-литерал) и UDP-сокеты (`AF_INET`/`SOCK_DGRAM`, `bind`/per-port-очередь/`sendto`/`recvfrom`); syscall'ы сами опрашивают NIC; `read`/`write`/`poll` работают на сокете | `src/net/`, `src/drivers/virtio_net.rs`, `src/user/syscall.rs` |
+| Пакеты (`pkg`) | MVP | нативный установщик (не apt): плоский `index` и `.ppkg` с репозитория по **plain HTTP** (`http://IP:port/`, в QEMU хост — `10.0.2.2`), потоковая загрузка в `/mnt/pkg` кусками 4 KiB, шлюз «размер + SHA-256 из индекса» **до** разбора `PPKG0001`; `kind=app` → `/mnt/bin/<name>`, `applet-bundle` → `/mnt/bin/paghbox` + симлинки; манифест в `/mnt/pkg/<name>.manifest`; TLS-транспорта, OpenPGP и apt у `pkg` по-прежнему нет | `src/pkg/` |
+| apt / OpenPGP | **нет** | apt намеренно не подключён, пока нет проверки подписей Debian (OpenPGP); `pkg` — отдельный нативный путь для портов. TLS 1.3-клиент есть с 0.19.0 (шелл `https`; 0.21.0 — userland-сессии 1100–1103), но `pkg` его не использует | — |
 | Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 4 блока/указателя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 14 user-mode (включая `user-tls-abi` — `getrandom` и fail-closed матрица 1100–1103; ABI-фикстуры `argv`/`abi` с секциями потоков/фьютексов, сигналов и TCP-сервера: bind/listen/nonblocking accept/EAGAIN/dup-ENOTSUP; `user-stack-grows` — цепочка 160 KiB возвращается через `stack: deep recursion ok`, `user-stack-cap` — цепочка 1.2 MiB умирает `store page fault` на guard-странице, `user-stack-fork` — fork на выросшем стеке, обе стороны доходят до конца, `wait4` возвращает pid; 14/14 с диском, 12/14 + 2 SKIP без `/mnt`) + 12 сети (идемпотентность по ledger'у, `net-tls-session-gate`), QEMU-smoke в шести режимах (serial, ramfb, диск-fresh, диск-existing, net, keyboard), установка пакета проверяется отдельным тестом `pkg`, живые сокетные прогоны — `tools/test_sockets.py` (TCP-клиент), `tools/test_udp.py` (UDP), `tools/test_tcp_server.py` (TCP-сервер: `mke2fs -d` + QEMU `hostfwd`) и `tools/test_tls.py` (живой TLS 1.3 + userland `https_get`; libpagh-фикстуры, не в CI); проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/net/selftest.rs`, `src/pkg/`, `.github/smoke.py`, `tools/` |
 | CI | готово | `fmt`, debug/release build, QEMU-smoke в шести режимах: serial, ramfb, диск-fresh (формат/монтирование/запись), диск-existing (повторная загрузка читает файл), net (DHCP + ping шлюза), keyboard (virtio-keyboard печатает `help`/`halt` через монитор QEMU); во всех приложен virtio-tablet, в keyboard — ещё и virtio-keyboard | `.github/workflows/ci.yml` |
 
@@ -601,7 +602,8 @@ backspace работает, всё остальное — команды:
 
 `pkg` ставит в `/mnt` один статический RV64 ELF из `.ppkg`, скачанного с
 плоского HTTP-репозитория. Это **не apt**: ни Debian-метаданных, ни `.deb`, ни
-solver'а зависимостей, ни сжатия, ни OpenPGP; TLS тоже нет. Репозиторий — это
+solver'а зависимостей, ни сжатия, ни OpenPGP; TLS-транспорта у `pkg` тоже нет
+(ядро TLS-клиент имеет с 0.19.0, установщик его не использует). Репозиторий — это
 файл `index` и каталог `pkg/*.ppkg`; формат описан в `docs/package-format.md`
 репозитория [`pagh-programs`](https://github.com/ccclosed/pagh-programs).
 
@@ -628,9 +630,10 @@ pkg remove hello                             # pkg: removed hello
 пишется последним, и `pkg remove` работает по нему.
 
 Это проверка **целостности**, а не подписи: зеркало, которое отдаёт другой
-пакет с тем же размером и хешем, дизайном не ловится. HTTPS и OpenPGP — следующий
-майлстоун; до него `pkg` честно говорит «only plain http:// is supported
-(there is no TLS yet)» на `https://` и не притворяется apt.
+пакет с тем же размером и хешем, дизайном не ловится. Подписей (OpenPGP) нет —
+это следующий шаг; `pkg` намеренно ходит только по `http://` даже при наличии
+TLS-клиента в ядре и честно отвечает «only plain http:// is supported
+(there is no TLS yet)» на `https://`, не притворяясь apt.
 
 Ограничения MVP: до 64 пакетов в индексе, IPv4-хост в URL (без DNS), один
 пакет за раз, `payload ≤ 8 MiB`, до 160 команд в `applet-bundle`, `/mnt`
@@ -775,9 +778,10 @@ IPv4, ICMP и UDP, а `dhcp`/`dns`/`tcp` — маленькие клиенты. 
 * **Один блочный слот, нет разделов/hot-plug.** Второй диск — изменение дизайна.
 * **Нет подписей пакетов и apt.** Нативный `pkg` говорит по plain HTTP и
   проверяет только размер + SHA-256 из индекса: это целостность, а не
-  аутентификация источника. TLS-стек и OpenPGP-проверка подписей — следующий
-  майлстоун; `apt` намеренно не подключается, пока их нет: «скачали и поставили
-  без проверки» — это ровно то, чего fail-closed apt не делает.
+  аутентификация источника. TLS 1.3-клиент в ядре есть (0.19.0; `https` и
+  userland-сессии 1100–1103), но `pkg` им не пользуется; OpenPGP-проверки
+  подписей и `apt` нет — `apt` намеренно не подключается, пока их нет: «скачали
+  и поставили без проверки» — это ровно то, чего fail-closed apt не делает.
 * **TCP минимальный.** Один active-open клиент, один listener и восемь слотов
   соединений; без retransmission-таймера (кроме двух SYN), out-of-order
   reassembly, congestion control, keepalive, TIME_WAIT и half-close; backlog ≤ 4,

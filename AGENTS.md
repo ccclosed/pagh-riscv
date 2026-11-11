@@ -1,8 +1,9 @@
 # AGENTS.md — guide for AI agents (and humans) working on pagh-riscv
 
-A small 64-bit RISC-V (RV64) kernel in Rust: `#![no_std]`, **zero dependencies**,
-booted by OpenSBI in S-mode on QEMU's `virt` machine, with a polled serial console
-and a ramfb screen. Written by AI under human supervision — read this file before
+A small 64-bit RISC-V (RV64) kernel in Rust: `#![no_std]`; the kernel code is
+written here, the only crates are the vendored TLS 1.3/X.509 stack (since 0.19.0),
+and it is booted by OpenSBI in S-mode on QEMU's `virt` machine, with a polled
+serial console and a ramfb screen. Written by AI under human supervision — read this file before
 touching the code. It lists the gates that must pass and the invariants that are
 easy to break silently.
 
@@ -105,8 +106,9 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
 
 ## Repo layout
 
-- `src/` — the kernel (crate `pagh`, **binary**, target `riscv64gc-unknown-none-elf`,
-  `[dependencies]` empty). Modules: `main.rs` (boot phases, global allocator, panic
+- `src/` — the kernel (crate `pagh`, **binary**, target
+  `riscv64gc-unknown-none-elf`; `[dependencies]` is the exactly pinned, vendored
+  TLS/X.509 set). Modules: `main.rs` (boot phases, global allocator, panic
   handler), `arch/riscv64/{boot,csr,sbi,traps,mmu}.rs`, `fdt.rs`,
   `memory/{pmm,heap,selftest}.rs` (+ `src/memory/README.md`),
   `drivers/{uart,fw_cfg,ramfb,framebuffer,block,virtio_mmio,virtio_net,virtio_input,selftest}.rs`
@@ -134,7 +136,9 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
 - `.github/` — CI workflow and the smoke driver.
 - `run.sh`, `linker.ld`, `rust-toolchain.toml`, `.cargo/config.toml` — build and run.
 - Absent on purpose (do not assume they exist): `host-tests/`, `tools/build.py`,
-  `tools/e2e.py`, `vendor/`, `limine/`, `disk.img`, `OVMF.fd`.
+  `tools/e2e.py`, `limine/`, `disk.img`, `OVMF.fd`. `vendor/` is **not** absent: it
+  is the committed source of the pinned TLS/X.509 crates, selected by
+  `.cargo/config.toml` so the build is offline and `--locked`.
 
 ## Hard invariants (breaking these looks like "hardware" bugs)
 
@@ -238,12 +242,18 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
     an interrupt on an unarmed register. `plic::windows()` derives the S-mode
     context page — never map `CONTEXT_BASE` alone (that is firmware's M-mode
     context; the first threshold write faults, as the first M3 boot showed).
-15. **`#![no_std]`, no dependencies.** `Cargo.toml`'s `[dependencies]` is empty.
-    `alloc` **is** available (`extern crate alloc` + `#[global_allocator]` in
-    `src/main.rs`). Nothing that runs *before* the frame pool may allocate, and the
-    drivers that run early (console, ramfb, virtio probe) use fixed statics — but
-    the filesystem mount and the shell are normal `alloc` users by design. Adding a
-    crate is an architecture decision, not an implementation detail.
+15. **`#![no_std]`, and the dependency set is vendored and pinned.** Since 0.19.0
+    `[dependencies]` holds the TLS 1.3/X.509 stack: 11 direct pins (`embedded-tls`
+    with its local `Finished`-ordering patch, `embedded-io[-async]`, `rand_core`,
+    `rsa`, `p384`, `ed25519-dalek`, `sha2`, `p256`, `signature`, `const-oid`), 77
+    crates in total under `vendor/`, built offline via `.cargo/config.toml`. The
+    rest of the kernel uses no crates. `alloc` **is** available (`extern crate
+    alloc` + `#[global_allocator]` in `src/main.rs`). Nothing that runs *before*
+    the frame pool may allocate, and the drivers that run early (console, ramfb,
+    virtio probe) use fixed statics — but the filesystem mount and the shell are
+    normal `alloc` users by design. Adding a crate, refreshing the vendored set, or
+    dropping the embedded-tls patch is an architecture decision, not an
+    implementation detail.
 16. **`unsafe` blocks carry `SAFETY:` comments** — every one, including the asm
     contracts (house style; no automated gate yet, unlike x86's `check_safety.py`).
 17. **Only a blank device is ever formatted.** `main.rs::init_fs` mounts first and
@@ -495,7 +505,7 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
 |---|---|
 | Sv39 is on with an **identity** map, so a physical address is still a pointer | the kernel root and every process root copy that identity map; any address handed to a device (`fw_cfg`, ramfb) relies on it. `create_user_space` copies only supervisor leaves, so a kernel mapping added after a process root was created is absent there — do not add kernel maps under a live process without a plan |
 | The tick is 100 Hz and preemption happens only on it (no priorities/deadline scheduler) | scheduling policy is a scheduler change; `timer::set_tick_handler` is the seam, not a policy |
-| No TLS/apt: the network stack speaks plain HTTP | `pkg` verifies size + SHA-256 from the index only (integrity, not signatures) and says so; apt stays deliberately unwired until the vendored-TLS + OpenPGP milestone lands. Never call the digest a signature or `pkg` an apt replacement |
+| `pkg`/apt have no package signatures and no TLS transport in the installer | TLS 1.3 exists in the kernel (0.19.0 client, 0.21.0 userland sessions) but `pkg` speaks plain HTTP on purpose; it verifies size + SHA-256 from the index only (integrity, not signatures) and says so; apt stays deliberately unwired until OpenPGP package-signature verification lands. Never call the digest a signature or `pkg` an apt replacement |
 | TCP is a minimal client + one listener, not a general stack; userland gets one active `AF_INET`/`SOCK_STREAM` client, one listener (`bind`/`listen`/`accept`) and `AF_INET`/`SOCK_DGRAM` (bind/sendto/recvfrom) | one listener, backlog ≤ 4, 8 connection slots (4 KiB rx each); no UDP `connect`, IPv6 sockets, DNS syscall, keepalive/TIME_WAIT/half-close, out-of-order reassembly, congestion control or TLS; UDP is 8 bindings × 4 datagrams × 1024 B, one interface |
 | The NIC is polled and the stack is synchronous | network progress happens while a command, a socket syscall (`connect`/`send`/`recv`/`close`) or the shell's idle loop polls; an IRQ-driven NIC is a later milestone |
 | Interrupt handlers cannot allocate or print | put work in normal context; bump a counter and read it from `time`/`selftest` |
@@ -573,8 +583,9 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
     under `/mnt/bin` is touched. Only after that gate is `PPKG0001` parsed and a
     payload copied to `/mnt/bin`; the manifest is written last. Never reorder
     this into "parse while downloading", "install then verify", or a whole-package
-    heap buffer. There is no TLS, no OpenPGP and no apt: do not describe the
-    SHA-256 as authentication, and do not call `pkg` an apt replacement.
+    heap buffer. `pkg` does not use the kernel's TLS client, and there is no
+    OpenPGP and no apt: do not describe the SHA-256 as authentication, and do not
+    call `pkg` an apt replacement.
 
 35. **Every path mutation shares one shape and one error contract.** `mkdirat`,
     `unlinkat`, `symlinkat`, `linkat`, `renameat2` and `fchmodat` read the path
@@ -622,7 +633,8 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
     clamps the backlog to `1..=4`; the UDP binding table is static (8 ports, 4
     datagrams each), the queue drops the oldest datagram when full, and no lock
     is held across `copy_to_user` or a NIC poll. IPv4 literals only: there is
-    no DNS syscall, no UDP `connect`, no IPv6 socket, and no TLS. The live
+    no DNS syscall, no UDP `connect`, no IPv6 socket, and no TLS socket option
+    (TLS is the separate `tls_*` 1100-1103 family over a connected stream). The live
     evidence is `tools/test_sockets.py` / `docs/live-sockets.txt` (TCP client),
     `tools/test_tcp_server.py` / `docs/live-tcp-server.txt` (TCP server) and
     `tools/test_udp.py` / `docs/live-udp.txt` (UDP); the CI-safe evidence is the
