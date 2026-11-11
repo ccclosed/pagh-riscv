@@ -900,7 +900,7 @@ fn cmd_mv<'a>(mut args: impl Iterator<Item = &'a str>, state: &mut State) {
 }
 
 /// `ln [-s] <target> <path>`: a symbolic link with `-s`, a hard link without.
-fn cmd_ln<'a>(mut args: impl Iterator<Item = &'a str>, state: &mut State) {
+fn cmd_ln<'a>(args: impl Iterator<Item = &'a str>, state: &mut State) {
     let mut symbolic = false;
     let mut rest: alloc::vec::Vec<&'a str> = alloc::vec::Vec::new();
     for arg in args {

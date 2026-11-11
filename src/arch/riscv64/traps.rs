@@ -297,7 +297,7 @@ pub fn user_timer_ticks() -> u64 {
 /// would make the first S-mode trap try to switch to a stack that does not exist.
 pub fn init() {
     crate::arch::riscv64::csr::write_sscratch(0);
-    crate::arch::riscv64::csr::write_stvec(trap_entry as usize);
+    crate::arch::riscv64::csr::write_stvec(trap_entry as *const () as usize);
     crate::arch::riscv64::csr::enable_interrupts();
 }
 

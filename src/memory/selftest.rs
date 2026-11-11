@@ -333,7 +333,7 @@ fn heap_defenses() -> bool {
     let mut ok = true;
     // See `heap_vec`: compare against the state this routine found, not against
     // zero, so a driver's or filesystem's persistent heap does not read as a leak.
-    let (base_used, base_mapped, base_chunks) = crate::heap_stats();
+    let (base_used, base_mapped, _) = crate::heap_stats();
     let block_layout = Layout::from_size_align(64, 8).unwrap();
     let keeper_layout = Layout::from_size_align(128, 8).unwrap();
 
