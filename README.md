@@ -665,7 +665,7 @@ python3 tools/test_pkg.py
 | # | Фаза | Код |
 |---|---|---|
 | 1 | `_start`: OpenSBI запускает ровно один hart (любого id); стек и `kmain` | `src/arch/riscv64/boot.rs` |
-| 2 | стек: `sp = __stack_top`, 64 KiB в `.bss`, выравнивание 16 | `src/arch/riscv64/boot.rs` |
+| 2 | стек: `sp = __stack_top`, 128 KiB в `.bss`, выравнивание 16 | `src/arch/riscv64/boot.rs` |
 | 3 | захват hart id в `BOOT_HART_ID` (пока он в `a0`) | `src/arch/riscv64/boot.rs` |
 | 4 | `call kmain(a0, a1)` | `src/arch/riscv64/boot.rs` |
 | 5 | консоль: `uart::init()` + попытка поднять экран (`console::init` → `framebuffer::init`) | `src/main.rs`, `src/console.rs` |
@@ -676,11 +676,17 @@ python3 tools/test_pkg.py
 | 10 | `traps::init()`: `stvec` + `sstatus.SIE` — до всего, что может сбойнуть | `src/main.rs`, `src/arch/riscv64/traps.rs` |
 | 11 | `shell::run(tree)` — цикл консоли, не возвращается | `src/main.rs`, `src/shell.rs` |
 
+Таблица сокращённая: полная последовательность (фазы 0–17, включая таймер, PLIC,
+задачи, virtio-диск, VFS, сеть и указатель) с обоснованием порядка — в
+`docs/architecture.md`, раздел 3.
+
 **Привилегии.** Ядро живёт в S-mode; M-mode принадлежит прошивке, и обращаться
 туда можно только через SBI (`ecall`) — именно так работает `halt`. M-mode CSR
 из S-mode недоступны физически: `csrr …, mhartid` — это illegal instruction, и
 ядро узнало это на своём опыте (см. `docs/architecture.md`, раздел 2). `satp`
-включает Sv39 с identity-картой (страницы 4 KiB, без user-бита); U-mode нет.
+включает Sv39 с identity-картой (страницы 4 KiB); с M6b у каждого процесса свой
+Sv39-root и страницы с `U=1`, вход в U-mode — один `sret` (`user::enter_user`), а
+`ecall` — syscall-ABI (см. «User mode» выше и `docs/architecture.md` §9.1).
 
 **Устройства.** Единственное описание машины — device tree: ядро читает из него
 память и частоту timebase, отказываясь угадывать при ошибке разбора. Адреса UART
@@ -695,7 +701,7 @@ IPv4, ICMP и UDP, а `dhcp`/`dns`/`tcp` — маленькие клиенты. 
 Детали и честные границы — [`src/net/README.md`](src/net/README.md).
 
 **Память.** Ядро линкуется на `0x8020_0000` (`linker.ld`), `.bss` — 8 МиБ:
-две поверхности экрана (тень и scanout), битовая карта PMM, стек 64 KiB и
+две поверхности экрана (тень и scanout), битовая карта PMM, стек 128 KiB и
 статики; `__kernel_end` выровнен на 4 KiB. `.bss` не обнуляется кодом ядра:
 обнуляет ELF-загрузчик QEMU (NOBITS-сегмент) — и это существенно, потому что
 полярность карты PMM («бит установлен = кадр свободен») держится именно на нулях.

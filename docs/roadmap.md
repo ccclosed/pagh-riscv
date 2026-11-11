@@ -27,14 +27,14 @@
 
 | Критерий | Как проверяется | Подтверждение |
 |---|---|---|
-| `_start` паркует не-нулевые hart'ы и вызывает `kmain` | `src/arch/riscv64/boot.rs:13-38`; в логе `boot hart   0` | живой запуск |
-| Стек 64 KiB, выравнивание 16 | `src/arch/riscv64/boot.rs:18-21, 44-54` | `nm`: `__stack_bottom … __stack_top` |
-| DTB читается: память и timebase | `src/main.rs:65-81`, `src/fdt.rs:160-191` | `memory 0x80000000..0x90000000 (256 MiB)`, `timebase 10000000 Hz` |
-| Ошибка DTB фатальна и громкая | `src/main.rs:67-71` | текст `fdt: refusing to guess the machine layout` |
-| Вектор ловушек установлен | `src/main.rs:109-111`, `src/arch/riscv64/traps.rs:151-155` | кадр и диспетчер — `docs/architecture.md`, раздел 4 |
-| Шелл: команды и редактор строки | `src/shell.rs:21-59, 140-250` | `.github/smoke.py`: `mem`, `hart`, `time`, `echo`, неизвестная команда, `help`, `halt` |
-| `halt` действительно выключает машину | `src/shell.rs:221-227`, `src/arch/riscv64/sbi.rs:24-38` | QEMU завершается с кодом 0 (проверка в `smoke.py`) |
-| Нет паники в обработчике ловушек | `src/arch/riscv64/traps.rs:4-8, 195-201` | исключение печатает `[EXC] … halting` и паркует hart |
+| `_start` вызывает `kmain` на единственном hart'е, которому OpenSBI отдал S-mode (id из `a0`, не обязательно 0); остальные hart'ы firmware держит в HSM stopped, ядро их не паркует | `src/arch/riscv64/boot.rs:9-43`; в логе `boot hart   <id>` | живой запуск |
+| Стек 128 KiB, выравнивание 16 | `src/arch/riscv64/boot.rs:51-61` | `nm`: `__stack_bottom … __stack_top` |
+| DTB читается: память и timebase | `src/main.rs:74-90`, `src/fdt.rs:282, 302` | `memory 0x80000000..0x90000000 (256 MiB)`, `timebase 10000000 Hz` |
+| Ошибка DTB фатальна и громкая | `src/main.rs:74-79` | текст `fdt: refusing to guess the machine layout` |
+| Вектор ловушек установлен | `src/main.rs:227`, `src/arch/riscv64/traps.rs:298-302` | кадр и диспетчер — `docs/architecture.md`, раздел 4 |
+| Шелл: команды и редактор строки | `src/shell.rs:67-182, 217-525` | `.github/smoke.py`: `mem`, `hart`, `time`, `echo`, неизвестная команда, `help`, `halt` |
+| `halt` действительно выключает машину | `src/shell.rs:516-522`, `src/arch/riscv64/sbi.rs:87-102` | QEMU завершается с кодом 0 (проверка в `smoke.py`) |
+| Нет паники в обработчике ловушек | `src/arch/riscv64/traps.rs:6-8, 404-416` | исключение печатает `[EXC] … halting` и паркует hart |
 | CI зелёный | `.github/workflows/ci.yml` | `fmt`, debug/release build, smoke в шести режимах (serial, ramfb, keyboard, net, диск fresh/existing) |
 
 Открытый хвост M1: host-тестов нет, чистая логика (`fdt.rs`) не покрыта. Для
