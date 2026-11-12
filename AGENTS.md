@@ -358,7 +358,9 @@ demand-grown-stack runs, `user-tls-abi` — `userland/tls.elf` exercising
 `getrandom(278)` and the fail-closed answer of every TLS syscall on a descriptor
 that is not a session, with no server and no `/mnt` needed — and `user-proc-fs`
 — `userland/proc.elf` reading `/proc` through `openat`/`read`/`getdents64`,
-including the read-only refusals and `-ENOENT`, with no disk and no NIC needed)
+including the read-only refusals, `-ENOENT`, `/proc/self`/its own pid, a live
+forked peer by pid and a reaped child that must be `-ENOENT` again, with no disk
+and no NIC needed)
 + 12 network
 checks, idempotent, each group prints a
 free-frame ledger; `net-tls-session-gate` adds the kernel-side view of the same
@@ -442,7 +444,7 @@ fuzzing. That is a gap, not a policy — the rule stands:
 
 ## Versioning
 
-Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.22.0`,
+Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.23.0`,
 which `Cargo.lock` mirrors. **The two move together in one commit**: CI builds with
 `--locked`, and cargo refuses to rewrite the lock (`cannot update the lock file …
 because --locked was passed`), so a `Cargo.toml`-only bump fails the build job in
@@ -523,7 +525,14 @@ seconds. Verify locally with `cargo build --locked` after any version change.
   `user-proc-fs` (`userland/proc.elf`) and `run proc` prove the userland path,
   and the serial/net/disk-fresh smoke modes prove the shell path; it also puts
   `timer::timebase_hz` to work, leaving 19 of the 20 documented diagnostic
-  warnings. The same rule applies
+  warnings; `0.23.0` adds per-pid `/proc` on top: `/proc/<pid>/{status,stat,
+  cmdline}` for every process with a live thread, `/proc/self` as a symlink into
+  the reader's own entry, and `/proc/kthreads/<tid>/{status,stat}` for kernel
+  threads, which have no pid; `<pid>` is `getpid()` (the Process table is the
+  source), a dead/reaped id is `-ENOENT`, `cmdline` is a bounded 128-byte argv
+  snapshot copied at `run`/`execve` and through `fork`, and `stat` is a
+  documented native subset with no invented CPU-time columns. The same rule
+  applies
   to both: the tag equals the manifest and the `Cargo.lock` entry, and the
   release is not optional.
 
@@ -554,7 +563,7 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
 | Processes are an MVP: `fork` deep-copies, sockets are not inherited (child gets `-ENOTSUP`), file offsets are copied rather than shared, `SIGCHLD` has no child-exit source, no init/reparenting (the foreground runner kills orphans), `MAX_PROCESSES = 6` | do not describe this as POSIX process semantics; wait status is `code<<8` or signal in low 7 bits; a new process resource belongs in `Process` (or a side table) and must be released by `run_source`, `wait4` and `cleanup_orphans` |
 | Signals are a documented subset: no `sigqueue`/`sival_ptr`/queued signals, no SIGFPE producer, no tty/process groups, `SA_RESTART` only for `futex`/`nanosleep` (full timeout again), `SIGCHLD` has no child-exit source (si_status 0), no cross-process `kill`, and `kill(0, SIGSTOP)` can park a whole process | the frame/`siginfo_t`/`ucontext_t` layouts are the ABI (see invariant 41) and must move with `docs/architecture.md` + `userland/abi.rs`; do not claim Linux signal semantics, and add queueing/tty/process-group state as a real design change rather than a flag |
 | 19 compiler warnings remain (unused diagnostic helpers; 20 before 0.22.0, which reads `timer::timebase_hz` from `/proc/cpuinfo`) | do not add more; warning-cleanup PRs are welcome |
-| `/proc` is a fixed read-only slice (`src/vfs/proc.rs`): no `/proc/<pid>`, `/proc/sys`, `/proc/stat`, no writes, no `statfs` | the tree table, the renderers, `src/vfs/README.md` and the smoke/fixture markers move together; content is rendered on read and `size()` renders too, so keep both paths consistent. `/proc/uptime`'s idle field is `0.00` (not accounted) and `/proc/net/arp` lists only fresh entries — do not "improve" either into `-1`/`0`/stale rows |
+| `/proc` is a read-only slice (`src/vfs/proc.rs`) with per-pid only at process granularity: no `/proc/<pid>/task/<tid>`, `/proc/sys`, `/proc/stat`, no writes, no `statfs` | the tree tables, the renderers, `src/vfs/README.md` and the smoke/fixture markers move together; content is rendered on read and `size()` renders too, so keep both paths consistent. `cmdline` is a bounded snapshot (128 B, taken at `run`/`execve`), not live memory; `stat` is a native subset (no CPU-time accounting exists); zombies are `-ENOENT` until `wait4`; there are no permissions. `/proc/uptime`'s idle field is `0.00` and `/proc/net/arp` lists only fresh entries — do not "improve" either into `-1`/`0`/stale rows |
 | No `LICENSE` file although `Cargo.toml` says MIT | do not add a license your work does not own |
 | `src/memory/paging.rs` owns the kernel root and creates process roots; `src/arch/riscv64/mmu.rs` is encoding only | do not map over the kernel image or drop the identity map while a device holds a physical address; `free_user_space` frees table frames only, the process teardown frees the leaves first |
 28. **The software cursor is frame content.** It is erased before text is drawn and
@@ -789,21 +798,35 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
     slot was released meanwhile, never resurrect it; the slot's `used` bit stays
     set while a call is in flight, which is what turns a concurrent second call
     into `-EAGAIN`.
-46. **`/proc` is a fixed read-only slice of live kernel state, not Linux's
-    procfs.** `src/vfs/proc.rs` mounts it from `vfs::init`, so it exists on a
-    machine with no disk — exactly when a diagnostic filesystem is worth having.
-    The tree is exactly `cpuinfo`, `meminfo`, `mounts`, `tasks`, `uptime`,
-    `version` and `net/{dev,arp}`: no `/proc/<pid>`, no `/proc/sys`, no writable
-    knob and no wildcard; an unknown name stays `NotFound` (`-ENOENT`) rather
-    than being synthesised. Content is rendered when read — `read(offset == 0)`
-    re-renders (live state), later offsets continue the same render (one reading
-    pass, so a multi-chunk reader cannot splice two uptimes) — and `size()` *is*
-    the rendered length so `stat`/`fstat` and `lseek(SEEK_END)` agree with what
-    a read returns (EOF comes from `read` answering 0); do not return 0 from
-    `size()` or render once at `lookup`. `write`/`truncate`/
-    `create_*`/`remove` keep the `VfsNode` defaults (`-ENOTSUP`). The renderers
-    run with **no node lock held** (lock order is state-then-node) and take one
-    subsystem lock at a time; a file whose value cannot be reported honestly
-    omits the row or prints the truth (`/proc/uptime`'s second field is `0.00`
-    because idle time is not accounted). Adding a file moves the tree table, its
-    renderer, `src/vfs/README.md`, the fixture and the smoke markers together.
+46. **`/proc` is a read-only slice of live kernel state, not Linux's procfs.**
+    `src/vfs/proc.rs` mounts it from `vfs::init`, so it exists on a machine with
+    no disk — exactly when a diagnostic filesystem is worth having. It has two
+    namespaces: `/proc/<pid>` is a **process** (the id `getpid()` returns, from
+    the `Process` table; `status`, `stat`, `cmdline`), `/proc/kthreads/<tid>` is
+    a **kernel thread** (no pid; `status`, `stat`), and `/proc/self` is a
+    symlink whose target is computed in the reader's context (`<pid>`, or
+    `kthreads/<tid>`) and expanded by the ordinary `walk` — never a special
+    case in the shell or the syscall layer. A pid with no live thread is
+    `NotFound` (`-ENOENT`); zombies are not exposed (`wait4` collects them), and
+    there are no file permissions to check, so every live entry is readable.
+    Content is rendered when read — `read(offset == 0)` re-renders (live state),
+    later offsets continue the same render (one reading pass, so a multi-chunk
+    reader cannot splice two uptimes) — and `size()` *is* the rendered length so
+    `stat`/`fstat` and `lseek(SEEK_END)` agree with what a read returns (EOF
+    comes from `read` answering 0); do not return 0 from `size()` or render once
+    at `lookup`. `write`/`truncate`/`create_*`/`remove` keep the `VfsNode`
+    defaults (`-ENOTSUP`). `/proc/<pid>/status` aggregates the process's live
+    threads (most-awake state, thread count, summed switches/work, main thread's
+    stack and `satp`), `/proc/<pid>/stat` is the documented native field list
+    `id (comm) state ppid threads switches work stack_kib satp` — no utime/stime
+    columns, because the kernel does not account CPU time — and `cmdline` is the
+    bounded 128-byte argv snapshot `Process.cmdline` took at `run`/`execve`
+    (NUL-separated, trailing NUL, copied by `fork`, *not* a live view of the
+    program's stack). The renderers run with **no node lock held** (lock order
+    is state-then-node) and take one subsystem lock at a time (process table
+    first, scheduler after; the process table is released before the scheduler
+    lock is taken). A file whose value cannot be reported honestly omits the
+    row or prints the truth (`/proc/uptime`'s second field is `0.00` because
+    idle time is not accounted). Adding a file or a namespace moves the tree
+    tables, the renderers, `src/vfs/README.md`, the fixture and the smoke markers
+    together.

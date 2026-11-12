@@ -112,7 +112,7 @@ TTF-парсер (только офлайн-растетризованный а�
 | ФС совместима с хостовым ext2 | **готово** | образ `mkfs.ext2 -t ext2` + файл, записанный `debugfs`, читается ядром; `e2fsck -fn` после загрузки чист |
 | данные переживают перезагрузку | **готово** | второй запуск того же образа монтирует его (без формата) и читает файл; это же делает CI (`smoke.py --disk … --fresh`, затем без `--fresh`) |
 | устройство не портится: формат только пустого | **готово** | `src/fs/format_policy.rs`: нули → формат; MBR/GPT/чужое/битый ext2 → отказ с причиной; `SELFTEST ext2-policy PASS` |
-| VFS отделяет ФС от шелла | **готово** | `src/vfs/mod.rs`: `VfsNode`, синтетический корень, `/mnt`, `lookup_path` vs `walk`; 0.22.0 добавила `/proc` (`src/vfs/proc.rs`) поверх того же трейта |
+| VFS отделяет ФС от шелла | **готово** | `src/vfs/mod.rs`: `VfsNode`, синтетический корень, `/mnt`, `lookup_path` vs `walk`; 0.22.0 добавила `/proc` (`src/vfs/proc.rs`) поверх того же трейта, 0.23.0 — per-pid `/proc/<pid>`/`kthreads`/`self` |
 | два прогона `selftest` дают один ledger | **готово** | `PMM hygiene: free frames N -> N` оба раза; 7 memory + 3 block + 11 ext2 проверок |
 | CI проверяет M5 end-to-end | **готово** | `.github/workflows/ci.yml`: пустой образ → формат/монтирование/запись, затем повторная загрузка того же образа читает файл |
 
@@ -121,8 +121,9 @@ TTF-парсер (только офлайн-растетризованный а�
 из хоста — `mkfs.ext2 -q -t ext2 -F /tmp/host.img && debugfs -w -R "write файл …"`.
 
 Не входит в M5 (честно): **журнал/WAL** x86-версии (сбой между двумя записями
-может оставить операцию недоделанной), per-pid procfs (`/proc` появился в 0.22.0
-как фиксированный read-only срез, `src/vfs/proc.rs`), ramfs,
+может оставить операцию недоделанной), per-thread procfs (`/proc` появился в
+0.22.0 как read-only срез, в 0.23.0 — per-pid на уровне процесса,
+`src/vfs/proc.rs`; `<pid>/task/<tid>` нет), ramfs,
 права/uid/gid/времена,
 несколько дисков (в `block.rs` один слот), hot-plug и разделы, кэш страниц и
 отложенная запись, `fsck`, квоты, разреженные файлы и тройной indirect.
@@ -136,7 +137,7 @@ TTF-парсер (только офлайн-растетризованный а�
 | Round-robin и вытеснение по таймеру | **готово** | квант 8 тиков, готовые потоки FIFO; одна строка `timer::set_tick_handler(tick_from_timer)`; `sleep 1` двигает счётчики демо-потоков без `yield` (258 → 358 тиков, 32 → 44 переключения) |
 | Планировщик не аллоцирует и не берёт лок через switch | **готово** | `schedule()` выбирает под локом, отпускает и только потом `task_switch`; тик/switch без аллокаций; контракт в `src/task/README.md` |
 | Проверки машинные и идемпотентные | **готово** | `SELFTEST task-* 5/5`: interleave (130 switch-out), exit-stack, layout/guard, canary, idle; ledger `62650 -> 62650` в двух прогонах |
-| User mode + syscall'ы + ELF из шелла | **готово** | M6b: `sret` с `SPP=0`/`SPIE=1`/`SUM=0`, `sscratch`-контракт ловушек, `ecall`-диспетчер (57 номеров, `sepc+4`, проверка user-указателей по PTE U\|R), ELF64-загрузчик с откатом кадров и потоковым чтением `ImageSource` (≤ 512 B за чтение, без буфера размером с файл), per-process Sv39-root/ASID, `run <path>` до 1 MiB и фикстуры `demo`/`fault`/`spin`/`argv`/`abi`/`exec-child`/`stack`/`stack-over`/`stack-fork`/`proc`, деманд-рост user-стека до 1 MiB на процесс (`src/user/stack.rs`, guard ниже `USER_STACK_FLOOR`); `SELFTEST user-* 15/15` с диском (13/15 + 2 SKIP без `/mnt`), включая `user-stack-grows` (160 KiB цепочка возвращается), `user-stack-cap` (1.2 MiB цепочка умирает `store page fault`), `user-stack-fork` (fork на выросшем стеке, обе стороны доходят, `wait4` возвращает pid), `user-proc-fs` (`userland/proc.elf` читает `/proc` через syscall'ы) и `user-run-large-file` (100 KiB образ с нулевым хвостом через `run_file`), ledger совпадает в двух прогонах; `run demo` → 42, `run fault` → killed, `run spin` → 7 (таймер-in-U), маркеры `abi: threads/signals/altstack/siginfo/jobcontrol/fork/wait/exec/exec wait ok` |
+| User mode + syscall'ы + ELF из шелла | **готово** | M6b: `sret` с `SPP=0`/`SPIE=1`/`SUM=0`, `sscratch`-контракт ловушек, `ecall`-диспетчер (57 номеров, `sepc+4`, проверка user-указателей по PTE U\|R), ELF64-загрузчик с откатом кадров и потоковым чтением `ImageSource` (≤ 512 B за чтение, без буфера размером с файл), per-process Sv39-root/ASID, `run <path>` до 1 MiB и фикстуры `demo`/`fault`/`spin`/`argv`/`abi`/`exec-child`/`stack`/`stack-over`/`stack-fork`/`proc`, деманд-рост user-стека до 1 MiB на процесс (`src/user/stack.rs`, guard ниже `USER_STACK_FLOOR`); `SELFTEST user-* 15/15` с диском (13/15 + 2 SKIP без `/mnt`), включая `user-stack-grows` (160 KiB цепочка возвращается), `user-stack-cap` (1.2 MiB цепочка умирает `store page fault`), `user-stack-fork` (fork на выросшем стеке, обе стороны доходят, `wait4` возвращает pid), `user-proc-fs` (`userland/proc.elf` читает `/proc` через syscall'ы, включая per-pid/`self`/`kthreads` и reaped-child `-ENOENT`) и `user-run-large-file` (100 KiB образ с нулевым хвостом через `run_file`), ledger совпадает в двух прогонах; `run demo` → 42, `run fault` → killed, `run spin` → 7 (таймер-in-U), маркеры `abi: threads/signals/altstack/siginfo/jobcontrol/fork/wait/exec/exec wait ok` |
 | Прерывание таймера, взятое в U-mode | **готово** | `trap_entry` U-путь + `SPP`-разбор эпилога; счётчик `traps::user_timer_ticks()` растёт на `run spin` (0.2 s в U-mode), selftest это проверяет |
 | Linux-compat слой из x86 | **нет** | после M6b и только когда есть userland, которому он нужен |
 
@@ -208,7 +209,8 @@ GitHub release, скриншот `docs/net.png`.
    crt0/`libpagh`, затем порты `curl`/`ripgrep`, переписанные под API.
 3. Свой **загрузчик для x86-64** (в репозитории Pagh-OS) — замена Limine.
 4. Журнал/WAL в ext2, SMP, сетевые помелочи (renewal, несколько сокетов).
-5. **Полный procfs**: per-pid `/proc/<pid>/{status,stat,cmdline,maps}`,
-   `/proc/sys`, `/proc/stat` и `statfs(2)`; 0.22.0 дала фиксированный
-   read-only срез (`src/vfs/proc.rs`: `cpuinfo`, `meminfo`, `mounts`, `tasks`,
-   `uptime`, `version`, `net/{dev,arp}`).
+5. **Полный procfs**: per-thread `/proc/<pid>/task/<tid>`, `maps`,
+   `/proc/sys`, `/proc/stat` и `statfs(2)`; 0.22.0 дала read-only срез
+   (`cpuinfo`, `meminfo`, `mounts`, `tasks`, `uptime`, `version`,
+   `net/{dev,arp}`), 0.23.0 — per-pid `status`/`stat`/`cmdline`, `/proc/self` и
+   `/proc/kthreads` для kernel-потоков (`src/vfs/proc.rs`).

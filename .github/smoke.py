@@ -84,11 +84,14 @@ EXPECTED = [
     # `/proc` is mounted by `vfs::init`, so it exists on this serial-only boot
     # too (no disk, no NIC). The shell reads it with the ordinary file commands;
     # the listing is asserted as one block so order and completeness are checked,
-    # not just the presence of a name.
+    # not just the presence of a name. No user process can be live while the
+    # shell runs (a foreground `run` owns the console), so no numeric `/proc`
+    # entries appear here; the `run proc` fixture below checks that namespace
+    # from inside a process.
     "pagh:rv64> cat /proc/version",
-    "pagh 0.22.0 (riscv64) #1",
+    "pagh 0.23.0 (riscv64) #1",
     "pagh:rv64> ls /proc",
-    "cpuinfo\nmeminfo\nmounts\nnet/\ntasks\nuptime\nversion\n",
+    "cpuinfo\nkthreads/\nmeminfo\nmounts\nnet/\nself\ntasks\nuptime\nversion\n",
     "pagh:rv64> cat /proc/meminfo",
     "MemTotal:",
     "MemFree:",
@@ -101,9 +104,32 @@ EXPECTED = [
     "pagh:rv64> stat /proc/meminfo",
     "type:  regular file",
     "mode:  0644",
+    # The per-pid half, seen from the shell: `/proc/self` is a symlink into the
+    # kernel-thread namespace (the shell is not a process), `/proc/<pid>` is a
+    # process id and a pid that never existed is -ENOENT.
+    "pagh:rv64> cat /proc/self/status",
+    "Name:\tshell",
+    "State:\tR (running)",
+    "Tid:\t0",
+    "Pid:\t0",
+    "Threads:\t1",
+    "Stack:\tboot",
+    "pagh:rv64> cat /proc/self/stat",
+    "0 (shell) R 0 1 ",
+    "pagh:rv64> stat /proc/self",
+    "type:  symbolic link",
+    "target: kthreads/0",
+    "pagh:rv64> ls /proc/kthreads",
+    "0/\n1/\n",
+    "pagh:rv64> cat /proc/0/status",
+    "cat: /proc/0/status: not found",
     # The userland half of the same contract: a static program reads /proc
-    # through openat/read/getdents64 and prints the markers itself.
+    # through openat/read/getdents64 — including `/proc/self`, a live peer by
+    # pid, and a reaped child that must be -ENOENT again — and prints the
+    # markers itself.
     "pagh:rv64> run proc",
+    "proc: self ok",
+    "proc: fork ok",
     "proc: done",
     "run: proc exited with code 0",
     "pagh:rv64> help",
@@ -132,7 +158,8 @@ SCREEN_MARKER = {
 COMMANDS = (b"mem\nhart\ntime\necho smoke ok\nnosuchcmd\n"
             b"run demo alpha beta\n"
             b"cat /proc/version\nls /proc\ncat /proc/meminfo\ncat /proc/tasks\n"
-            b"stat /proc/meminfo\nrun proc\n"
+            b"stat /proc/meminfo\ncat /proc/self/status\ncat /proc/self/stat\n"
+            b"stat /proc/self\nls /proc/kthreads\ncat /proc/0/status\nrun proc\n"
             b"help\nhalt\n")
 
 # ── the disk mode (M5) ─────────────────────────────────────────────────────

@@ -17,14 +17,22 @@
 | `walk` | `mod.rs:520` | переход по путям **с** симлинками и бюджетом шагов (`cat`/`cd`/`write`) |
 | `replace_contents` | `mod.rs:584` | атомарная замена содержимого файла (truncate+write) |
 | `rename` | `mod.rs:599` | переименование через `VfsNode::rename` |
-| `proc` | `proc.rs` | синтетический read-only `/proc`: фиксированное дерево файлов с живым состоянием ядра, рендер при чтении; монтируется в `init` |
+| `proc` | `proc.rs` | синтетический read-only `/proc`: живые файлы состояния, per-pid (`<pid>/{status,stat,cmdline}`), `/proc/kthreads` для kernel-потоков и `/proc/self`-симлинк; рендер при чтении; монтируется в `init` |
 
 ## `/proc`: синтетический срез живого состояния
 
 `vfs::init` монтирует `/proc` (`proc::root()` в `proc.rs`) **до** диска, потому
-что диагностический filesystem нужен именно тогда, когда `/mnt` нет. Дерево
-фиксировано: `cpuinfo`, `meminfo`, `mounts`, `tasks`, `uptime`, `version` и
-каталог `net/` с `dev` (интерфейс + DHCP-lease) и `arp` (живой ARP-кэш). Файл —
+что диагностический filesystem нужен именно тогда, когда `/mnt` нет. Дерево —
+`cpuinfo`, `meminfo`, `mounts`, `tasks`, `uptime`, `version`, каталог `net/` с
+`dev` (интерфейс + DHCP-lease) и `arp` (живой ARP-кэш), плюс два динамических
+пространства имён: `<pid>/{status,stat,cmdline}` (pid — это `getpid()`, источник —
+`Process`, запись живёт, пока у процесса есть живой поток) и
+`kthreads/<tid>/{status,stat}` для kernel-потоков без pid (шелл, idle,
+демо-потоки). `/proc/self` — симлинк, цель которого вычисляется в контексте
+читателя (`<pid>` либо `kthreads/<tid>`) и разворачивается обычным `walk`, так
+что `cat /proc/self/status` не требует ни одной особой ветки в шелле или
+syscall-слое. Мёртвый/переиспользованный id — `-ENOENT`; зомби не выставляются
+(их забирает `wait4`); прав нет — читаются все живые записи. Файл —
 это рендерер, а не буфер: `lookup`/`readdir` создают новый узел, `read` с
 offset 0 перерисовывает (живое состояние), следующие offset'ы продолжают тот же
 рендер (один проход чтения не склеивает два разных uptime), `size()` равен
@@ -35,8 +43,20 @@ offset 0 перерисовывает (живое состояние), след�
 одной подсистемной блокировки за раз. Для `mounts` у узла появился
 `fs_type()` (`ext2`, `procfs`, `synthetic`), а `mount_snapshot()` отдаёт таблицу
 монтирований снимком — так `/proc/mounts` не держит её лок, пока форматирует
-строку. Форматы файлов описаны в `proc.rs`, а проверка — `SELFTEST user-proc-fs`
-и serial/net/disk smoke-режимы.
+строку. Форматы файлов описаны в `proc.rs`.
+
+`<pid>/status` — key/value-строки Linux-подобных имён; значения реальные:
+`State` — самое «проснувшееся» состояние любого живого потока процесса,
+`Threads` — их число, `Switches`/`Work` — суммы, `Tid` — id главного потока,
+`Stack` — его kernel-стек (`boot` для потока загрузки), `Satp`/`ASID` — корень
+процесса. `<pid>/stat` — документированный нативный набор полей
+`id (comm) state ppid threads switches work stack_kib satp`: колонок utime/stime
+нет, потому что учёта CPU-времени в ядре нет, а выдумывать нули нечем.
+`<pid>/cmdline` — снимок argv, скопированный при `run`/`execve` в
+`Process.cmdline` (NUL-разделители и завершающий NUL, потолок 128 байт,
+`fork` копирует ребёнку); это не живая память программы. Проверки —
+`SELFTEST user-proc-fs` (self/свой pid/живой ребёнок/reaped `-ENOENT`,
+kthreads) и serial/net/disk smoke-режимы.
 
 ## Почему два примитива разрешения путей
 
@@ -65,11 +85,11 @@ offset 0 перерисовывает (живое состояние), след�
 
 ## Чего нет
 
-`/dev`, `ramfs`, per-pid дерево `/proc/<pid>`, `/proc/sys` и запись в `/proc`;
-hard links и права; page cache и отложенная запись; `open`/`close`-дескрипторы
-(шелл адресует файлы путями). `/proc` существует как фиксированный read-only
-срез (см. выше); остальное — за пределами M5 и названо в `docs/roadmap.md` и
-`README.md`.
+`/dev`, `ramfs`, `/proc/<pid>/task/<tid>` (per-thread view), `/proc/sys`,
+`/proc/stat` и запись в `/proc`; hard links и права; page cache и отложенная
+запись; `open`/`close`-дескрипторы (шелл адресует файлы путями). `/proc`
+существует как read-only срез с per-pid на уровне процесса (см. выше);
+остальное — за пределами M5 и названо в `docs/roadmap.md` и `README.md`.
 
 ## Как проверить
 
@@ -80,5 +100,7 @@ hard links и права; page cache и отложенная запись; `open
 # без диска: одна строка "no block device", шелл работает
 # /proc: ls /proc; cat /proc/version; cat /proc/meminfo; cat /proc/tasks;
 #        cat /proc/mounts; stat /proc/meminfo; run proc
+# per-pid: ls /proc/kthreads; cat /proc/self/status; cat /proc/self/stat;
+#          stat /proc/self; cat /proc/0/status  (не процесс -> not found)
 # selftest: SELFTEST ext2-* (11/11), SELFTEST user-proc-fs, PMM ledger одинаков
 ```

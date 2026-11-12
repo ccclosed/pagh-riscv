@@ -457,17 +457,31 @@ SELFTEST SUMMARY: 6/6 passed
 
 **`/proc` — синтетический read-only слой поверх VFS.** `src/vfs/proc.rs`
 монтирует `/proc` из `vfs::init`, то есть до и независимо от диска: на машине
-без `/mnt` это единственный способ увидеть живое состояние. Дерево фиксировано —
-`cpuinfo`, `meminfo`, `mounts`, `tasks`, `uptime`, `version`, `net/{dev,arp}`;
-файл не буфер, а рендерер: `lookup`/`readdir` создают новый узел, `read` с
+без `/mnt` это единственный способ увидеть живое состояние. Дерево —
+`cpuinfo`, `meminfo`, `mounts`, `tasks`, `uptime`, `version`, `net/{dev,arp}`,
+плюс два динамических namespace: `/proc/<pid>/{status,stat,cmdline}` для
+процесса (`<pid>` — id из `getpid()`, источник — таблица `Process`; запись
+живёт, пока у процесса есть живой поток) и `/proc/kthreads/<tid>/{status,stat}`
+для kernel-потоков, у которых pid нет (шелл, idle, демо-потоки). `/proc/self` —
+симлинк, цель которого вычисляется в контексте читателя (`<pid>` или
+`kthreads/<tid>`) и разворачивается обычным `walk`: `cat /proc/self/status`
+работает и в шелле, и в userland без единой особой ветки. Мёртвый и
+переиспользованный id — `-ENOENT`; зомби не выставляются (их забирает
+`wait4`); прав нет, читаются все живые записи. `status` агрегирует живые потоки
+процесса (самое «проснувшееся» состояние, `Threads`, суммы `Switches`/`Work`,
+`Tid` главного потока, стек и `satp`), `stat` — документированный нативный
+набор `id (comm) state ppid threads switches work stack_kib satp` (без
+utime/stime: учёта CPU-времени нет), `cmdline` — bounded-снимок argv (128
+байт), скопированный при `run`/`execve` и унаследованный `fork`-ребёнком.
+Файл не буфер, а рендерер: `lookup`/`readdir` создают новый узел, `read` с
 offset 0 перерисовывает содержимое (живое состояние), последующие offset'ы
 продолжают тот же рендер, а `size()` равен длине рендера, чтобы `stat`/`fstat`
 и `lseek(SEEK_END)` показывали ту же длину, что вернёт чтение (EOF — это ответ
-`read` = 0). `write`/`truncate`/`create_*`/`remove` остаются
-дефолтами трейта (`-ENOTSUP`), неизвестное имя — `-ENOENT`; per-pid дерева,
-`/proc/sys` и записи в `/proc` в этом срезе нет. `SELFTEST user-proc-fs`
+`read` = 0). `write`/`truncate`/`create_*`/`remove` остаются дефолтами трейта
+(`-ENOTSUP`), неизвестное имя — `-ENOENT`. `SELFTEST user-proc-fs`
 (`userland/proc.elf`) проходит userland-половину через `openat`/`read`/
-`getdents64` без диска и без NIC, serial/`--net`/disk-fresh smoke проверяют
+`getdents64` без диска и без NIC — включая `/proc/self`, живой forked peer по
+pid и reaped child → `-ENOENT`; serial/`--net`/disk-fresh smoke проверяют
 шелловую половину.
 
 **Тесты.** `selftest` печатает три группы: 7 проверок памяти, 3 блочного слоя
@@ -1238,7 +1252,8 @@ fail-closed ответ всех четырёх TLS-вызовов (1100–1103) 
   16 KiB, из них два системных. `State::Stopped` и `stop_current`/
   `continue_task` есть для job control. TLS/PI/requeue, `join`/`waitid` и
   `CLONE_SETTLS` отсутствуют; процессов ≤ 6, `fork` — deep copy без COW.
-* **Нет журнала/WAL, полного procfs (только фиксированный read-only `/proc`),
+* **Нет журнала/WAL, полного procfs (read-only `/proc` с per-pid на уровне
+  процесса: без `<pid>/task/<tid>`, `/proc/sys` и `/proc/stat`),
   прав/uid, нескольких дисков, кэша страниц, fsck** —
   границы M5 названы в `docs/roadmap.md`; формат совместим с `mkfs.ext2`/`e2fsck`,
   поэтому образ можно проверять хостовыми инструментами.
