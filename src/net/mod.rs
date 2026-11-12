@@ -72,8 +72,9 @@ const UDP_EPHEMERAL_LAST: u16 = 60999;
 const ICMP_SLOTS: usize = 4;
 /// Echo data echoed back and kept in a reply (the ping probe payload).
 const ICMP_DATA_MAX: usize = 32;
-/// ARP cache entries.
-const ARP_ENTRIES: usize = 8;
+/// ARP cache entries. Public because `/proc/net/arp` sizes its snapshot buffer
+/// from the table it reports on: the two cannot drift.
+pub const ARP_ENTRIES: usize = 8;
 /// How long an ARP entry stays fresh, in 10 ms ticks (60 s).
 const ARP_LIFETIME_TICKS: u64 = 6000;
 /// Ticks an ARP resolution may take (1 s).
@@ -702,6 +703,30 @@ fn arp_learn(ip: Ipv4, mac: Mac) {
         seen_ticks: now,
         valid: true,
     };
+}
+
+/// Snapshot the live ARP cache: `(ip, mac)` for every entry the cache still
+/// considers fresh (inside [`ARP_LIFETIME_TICKS`]), in table order.
+///
+/// Writes at most `out.len()` entries and returns the number written. Stale
+/// entries are skipped, not returned: `arp_lookup` ignores them, so they are not
+/// mappings a reader could use, and `/proc/net/arp` must not print a mapping the
+/// stack itself would not resolve.
+pub fn arp_snapshot(out: &mut [(Ipv4, Mac)]) -> usize {
+    let now = timer::ticks();
+    let cache = ARP.lock();
+    let mut written = 0usize;
+    for entry in cache.iter() {
+        if !entry.valid || now.saturating_sub(entry.seen_ticks) >= ARP_LIFETIME_TICKS {
+            continue;
+        }
+        if written == out.len() {
+            break;
+        }
+        out[written] = (entry.ip, entry.mac);
+        written += 1;
+    }
+    written
 }
 
 fn arp_lookup(ip: Ipv4) -> Option<Mac> {

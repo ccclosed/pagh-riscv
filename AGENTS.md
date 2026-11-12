@@ -58,7 +58,7 @@ unknown argument is rejected, not ignored. Checks that are not part of CI:
 
 ```sh
 # at the `pagh:rv64>` prompt
-selftest                                        # in-QEMU suites: 7 mem + 4 block/pointer + 11 fs + 4 arch/timer + 5 task + 14 user (14/14 with /mnt, 12/14 + 2 skip without) + 12 net + ledgers
+selftest                                        # in-QEMU suites: 7 mem + 4 block/pointer + 11 fs + 4 arch/timer + 5 task + 15 user (15/15 with /mnt, 13/15 + 2 skip without) + 12 net + ledgers
 # from the host
 python3 tools/run.py --keys "help\n" --shot /tmp/shot.png --check-font --scan-all
 python3 tools/run.py --disk /tmp/pagh.img --keys "ls /mnt\n" --shot /tmp/fs.png
@@ -352,17 +352,23 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
 ## Testing philosophy
 
 What exists: the in-QEMU suites (shell `selftest`: 7 memory + 4 block/pointer + 11 ext2/VFS
-+ 4 interrupt/timer + 5 scheduler + 14 user-mode (including the native
++ 4 interrupt/timer + 5 scheduler + 15 user-mode (including the native
 thread/futex and the signal/altstack/siginfo/job-control sections, the three
-demand-grown-stack runs and `user-tls-abi` — `userland/tls.elf` exercising
+demand-grown-stack runs, `user-tls-abi` — `userland/tls.elf` exercising
 `getrandom(278)` and the fail-closed answer of every TLS syscall on a descriptor
-that is not a session, with no server and no `/mnt` needed) + 12 network
+that is not a session, with no server and no `/mnt` needed — and `user-proc-fs`
+— `userland/proc.elf` reading `/proc` through `openat`/`read`/`getdents64`,
+including the read-only refusals and `-ENOENT`, with no disk and no NIC needed)
++ 12 network
 checks, idempotent, each group prints a
 free-frame ledger; `net-tls-session-gate` adds the kernel-side view of the same
 session table), the headless QEMU smoke driver in six
 modes (serial, ramfb, disk-fresh, disk-existing, `--net`, `--keyboard`) — every mode attaches a
 virtio-tablet and the boot log must carry `virtio-input: tablet at 0x…` — including the M5
-format/mount/persist acceptance and the M7 DHCP/ping acceptance, and the pixel
+format/mount/persist acceptance and the M7 DHCP/ping acceptance, the `/proc`
+shell path (`cat /proc/version`, `ls /proc`, `cat /proc/meminfo`,
+`cat /proc/tasks`, `stat /proc/meminfo`, `run proc` in serial; the ARP row in
+`--net`; `/proc/mounts` in disk-fresh), and the pixel
 check that proves a screenshot is really the committed font. The network
 acceptance is deterministic: QEMU's slirp answers DHCP and ICMP to `10.0.2.2`
 without touching the runner's internet. The user-mode suite is the M6b/native-ABI evidence: ELF accept/reject matrix, round
@@ -436,7 +442,7 @@ fuzzing. That is a gap, not a policy — the rule stands:
 
 ## Versioning
 
-Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.21.2`,
+Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.22.0`,
 which `Cargo.lock` mirrors. **The two move together in one commit**: CI builds with
 `--locked`, and cargo refuses to rewrite the lock (`cannot update the lock file …
 because --locked was passed`), so a `Cargo.toml`-only bump fails the build job in
@@ -500,14 +506,24 @@ seconds. Verify locally with `cargo build --locked` after any version change.
   long-standing mechanical warnings (unused imports in the task facade, an
   unused chunk count in the heap-defence selftest, a needless `mut` in the
   shell's `ln`, and `trap_entry as usize` — now `as *const () as usize`),
-  leaving the 20 diagnostic-helper warnings the known-gaps table documents;
+  leaving the 20 diagnostic-helper warnings the known-gaps table tracks (19
+  once 0.22.0 reads `timer::timebase_hz` from `/proc/cpuinfo`);
   `0.21.2` (after `0.21.1`) sizes the kernel stacks from measurement: the
   userland TLS 1.3 path runs on the caller's kernel stack and peaked at
   ~17.1 KiB in release / ~70.1 KiB in debug, so the fixed 16 KiB had been
   overflowing since 0.19.0 — release silently into its guard frame, debug
   through it into the next PMM frame — and `STACK_SIZE` is now 24 KiB release /
-  96 KiB debug (guard and canary unchanged; see `docs/tls.md`). The same rule
-  applies
+  96 KiB debug (guard and canary unchanged; see `docs/tls.md`); `0.22.0` adds
+  `/proc`: a synthetic read-only filesystem mounted from `vfs::init` (so it
+  exists with no disk) exposing live kernel state as files — `cpuinfo`,
+  `meminfo`, `mounts`, `tasks`, `uptime`, `version` and `net/{dev,arp}` —
+  rendered on read (`read(offset == 0)` is a fresh snapshot, later offsets
+  continue it, `size()` is the rendered length), with write/mkdir/unlink
+  `-ENOTSUP` and unknown names `-ENOENT`; the 15th user-mode selftest
+  `user-proc-fs` (`userland/proc.elf`) and `run proc` prove the userland path,
+  and the serial/net/disk-fresh smoke modes prove the shell path; it also puts
+  `timer::timebase_hz` to work, leaving 19 of the 20 documented diagnostic
+  warnings. The same rule applies
   to both: the tag equals the manifest and the `Cargo.lock` entry, and the
   release is not optional.
 
@@ -537,7 +553,8 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
 | Threads are a native MVP: `clone` with explicit entry, no TLS/`CLONE_SETTLS`, no join/waitid, no priorities or PI futexes, max 14 live threads per process | libc's `clone` wrapper cannot be mapped one-to-one; document the native signature and keep the futex table static (32 waiters / 16 addresses) rather than growing it silently |
 | Processes are an MVP: `fork` deep-copies, sockets are not inherited (child gets `-ENOTSUP`), file offsets are copied rather than shared, `SIGCHLD` has no child-exit source, no init/reparenting (the foreground runner kills orphans), `MAX_PROCESSES = 6` | do not describe this as POSIX process semantics; wait status is `code<<8` or signal in low 7 bits; a new process resource belongs in `Process` (or a side table) and must be released by `run_source`, `wait4` and `cleanup_orphans` |
 | Signals are a documented subset: no `sigqueue`/`sival_ptr`/queued signals, no SIGFPE producer, no tty/process groups, `SA_RESTART` only for `futex`/`nanosleep` (full timeout again), `SIGCHLD` has no child-exit source (si_status 0), no cross-process `kill`, and `kill(0, SIGSTOP)` can park a whole process | the frame/`siginfo_t`/`ucontext_t` layouts are the ABI (see invariant 41) and must move with `docs/architecture.md` + `userland/abi.rs`; do not claim Linux signal semantics, and add queueing/tty/process-group state as a real design change rather than a flag |
-| 20 compiler warnings remain (unused diagnostic helpers) | do not add more; warning-cleanup PRs are welcome |
+| 19 compiler warnings remain (unused diagnostic helpers; 20 before 0.22.0, which reads `timer::timebase_hz` from `/proc/cpuinfo`) | do not add more; warning-cleanup PRs are welcome |
+| `/proc` is a fixed read-only slice (`src/vfs/proc.rs`): no `/proc/<pid>`, `/proc/sys`, `/proc/stat`, no writes, no `statfs` | the tree table, the renderers, `src/vfs/README.md` and the smoke/fixture markers move together; content is rendered on read and `size()` renders too, so keep both paths consistent. `/proc/uptime`'s idle field is `0.00` (not accounted) and `/proc/net/arp` lists only fresh entries — do not "improve" either into `-1`/`0`/stale rows |
 | No `LICENSE` file although `Cargo.toml` says MIT | do not add a license your work does not own |
 | `src/memory/paging.rs` owns the kernel root and creates process roots; `src/arch/riscv64/mmu.rs` is encoding only | do not map over the kernel image or drop the identity map while a device holds a physical address; `free_user_space` frees table frames only, the process teardown frees the leaves first |
 28. **The software cursor is frame content.** It is erased before text is drawn and
@@ -772,3 +789,21 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
     slot was released meanwhile, never resurrect it; the slot's `used` bit stays
     set while a call is in flight, which is what turns a concurrent second call
     into `-EAGAIN`.
+46. **`/proc` is a fixed read-only slice of live kernel state, not Linux's
+    procfs.** `src/vfs/proc.rs` mounts it from `vfs::init`, so it exists on a
+    machine with no disk — exactly when a diagnostic filesystem is worth having.
+    The tree is exactly `cpuinfo`, `meminfo`, `mounts`, `tasks`, `uptime`,
+    `version` and `net/{dev,arp}`: no `/proc/<pid>`, no `/proc/sys`, no writable
+    knob and no wildcard; an unknown name stays `NotFound` (`-ENOENT`) rather
+    than being synthesised. Content is rendered when read — `read(offset == 0)`
+    re-renders (live state), later offsets continue the same render (one reading
+    pass, so a multi-chunk reader cannot splice two uptimes) — and `size()` *is*
+    the rendered length so `stat`/`fstat` and `lseek(SEEK_END)` agree with what
+    a read returns (EOF comes from `read` answering 0); do not return 0 from
+    `size()` or render once at `lookup`. `write`/`truncate`/
+    `create_*`/`remove` keep the `VfsNode` defaults (`-ENOTSUP`). The renderers
+    run with **no node lock held** (lock order is state-then-node) and take one
+    subsystem lock at a time; a file whose value cannot be reported honestly
+    omits the row or prints the truth (`/proc/uptime`'s second field is `0.00`
+    because idle time is not accounted). Adding a file moves the tree table, its
+    renderer, `src/vfs/README.md`, the fixture and the smoke markers together.

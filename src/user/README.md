@@ -630,8 +630,9 @@ run demo         # hello: write + sched_yield + exit 42
 run demo a b     # то же: у фикстуры argc = 1, лишние слова игнорируются
 run fault        # getpid, затем load с адреса 0 -> killed: load page fault; машина жива
 run spin         # 0.2 s в U-mode (~20 timer interrupts из U), getpid, exit 7
-selftest         # SELFTEST user-*: 14/14 с /mnt (12/14 + 2 SKIP без диска), ledger одинаковый
+selftest         # SELFTEST user-*: 15/15 с /mnt (13/15 + 2 SKIP без диска), ledger одинаковый
                  # user-tls-abi: getrandom(278) + fail-closed матрица 1100..1103
+                 # user-proc-fs: userland/proc.elf читает /proc через openat/read/getdents64
                  #   (маркеры "tls: getrandom ok" / "tls: abi ok" / "tls: ok")
                  # user-stack-grows: 160 KiB цепочка -> "stack: deep recursion ok"
                  # user-stack-cap:   1.2 MiB цепочка -> killed: store page fault (stval 0x3fef_ffc8)

@@ -144,6 +144,14 @@ pub const STACK_FORK_ELF: &[u8] = include_bytes!("../../userland/stack-fork.elf"
 /// `tools/test_tls.py`'s. See `userland/tls.rs` and `SELFTEST user-tls-abi`.
 pub const TLS_ELF: &[u8] = include_bytes!("../../userland/tls.elf");
 
+/// Embedded `/proc` fixture: reads the synthetic filesystem through the ordinary
+/// syscall ABI — directory framing, `fstat`, chunked reads, the live files'
+/// contents, the read-only refusals and `-ENOENT` for unknown names — and prints
+/// `proc: ... ok` markers. It needs no disk and no NIC (both absences are
+/// accepted states it checks), so the selftest can run it on every boot. See
+/// `userland/proc.rs` and `SELFTEST user-proc-fs`.
+pub const PROC_ELF: &[u8] = include_bytes!("../../userland/proc.elf");
+
 pub use elf::{ElfError, ImageSource, SourceError, USER_STACK_BASE, USER_STACK_PAGES, USER_TOP};
 
 /// Longest program name kept for the fault diagnostic; the shell's path may be

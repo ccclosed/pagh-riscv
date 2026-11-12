@@ -1,0 +1,214 @@
+# Live /proc acceptance for pagh-riscv 0.22.0
+# kernel: target/riscv64gc-unknown-none-elf/debug/pagh (debug build, RV64, OpenSBI, QEMU virt)
+#
+# Three boots: serial-only (no disk, no NIC), network (DHCP + ping), and
+# disk (ext2 mounted at /mnt, then the full in-QEMU self-test suite).
+# Each line below is real serial output, not edited.
+
+== serial boot: /proc is mounted even with no disk and no NIC ==
+
+$ printf 'cat /proc/version\nls /proc\ncat /proc/cpuinfo\ncat /proc/meminfo\ncat /proc/uptime\ncat /proc/tasks\ncat /proc/mounts\nstat /proc/meminfo\nwrite /proc/version x\nrun proc\n'
+
+   pagh OS — RISC-V (RV64)
+========================================
+boot hart   0
+device tree 0x8fe00000
+memory      0x80000000..0x90000000 (256 MiB)
+timebase    10000000 Hz
+console     NS16550 @ 0x10000000
+pmm         62188/65536 frames free (256 MiB tracked), heap 0 KiB in 0 chunk(s)
+sv39        on, satp=0x8000000000080d12, identity 0x80000000..0x90000000 (RWX below 0x80d12000, RW above), 65549 pages, 13 device
+rtc         goldfish @ 0x101000 - 2026-11-12 20:29:23 UTC
+rtc         raw 0x18e75ff8 0x18e76637 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
+entropy     32 bytes from /chosen/rng-seed - TLS session keys available
+timer       10 ms ticks (100 Hz, timebase 10000000 Hz)
+plic        0xc000000 context 1, uart irq 10 (rx interrupt on)
+task        16 slots, 96 KiB stack + 4 KiB guard, quantum 8 ticks, timer clock
+virtio-blk: no device
+virtio-input: tablet at 0x10008000, abs X 0..32767, Y 0..32767
+fs          no block device (/mnt not mounted)
+virtio-net: no device
+net         no network device
+
+Type 'help' for the command list.
+
+pagh:rv64> cat /proc/version
+pagh 0.22.0 (riscv64) #1
+pagh:rv64> ls /proc
+cpuinfo
+meminfo
+mounts
+net/
+tasks
+uptime
+version
+pagh:rv64> cat /proc/cpuinfo
+processor	: 0
+hart		: 0
+timebase	: 10000000 Hz
+clock		: hardware timer
+pagh:rv64> cat /proc/meminfo
+MemTotal:          262144 kB
+MemFree:           248048 kB
+MemAvailable:      248048 kB
+HeapUsed:            3003 B
+HeapMapped:         65536 B
+HeapChunks:             1
+Sv39Pages:          65549
+Sv39DevicePages:       13
+pagh:rv64> cat /proc/uptime
+0.03 0.00
+pagh:rv64> cat /proc/tasks
+tasks: 2/16 live, 1 ready, 3 ticks, 0 switches, 0 reaps, timer clock
+  id  name       state     switches   work  stack
+  0   shell      running         0     0  boot
+  1   idle       ready           0     0  96 KiB
+pagh:rv64> cat /proc/mounts
+/proc /proc procfs rw 0 0
+pagh:rv64> stat /proc/meminfo
+  path:  /proc/meminfo
+  name:  meminfo
+  type:  regular file
+  mode:  0644
+  size:  221 bytes
+  inode: 0
+  links: 1
+pagh:rv64> write /proc/version x
+write: /proc/version: operation not supported
+pagh:rv64> run proc
+proc: version ok
+proc: meminfo ok
+proc: uptime ok
+proc: tasks ok
+proc: mounts ok
+proc: net ok
+proc: directory ok
+proc: readonly ok
+proc: missing ok
+proc: done
+run: proc exited with code 0
+pagh:rv64> halt
+halt: powering off
+
+== network boot: the ARP cache after ping ==
+
+$ printf 'net\nping 10.0.2.2\ncat /proc/net/dev\ncat /proc/net/arp\n'
+
+   pagh OS — RISC-V (RV64)
+========================================
+boot hart   0
+device tree 0x8fe00000
+memory      0x80000000..0x90000000 (256 MiB)
+timebase    10000000 Hz
+console     NS16550 @ 0x10000000
+pmm         62188/65536 frames free (256 MiB tracked), heap 0 KiB in 0 chunk(s)
+sv39        on, satp=0x8000000000080d12, identity 0x80000000..0x90000000 (RWX below 0x80d12000, RW above), 65549 pages, 13 device
+rtc         goldfish @ 0x101000 - 2026-11-12 20:29:24 UTC
+rtc         raw 0x5346a870 0x18e76637 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
+entropy     32 bytes from /chosen/rng-seed - TLS session keys available
+timer       10 ms ticks (100 Hz, timebase 10000000 Hz)
+plic        0xc000000 context 1, uart irq 10 (rx interrupt on)
+task        16 slots, 96 KiB stack + 4 KiB guard, quantum 8 ticks, timer clock
+virtio-blk: no device
+virtio-input: tablet at 0x10008000, abs X 0..32767, Y 0..32767
+fs          no block device (/mnt not mounted)
+virtio-net: virtio-net0 at 0x10007000: MAC 52:54:00:12:34:56
+net         DHCP ip 10.0.2.15/255.255.255.0 gw 10.0.2.2 dns 10.0.2.3 lease 86400 s
+
+Type 'help' for the command list.
+
+pagh:rv64> net
+net: virtio-net0 MAC 52:54:00:12:34:56
+  ip 10.0.2.15 mask 255.255.255.0 gateway 10.0.2.2
+  dns 10.0.2.3 lease 86400 s (server 10.0.2.2)
+pagh:rv64> ping 10.0.2.2
+ping: reply from 10.0.2.2: seq=1 time=0 ms
+ping: reply from 10.0.2.2: seq=2 time=0 ms
+ping: reply from 10.0.2.2: seq=3 time=0 ms
+ping: reply from 10.0.2.2: seq=4 time=0 ms
+ping: 4/4 replies, 0 ms total
+pagh:rv64> cat /proc/net/dev
+virtio-net0: mac 52:54:00:12:34:56 ip 10.0.2.15 mask 255.255.255.0 gateway 10.0.2.2 dns 10.0.2.3 server 10.0.2.2 lease 86400 s
+pagh:rv64> cat /proc/net/arp
+IP address       HW address        Device
+10.0.2.2         52:55:0a:00:02:02 virtio-net0
+pagh:rv64> halt
+halt: powering off
+
+== disk boot: /proc/mounts lists the mounted ext2, then selftest ==
+
+$ printf 'cat /proc/mounts\nselftest\n'
+
+pagh:rv64> cat /proc/mounts
+/proc /proc procfs rw 0 0
+/mnt /mnt ext2 rw 0 0
+pagh:rv64> selftest
+SELFTEST frames-roundtrip PASS
+SELFTEST frame-pattern PASS
+SELFTEST sv39-map-roundtrip PASS
+SELFTEST sv39-translate PASS
+SELFTEST heap-vec PASS
+SELFTEST heap-defenses PASS
+SELFTEST heap-chunks PASS
+SELFTEST SUMMARY: 7/7 passed
+SELFTEST block-memblock PASS
+SELFTEST block-device PASS
+SELFTEST input-device PASS
+SELFTEST block-heap-hygiene PASS
+SELFTEST SUMMARY (block): 4/4 passed
+SELFTEST ext2-format PASS
+SELFTEST ext2-write-read PASS
+SELFTEST ext2-dirs PASS
+SELFTEST ext2-truncate PASS
+SELFTEST ext2-symlink PASS
+SELFTEST ext2-rename PASS
+SELFTEST ext2-remount PASS
+SELFTEST ext2-free-space PASS
+SELFTEST ext2-corruption PASS
+SELFTEST ext2-policy PASS
+SELFTEST ext2-on-device PASS
+SELFTEST ext2 summary: 11/11 passed
+SELFTEST timer-ticks PASS
+SELFTEST timer-interrupts PASS
+SELFTEST uart-ring PASS
+SELFTEST plic-uart-line PASS
+SELFTEST SUMMARY (arch): 4/4 passed
+SELFTEST task-interleave PASS
+SELFTEST task-exit-returns-stack PASS
+SELFTEST task-stack-layout PASS
+SELFTEST task-canary PASS
+SELFTEST task-idle PASS
+SELFTEST SUMMARY (task): 5/5 passed
+[selftest] user PMM free frames before: 62012 of 65536
+SELFTEST user-abi-argv PASS
+SELFTEST user-abi-syscalls PASS
+SELFTEST user-elf-accept PASS
+SELFTEST user-elf-reject PASS
+SELFTEST user-run-rejects-bad-elf PASS
+SELFTEST user-hello-roundtrip PASS
+SELFTEST user-fault-isolated PASS
+SELFTEST user-after-fault PASS
+SELFTEST user-timer-preempts PASS
+SELFTEST user-stack-grows PASS
+SELFTEST user-stack-cap PASS
+SELFTEST user-stack-fork PASS
+SELFTEST user-run-large-file PASS
+SELFTEST user-tls-abi PASS
+SELFTEST user-proc-fs PASS
+SELFTEST SUMMARY (user): 15/15 passed
+[selftest] user PMM hygiene: free frames 62012 -> 62012
+SELFTEST net-checksum PASS
+SELFTEST net-ethernet PASS
+SELFTEST net-ipv4 PASS
+SELFTEST net-udp PASS
+SELFTEST net-icmp PASS
+SELFTEST net-arp PASS
+SELFTEST net-dhcp PASS
+SELFTEST net-dns PASS
+SELFTEST net-tcp PASS
+SELFTEST net-text PASS
+SELFTEST net-subnet PASS
+SELFTEST net-tls-session-gate PASS
+SELFTEST SUMMARY (net): 12/12 passed
+pagh:rv64> halt
+halt: powering off

@@ -1977,6 +1977,9 @@ impl VfsNode for Ext2Dir {
     fn fs_stat(&self) -> Option<FsStat> {
         self.fs_stat_of()
     }
+    fn fs_type(&self) -> &'static str {
+        "ext2"
+    }
     fn fs_ino(&self) -> u64 {
         self.ino as u64
     }
@@ -2081,6 +2084,9 @@ impl VfsNode for Ext2File {
     fn is_directory(&self) -> bool {
         false
     }
+    fn fs_type(&self) -> &'static str {
+        "ext2"
+    }
     fn fs_stat(&self) -> Option<FsStat> {
         Some(self.fs.fs_stat())
     }
@@ -2140,6 +2146,9 @@ impl VfsNode for Ext2Symlink {
     fn is_directory(&self) -> bool {
         false
     }
+    fn fs_type(&self) -> &'static str {
+        "ext2"
+    }
     fn fs_stat(&self) -> Option<FsStat> {
         Some(self.fs.fs_stat())
     }
@@ -2191,6 +2200,9 @@ impl VfsNode for Ext2Opaque {
     }
     fn is_directory(&self) -> bool {
         false
+    }
+    fn fs_type(&self) -> &'static str {
+        "ext2"
     }
     fn fs_ino(&self) -> u64 {
         self.ino as u64
