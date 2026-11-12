@@ -331,7 +331,8 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
     overflowed into `.bss` too (`chunk_count = 16384`). Box large buffers in
     device/stack structs, keep `probe`-style builders returning small values, and
     do not spend the remaining ~64 KiB on a stack local. The same rule applies
-    to a user task's 16 KiB kernel stack: `execve` runs the ELF loader there, and
+    to a user task's kernel stack (24 KiB release / 96 KiB debug since 0.21.2,
+    sized from the measured TLS handshake): `execve` runs the ELF loader there, and
     the loader's 256-entry page-plan array is a heap `Vec` for exactly this
     reason — it used to overflow the guard during the ABI fixture's exec child.
 26. **Network parsing never panics and never trusts a frame.** `src/net/wire.rs`
@@ -435,7 +436,7 @@ fuzzing. That is a gap, not a policy — the rule stands:
 
 ## Versioning
 
-Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.21.1`,
+Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.21.2`,
 which `Cargo.lock` mirrors. **The two move together in one commit**: CI builds with
 `--locked`, and cargo refuses to rewrite the lock (`cannot update the lock file …
 because --locked was passed`), so a `Cargo.toml`-only bump fails the build job in
@@ -499,8 +500,14 @@ seconds. Verify locally with `cargo build --locked` after any version change.
   long-standing mechanical warnings (unused imports in the task facade, an
   unused chunk count in the heap-defence selftest, a needless `mut` in the
   shell's `ln`, and `trap_entry as usize` — now `as *const () as usize`),
-  leaving the 20 diagnostic-helper warnings the known-gaps table documents.
-  The same rule applies
+  leaving the 20 diagnostic-helper warnings the known-gaps table documents;
+  `0.21.2` (after `0.21.1`) sizes the kernel stacks from measurement: the
+  userland TLS 1.3 path runs on the caller's kernel stack and peaked at
+  ~17.1 KiB in release / ~70.1 KiB in debug, so the fixed 16 KiB had been
+  overflowing since 0.19.0 — release silently into its guard frame, debug
+  through it into the next PMM frame — and `STACK_SIZE` is now 24 KiB release /
+  96 KiB debug (guard and canary unchanged; see `docs/tls.md`). The same rule
+  applies
   to both: the tag equals the manifest and the `Cargo.lock` entry, and the
   release is not optional.
 
@@ -571,7 +578,7 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
 32. **The user heap is exactly `0x2000_0000..0x2010_0000` (1 MiB).** `brk` maps
     zeroed PMM frames on demand through `paging::map_in(proc.root, …, Flags::user_rw())`,
     records them in `process::HEAPS` (not inline in `Process`, which must stay
-    small enough to move through a 16 KiB kernel stack), and rolls a partial
+    small enough to move through the kernel stack), and rolls a partial
     growth back on `-ENOMEM`. The runner/`wait4`/`execve` release them after
     `reap`/before the root is freed; the selftest's PMM ledger is the check. A
     new mapping in this window, or an image placed there, is `-ENOMEM`, not an
@@ -658,7 +665,7 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
     counter; the runner or `wait4` then does the one teardown. A new field that a
     thread may touch while another runs belongs in `Process`, not in `Task`.
 38. **Every thread owns a kernel stack; the user stack is not yours.** A `clone`
-    child gets the scheduler's 16 KiB + 4 KiB guard PMM stack like any task, and
+    child gets the scheduler's 24 KiB (96 KiB debug) + 4 KiB guard PMM stack like any task, and
     starts through the one trap-return path: a zeroed `TrapFrame` at the top of
     that stack (`sepc=entry`, `sp=user stack`, `a0=arg`, `sstatus =
     user_entry_status()`) and `TaskContext { ra = trap_return, sp = frame_base }`.

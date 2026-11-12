@@ -27,7 +27,9 @@ U-mode (см. «M6b: U-mode как состояние задачи»). С native
   `spawn` демо-когорты принимает не больше 14 за раз, а один процесс — не больше
   14 живых потоков (главный + 13 `clone`); `shell` и `idle` занимают два слота,
   а процессов в таблице `MAX_PROCESSES = 6`.
-* **Стек.** 16 KiB usable + 4 KiB guard (5 кадров `alloc_frames_contiguous`).
+* **Стек.** 24 KiB usable (96 KiB в debug) + 4 KiB guard (7/25 кадров
+  `alloc_frames_contiguous`); размеры измерены по самому глубокому пути —
+  рукопожатию TLS 1.3 в syscall 1100 (см. `docs/tls.md`).
   Guard внизу, канарейка в начале стека; `reap` проверяет её и сообщает
   `[task] STACK OVERFLOW`, после чего всё равно возвращает кадры. Выход потока
   обязан вернуть стек: `SELFTEST task-exit-returns-stack` проверяет

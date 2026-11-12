@@ -246,7 +246,7 @@ S-mode page fault (тот напечатал бы и остановил hart). �
 **Что общее у потоков процесса:** свой root/ASID и user-карта, fd-таблица,
 heap `brk`, mmap-регионы, таблица `fchmodat`, таблица `sigaction`, код и данные
 образа, pid (`getpid`), ppid, код выхода процесса (код главного). **Что своё:**
-tid, запись в task-таблице, kernel-стек 16 KiB + 4 KiB guard из PMM,
+tid, запись в task-таблице, kernel-стек 24 KiB (96 KiB в debug) + 4 KiB guard из PMM,
 сохранённый `TaskContext`/trap frame, user-регистры, blocked/pending/alt-стек;
 user-стек передаёт вызывающий, ядро его не выделяет и не освобождает. Каждый
 поток несёт в `Task::satp` root своего процесса; `scheduler::install_satp`

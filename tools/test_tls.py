@@ -333,6 +333,26 @@ def check(condition: bool, what: str, transcript: str) -> None:
         raise Failure(f"{what}\n--- serial transcript ---\n{transcript}")
 
 
+def check_no_stack_overflow(transcript: str, label: str) -> None:
+    """The kernel must not report a task stack overflow for a TLS path.
+
+    The handshake and the chain verifier run on the caller's kernel stack, so
+    this is the deepest path in the kernel. The scheduler only reports the
+    damage when the thread's stack is reclaimed: `[task] STACK OVERFLOW:
+    guard/canary at … was overwritten`. A release build can complete the
+    handshake while its stack has already written into the guard frame, so a
+    PASS verdict without this check is not enough (0.21.2 sizing: 24 KiB
+    release / 96 KiB debug, measured peaks ~17 / ~70 KiB).
+    """
+    check(
+        "[task] STACK OVERFLOW" not in transcript,
+        f"{label}: the kernel reported a task stack overflow — the TLS path "
+        "needs a bigger kernel stack than STACK_SIZE (guard/canary was "
+        "overwritten; see docs/tls.md 'Стек: самый глубокий путь ядра')",
+        transcript,
+    )
+
+
 def section(transcript: str, command: str) -> str:
     """The part of a transcript from `command` to the next prompt."""
     index = transcript.find(command)
@@ -368,6 +388,8 @@ def run(args: argparse.Namespace) -> int:
     finally:
         server.stop()
         shut_down(work)
+
+    check_no_stack_overflow(transcript, "shell https")
 
     # ── 1. entropy ────────────────────────────────────────────────────────
     check(
@@ -456,6 +478,7 @@ def run(args: argparse.Namespace) -> int:
             disk=disk,
             tag="user",
         )
+        check_no_stack_overflow(userland, "userland https_get")
         transcript += userland
 
     if not args.no_userland:
