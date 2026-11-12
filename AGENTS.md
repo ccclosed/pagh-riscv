@@ -422,7 +422,7 @@ fuzzing. That is a gap, not a policy — the rule stands:
 
 ## Versioning
 
-Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.21.0`,
+Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.21.1`,
 which `Cargo.lock` mirrors. **The two move together in one commit**: CI builds with
 `--locked`, and cargo refuses to rewrite the lock (`cannot update the lock file …
 because --locked was passed`), so a `Cargo.toml`-only bump fails the build job in
@@ -482,7 +482,12 @@ seconds. Verify locally with `cargo build --locked` after any version change.
   descriptor, plaintext `read`/`write`/`poll`/`shutdown`/`close` on it,
   `-ECONNRESET` for a TCP close without `close_notify`, no flag that weakens
   verification), the `user-tls-abi`/`net-tls-session-gate` selftests and the
-  libpagh `https_get` phase of `tools/test_tls.py`. The same rule applies
+  libpagh `https_get` phase of `tools/test_tls.py`; `0.21.1` clears four
+  long-standing mechanical warnings (unused imports in the task facade, an
+  unused chunk count in the heap-defence selftest, a needless `mut` in the
+  shell's `ln`, and `trap_entry as usize` — now `as *const () as usize`),
+  leaving the 20 diagnostic-helper warnings the known-gaps table documents.
+  The same rule applies
   to both: the tag equals the manifest and the `Cargo.lock` entry, and the
   release is not optional.
 
@@ -512,7 +517,7 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
 | Threads are a native MVP: `clone` with explicit entry, no TLS/`CLONE_SETTLS`, no join/waitid, no priorities or PI futexes, max 14 live threads per process | libc's `clone` wrapper cannot be mapped one-to-one; document the native signature and keep the futex table static (32 waiters / 16 addresses) rather than growing it silently |
 | Processes are an MVP: `fork` deep-copies, sockets are not inherited (child gets `-ENOTSUP`), file offsets are copied rather than shared, `SIGCHLD` has no child-exit source, no init/reparenting (the foreground runner kills orphans), `MAX_PROCESSES = 6` | do not describe this as POSIX process semantics; wait status is `code<<8` or signal in low 7 bits; a new process resource belongs in `Process` (or a side table) and must be released by `run_source`, `wait4` and `cleanup_orphans` |
 | Signals are a documented subset: no `sigqueue`/`sival_ptr`/queued signals, no SIGFPE producer, no tty/process groups, `SA_RESTART` only for `futex`/`nanosleep` (full timeout again), `SIGCHLD` has no child-exit source (si_status 0), no cross-process `kill`, and `kill(0, SIGSTOP)` can park a whole process | the frame/`siginfo_t`/`ucontext_t` layouts are the ABI (see invariant 41) and must move with `docs/architecture.md` + `userland/abi.rs`; do not claim Linux signal semantics, and add queueing/tty/process-group state as a real design change rather than a flag |
-| 20 compiler warnings remain (unused diagnostic helpers, `trap_entry as usize`, …) | do not add more; warning-cleanup PRs are welcome |
+| 20 compiler warnings remain (unused diagnostic helpers) | do not add more; warning-cleanup PRs are welcome |
 | No `LICENSE` file although `Cargo.toml` says MIT | do not add a license your work does not own |
 | `src/memory/paging.rs` owns the kernel root and creates process roots; `src/arch/riscv64/mmu.rs` is encoding only | do not map over the kernel image or drop the identity map while a device holds a physical address; `free_user_space` frees table frames only, the process teardown frees the leaves first |
 28. **The software cursor is frame content.** It is erased before text is drawn and
