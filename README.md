@@ -2,7 +2,8 @@
 
 <p align="center">
   Небольшое 64-битное ядро для RISC-V (RV64) на Rust: <code>#![no_std]</code>,
-  без единой внешней зависимости, загрузка через OpenSBI, запуск в QEMU.
+  весь код свой, кроме vendored-стека TLS 1.3/X.509 (<code>Cargo.toml</code>,
+  с 0.19.0), загрузка через OpenSBI, запуск в QEMU.
 </p>
 
 <p align="center">
@@ -10,7 +11,7 @@
   <img alt="Target: riscv64gc-unknown-none-elf" src="https://img.shields.io/badge/target-riscv64gc--unknown--none--elf-blue.svg">
   <img alt="no_std" src="https://img.shields.io/badge/%23!%5Bno__std%5D-yes-informational.svg">
   <img alt="Boot: OpenSBI S-mode" src="https://img.shields.io/badge/boot-OpenSBI%20S--mode-purple.svg">
-  <img alt="Milestone: M1-M7 done" src="https://img.shields.io/badge/milestone-M1%E2%80%93M7%20done-brightgreen.svg">
+  <img alt="Milestone: M1-M8 done" src="https://img.shields.io/badge/milestone-M1%E2%80%93M8%20done-brightgreen.svg">
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green.svg">
 </p>
 
@@ -270,9 +271,9 @@ SELFTEST SUMMARY: 7/7 passed
 | VFS | готово | `VfsNode`, синтетический корень, монтирование в `/mnt`, два примитива разрешения путей (`lookup_path` без последней симлинки / `walk` с переходом и бюджетом) | `src/vfs/mod.rs` |
 | Планировщик, потоки ядра (M6a) | готово | контекстный switch (callee-saved ABI), до 16 слотов (14 user-потоков на процесс), round-robin, квант 8 тиков, стек 16 KiB + guard из PMM, состояния `Ready/Running/Blocked/Stopped/Exited`, `block_current`/`wake_task` с тиковым дедлайном, `stop_current`/`continue_task` для job control, `Task::satp` + `install_satp` перед switch, вытеснение тиком таймера из trap-контекста (включая вытеснение U-mode), `tasks`/`spawn`/`yield`; exit возвращает кадры | `src/arch/riscv64/switch.rs`, `src/task/` |
 | User mode, syscalls, ELF, native ABI (M6b) | готово | `sret` в U-mode (`SPP=0`, `SPIE=1`, `SUM=0`, `sscratch`-контракт); **user-стек растёт по требованию**: load/store page fault ниже текущего дна (`Process::stack_low`) мапит и обнуляет страницы до адреса fault'а и повторяет инструкцию, потолок 1 MiB на процесс (64 KiB начального окна + 960 KiB, дно `0x3ff0_0000`), ниже дна — настоящий guard, на котором рекурсия сверх лимита умирает `store page fault`; `fork` копирует выросшие страницы, `execve` сбрасывает границу, teardown возвращает кадры в PMM; нативные потоки `clone`/`gettid`/`set_tid_address`/`exit`/`exit_group`/`futex` (общие Process/root, fd-таблица, heap и mmap; своё ядро-стек и user-стек вызывающего), фьютексы `WAIT`/`WAKE`; процессы `fork`(1000)/`execve`(221)/`wait4`(260)/`getppid`(173): свой Sv39-root/ASID, глубокая копия страниц, наследование fd/pipe/обработчиков, замена образа и статус `wait`, очистка сирот раннером; вход `a0=argc`, `a1=argv`, SysV-кадр `argc/argv/envp` с `argv[0]` как набран и `PWD=<cwd>`; `ecall`-диспетчер: `read`/`write`/`openat`/`close`/`lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/`readlinkat`/`exit`/`sched_yield`/`getpid` + `mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`/`ftruncate` (мутации через `parent_and_leaf` + `walk(parent, true)`, per-process режим для `fstat`), `sepc+4`, таблица 16 fd на процесс, `copy_from_user`/`copy_to_user` с проверкой `U/R/W` и `SUM` вокруг копии, heap-окно 1 MiB с возвратом кадров; ELF64-загрузчик с откатом кадров и **потоковым чтением** `ImageSource` (сегменты кусками ≤ 512 B, без буфера размером с файл), `run <path> [args...]` до 1 MiB и фикстуры `demo`/`fault`/`spin`/`argv`/`abi`; BSD-сокеты `socket`/`bind`/`connect`/`sendto`/`recvfrom`/`setsockopt`/`getsockopt`/`shutdown` (один TCP-клиент + UDP-сокеты, IPv4-литералы) и маршрутизация `read`/`write`/`close`/`poll` на сокет; POSIX-подобные сигналы `kill`/`tgkill`/`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`/`sigaltstack` (обработчики на процесс: fork копирует, exec сбрасывает; pending/blocked/altstack на поток; user-кадр 736 B с полным `siginfo_t` и `ucontext_t`; `SA_SIGINFO`/`SA_ONSTACK`/`SA_NODEFER`/`SA_RESETHAND`/`SA_RESTART`; job control `SIGSTOP`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU` + `SIGCONT`); synchronous SIGSEGV/SIGILL/SIGBUS/SIGTRAP при установленном обработчике; fault из U без обработчика убивает процесс; таймер вытесняет U-mode | `src/user/`, `src/user/stack.rs`, `src/user/process.rs`, `src/user/signal.rs`, `src/memory/paging.rs`, `userland/` |
-| Сеть (M7) | готово | virtio-net (modern, polled) + свой стек: Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP-клиент, DNS-резолвер, `net`/`dhcp`/`ping`/`dns`/`http`; без smoltcp и внешних крейтов. Для userland — один active-open TCP-сокет (`AF_INET`/`SOCK_STREAM`, IPv4-литерал) и UDP-сокеты (`AF_INET`/`SOCK_DGRAM`, `bind`/per-port-очередь/`sendto`/`recvfrom`); syscall'ы сами опрашивают NIC; `read`/`write`/`poll` работают на сокете | `src/net/`, `src/drivers/virtio_net.rs`, `src/user/syscall.rs` |
-| Пакеты (`pkg`) | MVP | нативный установщик (не apt): плоский `index` и `.ppkg` с репозитория по **plain HTTP** (`http://IP:port/`, в QEMU хост — `10.0.2.2`), потоковая загрузка в `/mnt/pkg` кусками 4 KiB, шлюз «размер + SHA-256 из индекса» **до** разбора `PPKG0001`; `kind=app` → `/mnt/bin/<name>`, `applet-bundle` → `/mnt/bin/paghbox` + симлинки; манифест в `/mnt/pkg/<name>.manifest`; TLS/OpenPGP/apt по-прежнему нет | `src/pkg/` |
-| apt / TLS / OpenPGP | **нет** | apt намеренно не подключён, пока нет vendored TLS + проверки подписей Debian; `pkg` — отдельный нативный путь для портов | — |
+| Сеть (M7) | готово | virtio-net (modern, polled) + свой стек: Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP-клиент, DNS-резолвер, `net`/`dhcp`/`ping`/`dns`/`http`; TCP/IP свой, без smoltcp (TLS-клиент — vendored `embedded-tls`, см. `docs/tls.md`). Для userland — один active-open TCP-сокет (`AF_INET`/`SOCK_STREAM`, IPv4-литерал) и UDP-сокеты (`AF_INET`/`SOCK_DGRAM`, `bind`/per-port-очередь/`sendto`/`recvfrom`); syscall'ы сами опрашивают NIC; `read`/`write`/`poll` работают на сокете | `src/net/`, `src/drivers/virtio_net.rs`, `src/user/syscall.rs` |
+| Пакеты (`pkg`) | MVP | нативный установщик (не apt): плоский `index` и `.ppkg` с репозитория по **plain HTTP** (`http://IP:port/`, в QEMU хост — `10.0.2.2`), потоковая загрузка в `/mnt/pkg` кусками 4 KiB, шлюз «размер + SHA-256 из индекса» **до** разбора `PPKG0001`; `kind=app` → `/mnt/bin/<name>`, `applet-bundle` → `/mnt/bin/paghbox` + симлинки; манифест в `/mnt/pkg/<name>.manifest`; TLS-транспорта, OpenPGP и apt у `pkg` по-прежнему нет | `src/pkg/` |
+| apt / OpenPGP | **нет** | apt намеренно не подключён, пока нет проверки подписей Debian (OpenPGP); `pkg` — отдельный нативный путь для портов. TLS 1.3-клиент есть с 0.19.0 (шелл `https`; 0.21.0 — userland-сессии 1100–1103), но `pkg` его не использует | — |
 | Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 4 блока/указателя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 14 user-mode (включая `user-tls-abi` — `getrandom` и fail-closed матрица 1100–1103; ABI-фикстуры `argv`/`abi` с секциями потоков/фьютексов, сигналов и TCP-сервера: bind/listen/nonblocking accept/EAGAIN/dup-ENOTSUP; `user-stack-grows` — цепочка 160 KiB возвращается через `stack: deep recursion ok`, `user-stack-cap` — цепочка 1.2 MiB умирает `store page fault` на guard-странице, `user-stack-fork` — fork на выросшем стеке, обе стороны доходят до конца, `wait4` возвращает pid; 14/14 с диском, 12/14 + 2 SKIP без `/mnt`) + 12 сети (идемпотентность по ledger'у, `net-tls-session-gate`), QEMU-smoke в шести режимах (serial, ramfb, диск-fresh, диск-existing, net, keyboard), установка пакета проверяется отдельным тестом `pkg`, живые сокетные прогоны — `tools/test_sockets.py` (TCP-клиент), `tools/test_udp.py` (UDP), `tools/test_tcp_server.py` (TCP-сервер: `mke2fs -d` + QEMU `hostfwd`) и `tools/test_tls.py` (живой TLS 1.3 + userland `https_get`; libpagh-фикстуры, не в CI); проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/net/selftest.rs`, `src/pkg/`, `.github/smoke.py`, `tools/` |
 | CI | готово | `fmt`, debug/release build, QEMU-smoke в шести режимах: serial, ramfb, диск-fresh (формат/монтирование/запись), диск-existing (повторная загрузка читает файл), net (DHCP + ping шлюза), keyboard (virtio-keyboard печатает `help`/`halt` через монитор QEMU); во всех приложен virtio-tablet, в keyboard — ещё и virtio-keyboard | `.github/workflows/ci.yml` |
 
@@ -327,7 +328,8 @@ virtio-net-device`, ядро получает `10.0.2.15/24` по DHCP, шлюз
 Выход из QEMU — `Ctrl-A`, затем `X`. Изнутри гостя: команда `halt` (SBI SRST,
 машина действительно выключается, QEMU завершается с кодом 0).
 
-Автоматические проверки «ядро живо» — те же, что в CI:
+Быстрые автоматические проверки «ядро живо» (smoke-драйвер тот же, что в CI;
+полный список гейтов — в разделе «Качество и CI»):
 
 ```sh
 cargo build
@@ -582,8 +584,11 @@ backspace работает, всё остальное — команды:
 | `ping <ip> [n]` | до 4 ICMP echo через свой ARP/IPv4/ICMP-путь; печатает `seq`, время и итог |
 | `dns <name>` | A-запись через DNS-сервер из lease |
 | `http <ip> <port> <path>` | HTTP/1.0 GET через TCP-клиент; ответ печатается в консоль |
+| `https <url>` | TLS 1.3 GET через свой TCP-клиент: цепочка до закоммиченного CA-бандла, SAN, срок и `CertificateVerify` (fail-closed); формы `https <host> [path] [port]` и `https --ip <addr> <url>` для прибитого адреса |
+| `entropy` | пул энтропии: есть ли seed из `/chosen/rng-seed` и сколько байт сгенерировано; без seed'а `https` отказывает до открытия сокета |
 | `pkg repo [URL]` / `pkg index` / `pkg list` | показать/задать репозиторий (по умолчанию `http://10.0.2.2:8000/`), скачать и разобрать индекс, показать пакеты с `[installed]` |
 | `pkg install <name>` / `pkg remove <name>` / `pkg installed` | скачать, проверить размер+SHA-256, установить в `/mnt/bin`; удалить по манифесту; список установленного |
+| `fs` | что смонтировано в `/mnt`: ext2, размер блока, свободные блоки и inode'ы (иначе «not mounted» / «not an ext2 filesystem») |
 | `time` | два счётчика: CSR `time` (аппаратный) и тики ядра; uptime, число прерываний таймера, статистика PLIC/UART |
 | `hart` | id hart'а, на котором работает ядро |
 | `echo <text>` | печатает текст (слова через один пробел) |
@@ -601,7 +606,8 @@ backspace работает, всё остальное — команды:
 
 `pkg` ставит в `/mnt` один статический RV64 ELF из `.ppkg`, скачанного с
 плоского HTTP-репозитория. Это **не apt**: ни Debian-метаданных, ни `.deb`, ни
-solver'а зависимостей, ни сжатия, ни OpenPGP; TLS тоже нет. Репозиторий — это
+solver'а зависимостей, ни сжатия, ни OpenPGP; TLS-транспорта у `pkg` тоже нет
+(ядро TLS-клиент имеет с 0.19.0, установщик его не использует). Репозиторий — это
 файл `index` и каталог `pkg/*.ppkg`; формат описан в `docs/package-format.md`
 репозитория [`pagh-programs`](https://github.com/ccclosed/pagh-programs).
 
@@ -628,9 +634,10 @@ pkg remove hello                             # pkg: removed hello
 пишется последним, и `pkg remove` работает по нему.
 
 Это проверка **целостности**, а не подписи: зеркало, которое отдаёт другой
-пакет с тем же размером и хешем, дизайном не ловится. HTTPS и OpenPGP — следующий
-майлстоун; до него `pkg` честно говорит «only plain http:// is supported
-(there is no TLS yet)» на `https://` и не притворяется apt.
+пакет с тем же размером и хешем, дизайном не ловится. Подписей (OpenPGP) нет —
+это следующий шаг; `pkg` намеренно ходит только по `http://` даже при наличии
+TLS-клиента в ядре и честно отвечает «only plain http:// is supported
+(there is no TLS yet)» на `https://`, не притворяясь apt.
 
 Ограничения MVP: до 64 пакетов в индексе, IPv4-хост в URL (без DNS), один
 пакет за раз, `payload ≤ 8 MiB`, до 160 команд в `applet-bundle`, `/mnt`
@@ -658,7 +665,7 @@ python3 tools/test_pkg.py
 | # | Фаза | Код |
 |---|---|---|
 | 1 | `_start`: OpenSBI запускает ровно один hart (любого id); стек и `kmain` | `src/arch/riscv64/boot.rs` |
-| 2 | стек: `sp = __stack_top`, 64 KiB в `.bss`, выравнивание 16 | `src/arch/riscv64/boot.rs` |
+| 2 | стек: `sp = __stack_top`, 128 KiB в `.bss`, выравнивание 16 | `src/arch/riscv64/boot.rs` |
 | 3 | захват hart id в `BOOT_HART_ID` (пока он в `a0`) | `src/arch/riscv64/boot.rs` |
 | 4 | `call kmain(a0, a1)` | `src/arch/riscv64/boot.rs` |
 | 5 | консоль: `uart::init()` + попытка поднять экран (`console::init` → `framebuffer::init`) | `src/main.rs`, `src/console.rs` |
@@ -669,11 +676,17 @@ python3 tools/test_pkg.py
 | 10 | `traps::init()`: `stvec` + `sstatus.SIE` — до всего, что может сбойнуть | `src/main.rs`, `src/arch/riscv64/traps.rs` |
 | 11 | `shell::run(tree)` — цикл консоли, не возвращается | `src/main.rs`, `src/shell.rs` |
 
+Таблица сокращённая: полная последовательность (фазы 0–17, включая таймер, PLIC,
+задачи, virtio-диск, VFS, сеть и указатель) с обоснованием порядка — в
+`docs/architecture.md`, раздел 3.
+
 **Привилегии.** Ядро живёт в S-mode; M-mode принадлежит прошивке, и обращаться
 туда можно только через SBI (`ecall`) — именно так работает `halt`. M-mode CSR
 из S-mode недоступны физически: `csrr …, mhartid` — это illegal instruction, и
 ядро узнало это на своём опыте (см. `docs/architecture.md`, раздел 2). `satp`
-включает Sv39 с identity-картой (страницы 4 KiB, без user-бита); U-mode нет.
+включает Sv39 с identity-картой (страницы 4 KiB); с M6b у каждого процесса свой
+Sv39-root и страницы с `U=1`, вход в U-mode — один `sret` (`user::enter_user`), а
+`ecall` — syscall-ABI (см. «User mode» выше и `docs/architecture.md` §9.1).
 
 **Устройства.** Единственное описание машины — device tree: ядро читает из него
 память и частоту timebase, отказываясь угадывать при ошибке разбора. Адреса UART
@@ -688,7 +701,7 @@ IPv4, ICMP и UDP, а `dhcp`/`dns`/`tcp` — маленькие клиенты. 
 Детали и честные границы — [`src/net/README.md`](src/net/README.md).
 
 **Память.** Ядро линкуется на `0x8020_0000` (`linker.ld`), `.bss` — 8 МиБ:
-две поверхности экрана (тень и scanout), битовая карта PMM, стек 64 KiB и
+две поверхности экрана (тень и scanout), битовая карта PMM, стек 128 KiB и
 статики; `__kernel_end` выровнен на 4 KiB. `.bss` не обнуляется кодом ядра:
 обнуляет ELF-загрузчик QEMU (NOBITS-сегмент) — и это существенно, потому что
 полярность карты PMM («бит установлен = кадр свободен») держится именно на нулях.
@@ -713,6 +726,7 @@ IPv4, ICMP и UDP, а `dhcp`/`dns`/`tcp` — маленькие клиенты. 
 | M5 | virtio-mmio блочное устройство, ext2, VFS | **готов** (virtio-mmio, ext2 rw + формат пустого диска, VFS, шелл-команды; журнала нет) |
 | M6 | Задачи, syscalls, Linux-compat-слой из x86-ветки | M6a (планировщик/потоки) — **готов**; M6b (user mode, syscalls, ELF) — **готов**; Linux-compat — нет |
 | M7 | Сеть: virtio-net и свой TCP/IP-стек | **готов** (Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP, DNS, `net`/`ping`/`dns`/`http`, `https` (TLS 1.3 с проверкой CA/SAN/срока/подписи); apt — следующий шаг) |
+| M8 | Указатель и software-курсор | **готов** (virtio-input: tablet/mouse и keyboard по device tree, курсор — часть кадра, события двигают стрелку; клики не используются) |
 
 Что считается «сделано» для каждого майлстоуна и что в него не входит —
 [`docs/roadmap.md`](docs/roadmap.md).
@@ -774,9 +788,10 @@ IPv4, ICMP и UDP, а `dhcp`/`dns`/`tcp` — маленькие клиенты. 
 * **Один блочный слот, нет разделов/hot-plug.** Второй диск — изменение дизайна.
 * **Нет подписей пакетов и apt.** Нативный `pkg` говорит по plain HTTP и
   проверяет только размер + SHA-256 из индекса: это целостность, а не
-  аутентификация источника. TLS-стек и OpenPGP-проверка подписей — следующий
-  майлстоун; `apt` намеренно не подключается, пока их нет: «скачали и поставили
-  без проверки» — это ровно то, чего fail-closed apt не делает.
+  аутентификация источника. TLS 1.3-клиент в ядре есть (0.19.0; `https` и
+  userland-сессии 1100–1103), но `pkg` им не пользуется; OpenPGP-проверки
+  подписей и `apt` нет — `apt` намеренно не подключается, пока их нет: «скачали
+  и поставили без проверки» — это ровно то, чего fail-closed apt не делает.
 * **TCP минимальный.** Один active-open клиент, один listener и восемь слотов
   соединений; без retransmission-таймера (кроме двух SYN), out-of-order
   reassembly, congestion control, keepalive, TIME_WAIT и half-close; backlog ≤ 4,
@@ -791,7 +806,8 @@ IPv4, ICMP и UDP, а `dhcp`/`dns`/`tcp` — маленькие клиенты. 
   `recvfrom` имеет бюджет ~10 s и не прерывается сигналом (возвращает `-EAGAIN`
   по дедлайну). Этого достаточно HTTP/1.0-клиенту (`examples/http_get`),
   простому UDP-эху и TCP-эху, но не Python-рантайму целиком.
-* **Нет SMP.** Один hart, остальные запаркованы в `_start`; планировщик и локи
+* **Нет SMP.** Работает один hart: OpenSBI отдаёт S-mode ровно одному, остальные
+  firmware держит в HSM stopped — ядро их не паркует (`src/arch/riscv64/boot.rs`); планировщик и локи
   это предполагают.
 * **Нет восстановления после S-mode исключения.** Сбой в ядре — печать и
   остановка hart. Сбой в U-mode (page fault, illegal instruction) завершает
@@ -808,7 +824,7 @@ IPv4, ICMP и UDP, а `dhcp`/`dns`/`tcp` — маленькие клиенты. 
 
 ```text
 src/main.rs                    boot-фазы по порядку, баннер, panic_handler
-src/arch/riscv64/boot.rs       _start: стек, парковка hart'ов, вызов kmain
+src/arch/riscv64/boot.rs       _start: стек, захват hart id, вызов kmain
 src/arch/riscv64/csr.rs        типизированный доступ к CSR
 src/arch/riscv64/traps.rs      trap_entry, кадр на 264 байта, диспетчер
 src/arch/riscv64/sbi.rs        ecall в M-mode (SRST)
@@ -842,7 +858,7 @@ src/console.rs                 kprint!/kprintln!: UART + экран
 src/shell.rs                   редактор строки и команды
 src/sync.rs                    один нереентерабельный спинлок
 docs/architecture.md           загрузка, кадр ловушки, привилегии, карта памяти
-docs/roadmap.md                майлстоуны M1–M7 и их критерии
+docs/roadmap.md                майлстоуны M1–M8 и их критерии
 docs/shell.png                 снимок экрана из работающего QEMU
 docs/user.png                  снимок run demo / run fault / run spin
 docs/net.png                   снимок net / ping / dns через собственный стек
@@ -850,7 +866,7 @@ assets/font8x18.bin            шрифт покрытия 8×18 (8 бит на 
 tools/run.py                   запуск + screendump + проверка шрифта
 tools/gen_font.py              офлайн-растеризация шрифта в ассет
 tools/font_check.py            сверка пикселей снимка с ассетом
-.github/smoke.py               QEMU-smoke: serial и ramfb режимы
+.github/smoke.py               QEMU-smoke: serial, ramfb, keyboard, net и дисковые режимы
 .github/workflows/ci.yml       fmt + debug/release build + smoke
 run.sh                         единственный лаунчер (QEMU virt + OpenSBI)
 linker.ld                      один сегмент, точка входа _start, 0x8020_0000
@@ -871,12 +887,18 @@ linker.ld                      один сегмент, точка входа _s
 | Дымовой тест: serial | `python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh` |
 | Дымовой тест: экран | `python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb` |
 | Дымовой тест: сеть | `python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --net` |
+| Дымовой тест: клавиатура | `python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb --keyboard` |
+| Дымовой тест: диск (формат и запись) | `qemu-img create -f raw /tmp/ci.img 64M`, затем `…/pagh --ramfb --disk /tmp/ci.img --fresh` |
+| Дымовой тест: диск (повторная загрузка) | `…/pagh --ramfb --disk /tmp/ci.img` |
 
 Всё это выполняется в CI (`.github/workflows/ci.yml`) на запиненном nightly из
-`rust-toolchain.toml`: `fmt` и обе сборки — отдельными job'ами, а smoke-режимы —
-шагами одного job'а. `--ramfb` добавляет `-device ramfb`, так что поднятие экрана
-проверяется без дисплея; `--net` добавляет virtio-net на QEMU user network и
-проверяет DHCP, `net` и ping шлюза, не завися от интернета раннера. Smoke-тест ждёт
+`rust-toolchain.toml`: `fmt` и обе сборки — отдельными job'ами, а шесть
+smoke-режимов — шагами одного job'а. `--ramfb` добавляет `-device ramfb`, так что
+поднятие экрана проверяется без дисплея; `--net` добавляет virtio-net на QEMU user
+network и
+проверяет DHCP, `net` и ping шлюза, не завися от интернета раннера; два дисковых
+шага проверяют формат/монтирование/запись и сохранность файла между загрузками,
+`--keyboard` — ввод через virtio-keyboard. Smoke-тест ждёт
 баннер (UART очищает FIFO при инициализации, поэтому команды, отправленные
 раньше, теряются), шлёт `mem`, `hart`, `time`, `echo`, неизвестную команду,
 `help` и `halt`, и требует, чтобы после `halt` QEMU завершился с кодом 0.

@@ -1,8 +1,9 @@
 # AGENTS.md — guide for AI agents (and humans) working on pagh-riscv
 
-A small 64-bit RISC-V (RV64) kernel in Rust: `#![no_std]`, **zero dependencies**,
-booted by OpenSBI in S-mode on QEMU's `virt` machine, with a polled serial console
-and a ramfb screen. Written by AI under human supervision — read this file before
+A small 64-bit RISC-V (RV64) kernel in Rust: `#![no_std]`; the kernel code is
+written here, the only crates are the vendored TLS 1.3/X.509 stack (since 0.19.0),
+and it is booted by OpenSBI in S-mode on QEMU's `virt` machine, with a polled
+serial console and a ramfb screen. Written by AI under human supervision — read this file before
 touching the code. It lists the gates that must pass and the invariants that are
 easy to break silently.
 
@@ -17,7 +18,7 @@ Read in this order; do not rely on memory over these files:
 |---|---|
 | `README.md` | pitch, honest status per subsystem, quickstart, what is *not* implemented |
 | `docs/architecture.md` | boot phases, trap frame layout with offsets, privilege model, memory (PMM/heap), console+screen, memory map — every claim cites file:line |
-| `docs/roadmap.md` | M1–M6, what "done" means for each, what is explicitly out of scope |
+| `docs/roadmap.md` | M1–M8, what "done" means for each, what is explicitly out of scope |
 | `docs/screenshot.md` | how a PNG of the screen is taken and how its pixels are verified |
 | `docs/tls.md` | TLS 1.3: the verifier's gates, the shell's `https`, and the userland session syscalls |
 | `src/README.md` | crate-root map and the boot sequence |
@@ -39,6 +40,9 @@ qemu-img create -f raw /tmp/ci.img 64M
 python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb --disk /tmp/ci.img --fresh
 python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb --disk /tmp/ci.img
 python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --ramfb --keyboard  # type help/halt
+# M7 acceptance (the smoke job runs it too): virtio-net on QEMU's user network,
+# a DHCP lease at boot, then `net` and an ICMP echo to the gateway.
+python3 .github/smoke.py target/riscv64gc-unknown-none-elf/debug/pagh --net
 ```
 
 `./run.sh` boots the kernel interactively (QEMU `virt` + OpenSBI, serial on stdio;
@@ -76,7 +80,7 @@ python3 tools/test_tls.py                    # needs host internet; --no-userlan
 `rust-toolchain.toml`.
 
 CI (`.github/workflows/ci.yml`) runs the commands above — the smoke job covers the
-four QEMU modes, including the two-run disk acceptance — and reads the toolchain pin
+six QEMU modes, including the two-run disk acceptance — and reads the toolchain pin
 out of `rust-toolchain.toml`. There are **no** other gates yet: no `tools/build.py`, no
 `tools/check_safety.py`, no host-test runner, no general E2E driver (those exist in the
 x86 repository and were deliberately not carried over). `tools/test_pkg.py` is a
@@ -94,7 +98,7 @@ path "for parity".
 kernel-build    -> cargo (target from .cargo/config.toml, linker.ld, -Tlinker.ld)
 kernel-run      -> run.sh                  # Linux/QEMU launcher; window by default, --headless for serial
 kernel-screen   -> tools/run.py            # boots with ramfb, screendump, font check
-kernel-smoke    -> .github/smoke.py        # headless QEMU driver used by CI (serial/ramfb/disk)
+kernel-smoke    -> .github/smoke.py        # headless QEMU driver used by CI (serial/ramfb/keyboard/net/disk)
 kernel-selftest -> the shell's `selftest`  # in-QEMU memory + block + filesystem checks
 package-e2e     -> tools/test_pkg.py       # .ppkg + HTTP mirror + QEMU disk, install/run/remove
 socket-live     -> tools/test_sockets.py   # host HTTP server + QEMU user net + libpagh http_get
@@ -105,8 +109,9 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
 
 ## Repo layout
 
-- `src/` — the kernel (crate `pagh`, **binary**, target `riscv64gc-unknown-none-elf`,
-  `[dependencies]` empty). Modules: `main.rs` (boot phases, global allocator, panic
+- `src/` — the kernel (crate `pagh`, **binary**, target
+  `riscv64gc-unknown-none-elf`; `[dependencies]` is the exactly pinned, vendored
+  TLS/X.509 set). Modules: `main.rs` (boot phases, global allocator, panic
   handler), `arch/riscv64/{boot,csr,sbi,traps,mmu}.rs`, `fdt.rs`,
   `memory/{pmm,heap,selftest}.rs` (+ `src/memory/README.md`),
   `drivers/{uart,fw_cfg,ramfb,framebuffer,block,virtio_mmio,virtio_net,virtio_input,selftest}.rs`
@@ -134,7 +139,9 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
 - `.github/` — CI workflow and the smoke driver.
 - `run.sh`, `linker.ld`, `rust-toolchain.toml`, `.cargo/config.toml` — build and run.
 - Absent on purpose (do not assume they exist): `host-tests/`, `tools/build.py`,
-  `tools/e2e.py`, `vendor/`, `limine/`, `disk.img`, `OVMF.fd`.
+  `tools/e2e.py`, `limine/`, `disk.img`, `OVMF.fd`. `vendor/` is **not** absent: it
+  is the committed source of the pinned TLS/X.509 crates, selected by
+  `.cargo/config.toml` so the build is offline and `--locked`.
 
 ## Hard invariants (breaking these looks like "hardware" bugs)
 
@@ -172,7 +179,7 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
 5. **`mhartid` is an M-mode CSR.** Reading it from S-mode is an illegal instruction
    (this actually happened: `scause=2, stval=0xf1402573`, machine halted). Use
    `arch::riscv64::hart_id()`, which reads `BOOT_HART_ID`, captured in `_start` while
-   the id is still in `a0` (`boot.rs:23-28, 56-63`). The same applies to every other
+   the id is still in `a0` (`boot.rs:30-35`, static at `63-70`). The same applies to every other
    M-mode CSR: `ecall` (SBI) is the only door.
 6. **Device-tree honesty.** The FDT is the machine description; a parse failure is
    fatal and loud (`src/main.rs`), never a guess. The reader answers exactly five
@@ -187,7 +194,7 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
 7. **Boot phase order is load-bearing** (`docs/architecture.md` §3): console before
    any print, FDT before the shell (and before any device work), **frame pool before
    the first allocation**, paging before any MMIO beyond the console, traps before the
-   shell, hart parking before Rust. M3 adds two: the timer and the PLIC after the
+   shell (nothing to park: firmware already left the other harts in HSM stopped). M3 adds two: the timer and the PLIC after the
    trap vector is installed (`sie` must stay 0 until both compare register and
    controller are ready, and the PLIC must route the UART line before the UART
    raises it), M5 adds two more: the block driver after the map and traps (it
@@ -238,12 +245,18 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
     an interrupt on an unarmed register. `plic::windows()` derives the S-mode
     context page — never map `CONTEXT_BASE` alone (that is firmware's M-mode
     context; the first threshold write faults, as the first M3 boot showed).
-15. **`#![no_std]`, no dependencies.** `Cargo.toml`'s `[dependencies]` is empty.
-    `alloc` **is** available (`extern crate alloc` + `#[global_allocator]` in
-    `src/main.rs`). Nothing that runs *before* the frame pool may allocate, and the
-    drivers that run early (console, ramfb, virtio probe) use fixed statics — but
-    the filesystem mount and the shell are normal `alloc` users by design. Adding a
-    crate is an architecture decision, not an implementation detail.
+15. **`#![no_std]`, and the dependency set is vendored and pinned.** Since 0.19.0
+    `[dependencies]` holds the TLS 1.3/X.509 stack: 11 direct pins (`embedded-tls`
+    with its local `Finished`-ordering patch, `embedded-io[-async]`, `rand_core`,
+    `rsa`, `p384`, `ed25519-dalek`, `sha2`, `p256`, `signature`, `const-oid`), 77
+    crates in total under `vendor/`, built offline via `.cargo/config.toml`. The
+    rest of the kernel uses no crates. `alloc` **is** available (`extern crate
+    alloc` + `#[global_allocator]` in `src/main.rs`). Nothing that runs *before*
+    the frame pool may allocate, and the drivers that run early (console, ramfb,
+    virtio probe) use fixed statics — but the filesystem mount and the shell are
+    normal `alloc` users by design. Adding a crate, refreshing the vendored set, or
+    dropping the embedded-tls patch is an architecture decision, not an
+    implementation detail.
 16. **`unsafe` blocks carry `SAFETY:` comments** — every one, including the asm
     contracts (house style; no automated gate yet, unlike x86's `check_safety.py`).
 17. **Only a blank device is ever formatted.** `main.rs::init_fs` mounts first and
@@ -500,7 +513,7 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
 |---|---|
 | Sv39 is on with an **identity** map, so a physical address is still a pointer | the kernel root and every process root copy that identity map; any address handed to a device (`fw_cfg`, ramfb) relies on it. `create_user_space` copies only supervisor leaves, so a kernel mapping added after a process root was created is absent there — do not add kernel maps under a live process without a plan |
 | The tick is 100 Hz and preemption happens only on it (no priorities/deadline scheduler) | scheduling policy is a scheduler change; `timer::set_tick_handler` is the seam, not a policy |
-| No TLS/apt: the network stack speaks plain HTTP | `pkg` verifies size + SHA-256 from the index only (integrity, not signatures) and says so; apt stays deliberately unwired until the vendored-TLS + OpenPGP milestone lands. Never call the digest a signature or `pkg` an apt replacement |
+| `pkg`/apt have no package signatures and no TLS transport in the installer | TLS 1.3 exists in the kernel (0.19.0 client, 0.21.0 userland sessions) but `pkg` speaks plain HTTP on purpose; it verifies size + SHA-256 from the index only (integrity, not signatures) and says so; apt stays deliberately unwired until OpenPGP package-signature verification lands. Never call the digest a signature or `pkg` an apt replacement |
 | TCP is a minimal client + one listener, not a general stack; userland gets one active `AF_INET`/`SOCK_STREAM` client, one listener (`bind`/`listen`/`accept`) and `AF_INET`/`SOCK_DGRAM` (bind/sendto/recvfrom) | one listener, backlog ≤ 4, 8 connection slots (4 KiB rx each); no UDP `connect`, IPv6 sockets, DNS syscall, keepalive/TIME_WAIT/half-close, out-of-order reassembly, congestion control or TLS; UDP is 8 bindings × 4 datagrams × 1024 B, one interface |
 | The NIC is polled and the stack is synchronous | network progress happens while a command, a socket syscall (`connect`/`send`/`recv`/`close`) or the shell's idle loop polls; an IRQ-driven NIC is a later milestone |
 | Interrupt handlers cannot allocate or print | put work in normal context; bump a counter and read it from `time`/`selftest` |
@@ -578,8 +591,9 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
     under `/mnt/bin` is touched. Only after that gate is `PPKG0001` parsed and a
     payload copied to `/mnt/bin`; the manifest is written last. Never reorder
     this into "parse while downloading", "install then verify", or a whole-package
-    heap buffer. There is no TLS, no OpenPGP and no apt: do not describe the
-    SHA-256 as authentication, and do not call `pkg` an apt replacement.
+    heap buffer. `pkg` does not use the kernel's TLS client, and there is no
+    OpenPGP and no apt: do not describe the SHA-256 as authentication, and do not
+    call `pkg` an apt replacement.
 
 35. **Every path mutation shares one shape and one error contract.** `mkdirat`,
     `unlinkat`, `symlinkat`, `linkat`, `renameat2` and `fchmodat` read the path
@@ -627,7 +641,8 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
     clamps the backlog to `1..=4`; the UDP binding table is static (8 ports, 4
     datagrams each), the queue drops the oldest datagram when full, and no lock
     is held across `copy_to_user` or a NIC poll. IPv4 literals only: there is
-    no DNS syscall, no UDP `connect`, no IPv6 socket, and no TLS. The live
+    no DNS syscall, no UDP `connect`, no IPv6 socket, and no TLS socket option
+    (TLS is the separate `tls_*` 1100-1103 family over a connected stream). The live
     evidence is `tools/test_sockets.py` / `docs/live-sockets.txt` (TCP client),
     `tools/test_tcp_server.py` / `docs/live-tcp-server.txt` (TCP server) and
     `tools/test_udp.py` / `docs/live-udp.txt` (UDP); the CI-safe evidence is the

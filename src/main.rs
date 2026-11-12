@@ -54,8 +54,9 @@ pub fn heap_stats() -> (usize, usize, usize) {
 /// The kernel entry point called from `_start`.
 ///
 /// `hart_id` is the hart OpenSBI booted us on, `dtb` the physical address of the
-/// device tree. Only hart 0 does anything: the others are parked in `_start`
-/// before Rust is reached, so this function never runs concurrently.
+/// device tree. Firmware hands S-mode to exactly one hart and its id is not
+/// checked (it need not be 0, and this kernel parks nobody — see
+/// `src/arch/riscv64/boot.rs`), so this function never runs concurrently.
 #[no_mangle]
 pub extern "C" fn kmain(hart_id: usize, dtb: usize) -> ! {
     console::init();

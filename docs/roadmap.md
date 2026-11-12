@@ -1,6 +1,6 @@
 # Roadmap pagh-riscv
 
-Семь майлстоунов: M1 — то, что уже работает; M2–M7 — по возрастанию. Для каждого
+Восемь майлстоунов: M1 — то, что уже работает; M2–M8 — по возрастанию. Для каждого
 сказано, что именно считается «сделано» (проверяемо), что есть в дереве сегодня и
 что в этот майлстоун **не** входит. Майлстоун не считается закрытым, пока его
 критерии не подтверждены живым запуском и не отражены в документации.
@@ -27,15 +27,15 @@
 
 | Критерий | Как проверяется | Подтверждение |
 |---|---|---|
-| `_start` паркует не-нулевые hart'ы и вызывает `kmain` | `src/arch/riscv64/boot.rs:13-38`; в логе `boot hart   0` | живой запуск |
-| Стек 64 KiB, выравнивание 16 | `src/arch/riscv64/boot.rs:18-21, 44-54` | `nm`: `__stack_bottom … __stack_top` |
-| DTB читается: память и timebase | `src/main.rs:65-81`, `src/fdt.rs:160-191` | `memory 0x80000000..0x90000000 (256 MiB)`, `timebase 10000000 Hz` |
-| Ошибка DTB фатальна и громкая | `src/main.rs:67-71` | текст `fdt: refusing to guess the machine layout` |
-| Вектор ловушек установлен | `src/main.rs:109-111`, `src/arch/riscv64/traps.rs:151-155` | кадр и диспетчер — `docs/architecture.md`, раздел 4 |
-| Шелл: команды и редактор строки | `src/shell.rs:21-59, 140-250` | `.github/smoke.py`: `mem`, `hart`, `time`, `echo`, неизвестная команда, `help`, `halt` |
-| `halt` действительно выключает машину | `src/shell.rs:221-227`, `src/arch/riscv64/sbi.rs:24-38` | QEMU завершается с кодом 0 (проверка в `smoke.py`) |
-| Нет паники в обработчике ловушек | `src/arch/riscv64/traps.rs:4-8, 195-201` | исключение печатает `[EXC] … halting` и паркует hart |
-| CI зелёный | `.github/workflows/ci.yml` | `fmt`, debug/release build, smoke в двух режимах (serial и `--ramfb`) |
+| `_start` вызывает `kmain` на единственном hart'е, которому OpenSBI отдал S-mode (id из `a0`, не обязательно 0); остальные hart'ы firmware держит в HSM stopped, ядро их не паркует | `src/arch/riscv64/boot.rs:9-43`; в логе `boot hart   <id>` | живой запуск |
+| Стек 128 KiB, выравнивание 16 | `src/arch/riscv64/boot.rs:51-61` | `nm`: `__stack_bottom … __stack_top` |
+| DTB читается: память и timebase | `src/main.rs:74-90`, `src/fdt.rs:282, 302` | `memory 0x80000000..0x90000000 (256 MiB)`, `timebase 10000000 Hz` |
+| Ошибка DTB фатальна и громкая | `src/main.rs:74-79` | текст `fdt: refusing to guess the machine layout` |
+| Вектор ловушек установлен | `src/main.rs:227`, `src/arch/riscv64/traps.rs:298-302` | кадр и диспетчер — `docs/architecture.md`, раздел 4 |
+| Шелл: команды и редактор строки | `src/shell.rs:67-182, 217-525` | `.github/smoke.py`: `mem`, `hart`, `time`, `echo`, неизвестная команда, `help`, `halt` |
+| `halt` действительно выключает машину | `src/shell.rs:516-522`, `src/arch/riscv64/sbi.rs:87-102` | QEMU завершается с кодом 0 (проверка в `smoke.py`) |
+| Нет паники в обработчике ловушек | `src/arch/riscv64/traps.rs:6-8, 404-416` | исключение печатает `[EXC] … halting` и паркует hart |
+| CI зелёный | `.github/workflows/ci.yml` | `fmt`, debug/release build, smoke в шести режимах (serial, ramfb, keyboard, net, диск fresh/existing) |
 
 Открытый хвост M1: host-тестов нет, чистая логика (`fdt.rs`) не покрыта. Для
 состояния ядра тесты уже появились — это M2 (`selftest`).
@@ -66,7 +66,7 @@
 | Таймер программируется через SBI TIME (не через `mtimecmp` — он M-mode) | **готово** | `src/arch/riscv64/timer.rs`: `set_timer` (EID 0x54494D45), абсолютный дедлайн +10 мс на прерывание (дрейф не копится), `time` CSR для счёта; лог `timer 10 ms ticks (100 Hz, timebase 10000000 Hz)` |
 | `sie` включает нужные источники, `stvec` их обрабатывает | **готово** | `sie.STIE`/`sie.SEIE` после инициализации; диспетчер в `traps.rs` различает `scause` с битом прерывания: timer (5), external (9); возврат только через `sret`, исключения по-прежнему печатают и паркуют hart |
 | PLIC разведён: внешние прерывания доходят | **готово** | `src/arch/riscv64/plic.rs`: база и UART source из DTB, S-mode context, enable/priority/threshold, claim/complete, счётчики и unknown-source; лог `plic 0xc000000 context 1, uart irq 10 (rx interrupt on)`; в `time` видно `plic N claims, N completed` |
-| Консоль не теряет байты при прерываниях | **готово** | приём — IRQ → кольцевой буфер → `uart::wait_byte` (`wfi`); smoke-driver шлёт пачку команд после баннера и проходит в четырёх режимах; `0 uart rx overrun(s)` в логе; polled-путь остаётся запасным |
+| Консоль не теряет байты при прерываниях | **готово** | приём — IRQ → кольцевой буфер → `uart::wait_byte` (`wfi`); smoke-driver шлёт пачку команд после баннера и проходит в шести режимах; `0 uart rx overrun(s)` в логе; polled-путь остаётся запасным |
 | Критические секции маскируют прерывания | **готово** | `uart::put_byte` под `csr::without_interrupts` (коммит «mask interrupts around the UART transmitter lock»); правило записано в `docs/architecture.md` §12.1 и AGENTS.md |
 | Сон и uptime считаются от тиков, холостой цикл не жжёт CPU | **готово** | `sleep 1` → `uptime 1010 ms (101 timer ticks at 100 Hz, 101 timer interrupts)`, `wfi` в `sleep_ticks` и в ожидании ввода |
 | Счётчики прерываний проверяются машинно | **готово** | `SELFTEST timer-ticks / timer-interrupts / uart-ring / plic-uart-line PASS` + `SELFTEST SUMMARY (arch): 4/4 passed`; два прогона в одной загрузке дают один ledger |
@@ -168,7 +168,8 @@ TCP-клиент для HTTP/1.0. Ни smoltcp, ни внешних крейто
 | Логика проверяется без железа | **готово** | `SELFTEST net-* 12/12` (без NIC): checksum-вектор, round-trip заголовков, отказ на порче, DHCP/DNS из фиксированных байт |
 | CI и живой прогон | **готово** | `smoke.py --net` (DHCP+net+ping+halt) в CI; `selftest` дважды с одинаковым PMM-ledger; `docs/net.png` проверен `font_check` |
 
-Не входит в M7: TLS/apt (следующий майлстоун, нужен крипто-слой), IPv6,
+Не входит в M7: TLS (сделан отдельно: 0.19.0 — клиент, 0.21.0 — userland-
+сессии) и apt (его нет), IPv6,
 фрагментация, несколько интерфейсов, несколько TCP-listener'ов, обновление
 lease по таймеру, прерывания NIC. UDP-сокеты как публичный API появились
 позже, в 0.17.0 (`socket(SOCK_DGRAM)`/`bind`/`sendto`/`recvfrom`), а TCP-сервер —
@@ -176,17 +177,6 @@ lease по таймеру, прерывания NIC. UDP-сокеты как п�
 
 Релиз **0.6.0** — это M7: версия в `Cargo.toml`/`Cargo.lock`, тег `0.6.0`,
 GitHub release, скриншот `docs/net.png`.
-
-## Дальше (после M7)
-
-1. **TLS + apt**: vendored `embedded-tls` с локальным патчем (как на x86),
-   OpenPGP-проверка `InRelease`/`Release.gpg` и дайджестов `.deb`; только после
-   этого `apt` становится доступен на RISC-V.
-2. **Userland-API и Rust-рантайм** (`pagh-api` + `pagh-tools`, отдельные репо):
-   расширение Linux-compat syscall-слоя (mmap/brk, futex, poll, sockets, время),
-   crt0/`libpagh`, затем порты `curl`/`ripgrep`, переписанные под API.
-3. Свой **загрузчик для x86-64** (в репозитории Pagh-OS) — замена Limine.
-4. Журнал/WAL в ext2, SMP, сетевые помелочи (renewal, несколько сокетов).
 
 ## M8 — указатель и software-курсор (готов)
 
@@ -197,10 +187,22 @@ GitHub release, скриншот `docs/net.png`.
 | Курсор — часть кадра, а не второй слой | **готово** | `framebuffer.rs`: сохранить/восстановить 12×19 под стрелкой, `flush_rect` только её прямоугольника; текст печатается под курсором, курсор остаётся сверху |
 | Опрос не требует прерывания | **готово** | `virtio_input::poll()` из idle-цикла шелла (100 Гц), очередь 64 буфера, consumed публикуется обратно; `selftest input-device PASS` |
 | Нет устройства — валидная конфигурация | **готово** | `NO_MOUSE=1 ./run.sh` и serial-only CI: строка `virtio-input: no device`, курсора нет; все остальные подсистемы не меняются |
-| CI видит устройство в каждом режиме | **готово** | smoke подключает `virtio-tablet-device`, ожидает строку `virtio-input: tablet at 0x`; пять режимов PASS |
+| CI видит устройство в каждом режиме | **готово** | smoke подключает `virtio-tablet-device`, ожидает строку `virtio-input: tablet at 0x`; шесть режимов PASS |
 
 Не входит в M8: клики и перетаскивание (драйвер читает `BTN_LEFT`, потребителя
 нет), каретка ввода, выделение текста мышью, свой PLIC-источник для virtio-input
 (сейчас polled), горячее подключение. Курсор не рисуется, пока выполняется
 команда (шелл занят) — это ограничение той же модели «один поток опрашивает»,
 что и у сети.
+
+## Дальше (после M8)
+
+1. **apt и проверка подписей**: OpenPGP-проверка `InRelease`/`Release.gpg` и
+   дайджестов `.deb`; только после этого `apt` становится доступен на RISC-V.
+   TLS 1.3-клиент уже есть (0.19.0: vendored `embedded-tls` с локальным патчем,
+   0.21.0: userland-сессии), но `pkg`/`apt` им пока не пользуются.
+2. **Userland-API и Rust-рантайм** (`pagh-api` + `pagh-tools`, отдельные репо):
+   расширение Linux-compat syscall-слоя (mmap/brk, futex, poll, sockets, время),
+   crt0/`libpagh`, затем порты `curl`/`ripgrep`, переписанные под API.
+3. Свой **загрузчик для x86-64** (в репозитории Pagh-OS) — замена Limine.
+4. Журнал/WAL в ext2, SMP, сетевые помелочи (renewal, несколько сокетов).
