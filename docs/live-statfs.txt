@@ -1,0 +1,62 @@
+# Live statfs(2)/fstatfs(2) acceptance for pagh-riscv 0.24.0
+# kernel: target/riscv64gc-unknown-none-elf/debug/pagh (debug build, RV64, OpenSBI, QEMU virt)
+#
+# Two boots. Serial-only (no disk, no NIC): the fixture has no filesystem to
+# describe and says so. Disk boot: a blank 64 MiB image is formatted by the
+# kernel, mounted at /mnt, described by the native statfs record, and the
+# same fixture runs under `selftest` as the 16th user-mode check.
+# Each line below is real serial output, not edited.
+
+== serial boot: no /mnt is an honest answer, not an error ==
+
+$ printf 'run statfs\n'
+
+   pagh OS — RISC-V (RV64)
+========================================
+boot hart   0
+device tree 0x8fe00000
+memory      0x80000000..0x90000000 (256 MiB)
+timebase    10000000 Hz
+console     NS16550 @ 0x10000000
+pmm         62156/65536 frames free (256 MiB tracked), heap 0 KiB in 0 chunk(s)
+sv39        on, satp=0x8000000000080d32, identity 0x80000000..0x90000000 (RWX below 0x80d32000, RW above), 65549 pages, 13 device
+rtc         goldfish @ 0x101000 - 2026-11-12 22:13:49 UTC
+rtc         raw 0x0179f890 0x18e76bea 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
+entropy     32 bytes from /chosen/rng-seed - TLS session keys available
+timer       10 ms ticks (100 Hz, timebase 10000000 Hz)
+plic        0xc000000 context 1, uart irq 10 (rx interrupt on)
+task        16 slots, 96 KiB stack + 4 KiB guard, quantum 8 ticks, timer clock
+virtio-blk: no device
+virtio-input: tablet at 0x10008000, abs X 0..32767, Y 0..32767
+fs          no block device (/mnt not mounted)
+virtio-net: no device
+net         no network device
+
+Type 'help' for the command list.
+
+pagh:rv64> run statfs
+statfs: no /mnt
+run: statfs exited with code 0
+pagh:rv64> halt
+halt: powering off
+
+== disk boot: ext2 record, live free counts, procfs zeros, then selftest ==
+
+$ printf 'run statfs\nselftest\n'
+
+pagh:rv64> run statfs
+statfs: /mnt ext2 block=4096 blocks=16250/16384 files=4085/4096 namelen=255 fsid=0
+statfs: ext2 ok
+statfs: free-space ok
+statfs: fstatfs ok
+statfs: /proc procfs block=0 blocks=0/0 files=0/0 namelen=255 fsid=0
+statfs: procfs ok
+statfs: errors ok
+statfs: done
+run: statfs exited with code 0
+
+SELFTEST user-proc-fs PASS
+SELFTEST user-statfs PASS
+SELFTEST SUMMARY (user): 16/16 passed
+[selftest] user PMM hygiene: free frames 61980 -> 61980
+halt: powering off

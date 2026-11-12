@@ -1,6 +1,6 @@
 # `userland/` — статические RV64-программы для M6b и native ABI
 
-Десять крошечных программ без рантайма и libc — ровно столько, чтобы проверить
+Одиннадцать крошечных программ без рантайма и libc — ровно столько, чтобы проверить
 точки входа ядра и контракт `pagh-api/docs/abi.md`. Все собраны в ELF заранее;
 ядро встраивает их через `include_bytes!` (`src/user/mod.rs`), поэтому чистый
 checkout собирается **без** кросс-компилятора.
@@ -16,6 +16,7 @@ checkout собирается **без** кросс-компилятора.
 | `stack.rs` / `stack.elf` | рекурсивная цепочка `descend`: 40 уровней по 4 KiB (160 KiB), в каждом уровне `sd` в дно кадра; печатает `stack: deep recursion ok` и выходит 0 | деманд-рост user-стека: первые ~96 KiB ниже начального окна обязаны быть домаплены ядром, иначе первый же store за `USER_STACK_BASE` убил бы программу |
 | `stack-over.rs` / `stack-over.elf` | та же цепочка на 300 уровней (1.2 MiB); если она **вернётся**, выходит 111 | потолок 1 MiB на процесс: рост обязан упереться в guard ниже `USER_STACK_FLOOR` и умереть `store page fault`, не съев PMM |
 | `proc.rs` / `proc.elf` | читает синтетический `/proc` обычными syscall'ами: `openat`+`getdents64` на `/proc` (девять статических записей с `d_type`, `self` — симлинк, `kthreads/` и `net/` — каталоги, плюс свой pid) и `/proc/net` (`arp`+`dev`), `fstat` (regular file 0o644, `size()` = числу прочитанных байт), чтение кусками по 7 B с `lseek(0)` и побайтовым сравнением (`version`), содержимое `meminfo` (`MemTotal`/`MemFree`, `free <= total`), `uptime`, `tasks`, `mounts`, `net/dev` (NIC есть или честно «no interface»), read-only-отказы (`mkdirat`/`unlinkat`/`write` → `-ENOTSUP`) и `-ENOENT` на неизвестные имена; **per-pid**: `readlink("/proc/self")` = `getpid()`, `/proc/self/{status,stat,cmdline}` совпадают с `/proc/<pid>/*`, `fork`-ребёнок читается по pid, пока жив, а после `wait4` его pid — `-ENOENT`, `/proc/kthreads/{0,1}` — shell/idle; печатает `proc: … ok` и выходит 0, любая ошибка — свой ненулевой код и строка `proc: FAIL` | userland-доступ к `/proc` через native ABI; снимок на проход чтения (`size`/`read` согласованы); read-only контракт синтетической ФС; per-pid namespace и `self` |
+| `statfs.rs` / `statfs.elf` | `statfs(43)`/`fstatfs(44)` через native ABI: `Statfs` — 96 B (10 little-endian `u64` + NUL-padded `type_name[16]`); проверяет поля ext2 (`magic=0xEF53`, power-of-two block size, `blocks_free<=blocks_total`, `blocks_available==blocks_free`, `files_free<=files_total`, `namelen=255`, `flags=0`, `type_name="ext2"`), живой учёт: create+write 4096 B двигает `blocks_free`/`files_free`, `unlink` возвращает; `fstatfs` на fd каталога совпадает с `statfs` пути, на `/proc` — `procfs` с нулями, на console — `-ENOTSUP`, на fd 999 — `-EBADF`; ошибки `-ENOENT`/`-ENOTSUP`/`-EINVAL`/`-EFAULT`; без диска печатает `statfs: no /mnt` и выходит 0; с диском — `statfs: … ok` и `statfs: done`, любая ошибка — свой код и `statfs: FAIL` | native `statfs`/`fstatfs`: реальные счётчики VFS, синтетическая ФС с нулевой ёмкостью, `fstatfs`-семантика fd и весь error-контракт |
 | `stack-fork.rs` / `stack-fork.elf` | та же цепочка, но на 30-м уровне (когда ниже начального окна уже выросли ~14 страниц) вызывается `fork(1000)`; родитель ждёт `wait4`, ребёнок доходит до конца на своей копии и печатает `stack: fork child ok`, родитель — `stack: fork parent ok`, оба выходят 0 (при ошибке fork/wait — 9) | `fork` копирует именно `stack_low..USER_STACK_BASE`, а `wait4` возвращает выросшие кадры ребёнка в PMM; рост продолжается и в ребёнке |
 | `user.ld` | линковка: `_start` = `0x1_0000`, PT_LOAD-раскладка | совпадает с окном из `src/user/elf.rs` |
 
@@ -43,7 +44,8 @@ toolchain: `TOOLCHAIN=nightly-... ./userland/build.sh`. `strip=debuginfo`
 
 - Linux/RISC-V номера: `read=63`, `write=64`, `openat=56`, `close=57`,
   `getdents64=61`, `lseek=62`, `fstat=80`, `readlinkat=78`, `nanosleep=101`,
-  `clock_gettime=113`, `uname=160`, `brk=214`, `exit=93`, `exit_group=94`,
+  `statfs=43`, `fstatfs=44`, `clock_gettime=113`, `uname=160`, `brk=214`,
+  `exit=93`, `exit_group=94`,
   `set_tid_address=96`, `futex=98`, `sched_yield=124`, `getpid=172`,
   `getppid=173`, `gettid=178`, `clone=220`, `fork=1000` (pagh-native),
   `execve=221`, `wait4=260`, `socket=198`, `bind=200`, `listen=201`,
@@ -118,7 +120,7 @@ proc: fork ok
 proc: done
 run: proc exited with code 0
 pagh:rv64> cat /proc/version
-pagh 0.23.0 (riscv64) #1
+pagh 0.24.0 (riscv64) #1
 pagh:rv64> cat /proc/self/status
 Name:	shell
 State:	R (running)
@@ -142,4 +144,14 @@ pagh:rv64> stat /proc/self
 pagh:rv64> ls /proc/kthreads
 0/
 1/
+pagh:rv64> run statfs
+statfs: /mnt ext2 block=4096 blocks=16250/16384 files=4085/4096 namelen=255 fsid=0
+statfs: ext2 ok
+statfs: free-space ok
+statfs: fstatfs ok
+statfs: /proc procfs block=0 blocks=0/0 files=0/0 namelen=255 fsid=0
+statfs: procfs ok
+statfs: errors ok
+statfs: done
+run: statfs exited with code 0
 ```

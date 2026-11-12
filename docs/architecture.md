@@ -438,7 +438,7 @@ SELFTEST SUMMARY: 6/6 passed
 |---|---|---|
 | шов блочного слоя | `src/drivers/block.rs` | трейт `BlockDevice` (512-байтные секторы, `read/write/flush`, `sector_count`), **один** слот реестра и RAM-диск `MemBlock` для тестов. Короткий трансфер — `Err`, а не EOF: молча укороченное чтение — это способ испортить метаданные ФС |
 | драйвер | `src/drivers/virtio_mmio.rs` | modern virtio 1.x (transport version 2), split virtqueue, один запрос в полёте, polled: прерываний пока нет (M3). Окна транспорта приходят из DTB. Запрос — три дескриптора (заголовок, данные, статус); `used.len` обязан совпасть с длиной данных, ненулевой статус — ошибка. Опрос ограничен; исчерпание помечает устройство FAILED (индексы кольца больше нельзя считать согласованными) |
-| ФС | `src/fs/ext2/` + `src/vfs/` | ext2 на диске: суперблок/группы/inode/dirent, direct + single/double indirect, truncate, каталоги, create/unlink/mkdir/rmdir/rename, симлинки. Геометрия (block size, inode size, `s_first_data_block`) читается из суперблока, поэтому образ хостового `mkfs.ext2` монтируется. VFS — один трейт `VfsNode`, синтетический корень, `/proc` (монтируется из `vfs::init`) и `/mnt` (boot-путь), два разрешения пути: `lookup_path` (без последней симлинки) и `walk` (с переходом и бюджетом), плюс `fs_type`/`mount_snapshot` для `/proc/mounts` |
+| ФС | `src/fs/ext2/` + `src/vfs/` | ext2 на диске: суперблок/группы/inode/dirent, direct + single/double indirect, truncate, каталоги, create/unlink/mkdir/rmdir/rename, симлинки. Геометрия (block size, inode size, `s_first_data_block`) читается из суперблока, поэтому образ хостового `mkfs.ext2` монтируется. VFS — один трейт `VfsNode`, синтетический корень, `/proc` (монтируется из `vfs::init`) и `/mnt` (boot-путь), два разрешения пути: `lookup_path` (без последней симлинки) и `walk` (с переходом и бюджетом), плюс `fs_type`/`mount_snapshot` для `/proc/mounts` и `FsStat` (magic, блоки, inode'ы, UUID-префикс) — источник `statfs(43)`/`fstatfs(44)` |
 
 **Формат — разрушительная операция, поэтому решение вынесено отдельно.**
 `init_fs` сначала пытается смонтировать; только после неудачи спрашивает
@@ -483,6 +483,24 @@ offset 0 перерисовывает содержимое (живое сост�
 `getdents64` без диска и без NIC — включая `/proc/self`, живой forked peer по
 pid и reaped child → `-ENOENT`; serial/`--net`/disk-fresh smoke проверяют
 шелловую половину.
+
+**`statfs(2)`/`fstatfs(2)` — цифры из VFS, а не из syscall.** Syscall берёт
+снимок `FsStat` у узла, к которому привёл путь (или fd), и добавляет `fs_type`;
+сам он ничего не считает. Для ext2 это `magic = 0xEF53`, реальные
+`block_size`/`blocks_total`/`blocks_free`/`inodes_total`/`inodes_free` и `fsid`
+— первые 8 байт `s_uuid` LE (`0` у образа без UUID: пустой образ форматтер
+пишет с нулевым UUID, и это честный ноль, а не «неизвестно»). Запись
+`Statfs` — нативные 96 байт: 10 little-endian `u64` и NUL-padded
+`type_name[16]`; `blocks_available == blocks_free` (форматтер пишет
+`s_r_blocks_count = 0`, резерва для root нет), `flags = 0` (read-only
+монтирований в ядре нет), `name_len = 255` (контракт VFS на имя компонента).
+Синтетическая ФС (`/proc`) ёмкости не имеет, но тип имеет: `procfs` и нули во
+всех счётчиках; синтетический корень `/` — `-ENOTSUP`; относительный путь —
+`-EINVAL`, отсутствующий — `-ENOENT`, `NULL`-запись — `-EFAULT`. `fstatfs`
+работает только для `File`-дескрипторов (console/pipe/socket/TLS — `-ENOTSUP`,
+несуществующий номер — `-EBADF`). Проверка: `userland/statfs.elf`
+(`run statfs`) и `SELFTEST user-statfs`; последняя сравнивает счётчики
+до/после реального create+write+unlink, так что константы её не пройдут.
 
 **Тесты.** `selftest` печатает три группы: 7 проверок памяти, 3 блочного слоя
 (RAM round-trip; реальный диск только читается) и 11 ext2/VFS на RAM-устройствах
@@ -1113,7 +1131,7 @@ exec проверяет сброс `SIG_IGN` в `SIG_DFL` и сохранени�
 файл даёт `-ENOEXEC`, процесс выживает.
 `SELFTEST user-abi-syscalls` требует, чтобы `forks`/`waits`/`getppids`/
 `execs` выросли, `live_processes() == 0`, `live_pipes() == 0`, а selftest с
-диском проходит 15/15 (13/15 + 2 SKIP без `/mnt`); PMM-ledger в двух прогонах
+диском проходит 16/16 (13/16 + 3 SKIP без `/mnt`); PMM-ledger в двух прогонах
 совпадает. Отдельная проверка `user-tls-abi` гоняет `userland/tls.elf`:
 `getrandom(278)` (нули/флаги/`-EFAULT`/короткое чтение на 64 KiB-потолке) и
 fail-closed ответ всех четырёх TLS-вызовов (1100–1103) на дескрипторе, который
@@ -1259,8 +1277,8 @@ fail-closed ответ всех четырёх TLS-вызовов (1100–1103) 
   поэтому образ можно проверять хостовыми инструментами.
 * **Нет SMP**: работает один hart.
 * **Нет host-тестов**: есть in-QEMU selftests (7 памяти, 4 блока/указателя, 11
-  ext2/VFS, 4 таймера/PLIC, 5 планировщика, 15 user-mode — с диском 15/15, без
-  `/mnt` 13/15 + 2 SKIP, 12 сети), QEMU-smoke в шести режимах (serial, ramfb, диск
+  ext2/VFS, 4 таймера/PLIC, 5 планировщика, 16 user-mode — с диском 16/16, без
+  `/mnt` 13/16 + 3 SKIP, 12 сети), QEMU-smoke в шести режимах (serial, ramfb, диск
   fresh/existing, net, keyboard) и проверка пикселей `tools/font_check.py`;
   чистая логика (`fdt.rs`) тестами не покрыта.
 * **Инструментов сборки нет**: `run.sh` — единственный лаунчер; в `tools/` только
@@ -1293,11 +1311,13 @@ fork/exec/wait подтверждены живыми прогонами (`run de
 killed, `run spin` → 7 с таймером в U; маркеры `abi: threads ok`,
 `abi: signals ok`, `abi: altstack ok`, `abi: siginfo ok`, `abi: jobcontrol ok`,
 `abi: fork ok`, `abi: wait ok`, `abi: exec ok`, `abi: exec wait ok`),
-`SELFTEST user-* 15/15` с диском (`user-run-large-file`: 100 KiB образ с нулевым
+`SELFTEST user-* 16/16` с диском (`user-run-large-file`: 100 KiB образ с нулевым
 хвостом через `run_file`; `user-stack-grows`/`user-stack-cap`/`user-stack-fork`:
 рост до 1 MiB, guard и fork на выросшем стеке; `user-tls-abi`: `getrandom` и
 fail-closed матрица TLS-вызовов; `user-proc-fs`: userland читает `/proc` через
-`openat`/`read`/`getdents64`; без `/mnt` — 13/15 + 2 SKIP), PMM-ledger до/после
+`openat`/`read`/`getdents64`; `user-statfs`: `statfs`/`fstatfs`, живой учёт
+блоков/inode'ов и матрица ошибок; без `/mnt` — 13/16 + 3 SKIP), PMM-ledger
+до/после
 каждого блока совпадает в двух прогонах, smoke проходит serial/net/ramfb/
 disk-fresh/disk-existing/keyboard. Следующие шаги —
 из `docs/roadmap.md`:

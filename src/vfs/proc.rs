@@ -382,6 +382,10 @@ impl VfsNode for ProcLink {
         0o120777
     }
 
+    fn fs_type(&self) -> &'static str {
+        "procfs"
+    }
+
     fn nlink(&self) -> u64 {
         1
     }
@@ -543,6 +547,12 @@ impl VfsNode for ProcFile {
         // Synthetic file bits: a regular file with the 0o644 default `fstat`
         // would otherwise have to invent.
         0o100644
+    }
+
+    fn fs_type(&self) -> &'static str {
+        // A file is part of the same filesystem as its directory; `statfs` and
+        // `fstatfs` on a proc file must answer `procfs`, not "synthetic".
+        "procfs"
     }
 
     fn nlink(&self) -> u64 {
