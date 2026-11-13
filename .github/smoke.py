@@ -89,7 +89,7 @@ EXPECTED = [
     # entries appear here; the `run proc` fixture below checks that namespace
     # from inside a process.
     "pagh:rv64> cat /proc/version",
-    "pagh 0.24.1 (riscv64) #1",
+    "pagh 0.24.2 (riscv64) #1",
     "pagh:rv64> ls /proc",
     "cpuinfo\nkthreads/\nmeminfo\nmounts\nnet/\nself\ntasks\nuptime\nversion\n",
     "pagh:rv64> cat /proc/meminfo",
