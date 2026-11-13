@@ -18,7 +18,7 @@ syscall'ов заморожен в `pagh-api/docs/abi.md`; ниже — как �
 | `signal.rs` | POSIX-подобные сигналы: per-process таблица `sigaction` (1..=31, строка привязана к слоту процесса), per-thread `pending`/`blocked`/`altstack`/активный кадр; `fork_process` копирует обработчики/blocked/altstack, `exec_process` сбрасывает обработчики в `SIG_DFL`, гасит pending и alt-стек, `clear_process` освобождает строку, `kill`/`tgkill` (129/131), `sigaltstack` (132), `rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn` (134/135/139), кадр 736 B в user-памяти с 128-байтным `siginfo_t` и 288-байтным `ucontext_t`, `SA_SIGINFO`/`SA_ONSTACK`/`SA_NODEFER`/`SA_RESETHAND`/`SA_RESTART`, `deliver_pending` на границе kernel→user, `deliver_fault` для SIGILL/SIGSEGV/SIGBUS/SIGTRAP и job control через `scheduler::stop_current`/`continue_task`; счётчики и `live_handlers`/`live_threads`/`live_pending` для selftest |
 | `futex.rs` | статическая очередь ожидающих `(run, uaddr) -> tid`: 32 слота на 16 адресов, `wait` (регистрация → `scheduler::block_current` → снятие), `wake` (`wake_task`, не больше N), `clear_run` на teardown; лок очереди маскирует прерывания и **не** держится через блокировку; порядок `futex → scheduler` |
 | `elf.rs` | ELF64-загрузчик: `ImageSource` (`len` + `read_at`) и потоковое чтение — заголовок, таблица program headers (≤ 8) и сегменты кусками ≤ 512 B в уже замапленные страницы, **без буфера размером с образ**; `load` — в активный root, `load_in(root, …)` — в root процесса; валидация заголовка/сегментов до первого кадра (включая W^X: одиночный `PF_W|PF_X` и слияние перекрывающихся `PT_LOAD` до W+X — `WxOverlap`), `PT_LOAD`-страницы `U=1`, нулевой `.bss`-хвост, откат кадров при любой ошибке; `Loaded { root, entry, pages(), release() }` (Vec, не inline-массив), `from_pages` для fork; типизированные `ElfError`/`SourceError` |
-| `syscall.rs` | `dispatch(frame)`: `read(63)`, `write(64)`, `openat(56)`, `close(57)`, `lseek(62)`, `fstat(80)`, `getdents64(61)`, `brk(214)`, `clock_gettime(113)`, `nanosleep(101)`, `uname(160)`, `readlinkat(78)`, `exit(93)`, `exit_group(94)`, `set_tid_address(96)`, `futex(98)`, `sched_yield(124)`, `getpid(172)`, `getppid(173)`, `gettid(178)`, `clone(220)`, `fork(1000)`, `execve(221)`, `wait4(260)`, сигналы `kill(129)`, `tgkill(131)`, `sigaltstack(132)`, `rt_sigaction(134)`, `rt_sigprocmask(135)`, `rt_sigreturn(139)` + мутации `mkdirat(34)`, `unlinkat(35)`, `symlinkat(36)`, `linkat(37)`, `fchmodat(53)`, `ftruncate(46)`, `renameat2(276)` + сокеты `socket(198)`, `bind(200)`, `connect(203)`, `sendto(206)`, `recvfrom(207)`, `setsockopt(208)`, `getsockopt(209)`, `shutdown(210)`; per-process таблица 16 fd (`FdTables`; `fork` копирует, `execve` сохраняет), per-process таблица режимов для `fchmodat`/`fstat`, `copy_from_user`/`copy_to_user` (проверка `U/R/W` по PTE, `SUM` только вокруг копии), `-errno`/`-ENOSYS`, `ecall → sepc + 4`, счётчики для selftest |
+| `syscall.rs` | `dispatch(frame)`: `read(63)`, `write(64)`, `openat(56)`, `close(57)`, `lseek(62)`, `fstat(80)`, `getdents64(61)`, `brk(214)`, `clock_gettime(113)`, `nanosleep(101)`, `uname(160)`, `readlinkat(78)`, `exit(93)`, `exit_group(94)`, `set_tid_address(96)`, `futex(98)`, `sched_yield(124)`, `getpid(172)`, `getppid(173)`, `gettid(178)`, `clone(220)`, `fork(1000)`, `execve(221)`, `wait4(260)`, сигналы `kill(129)`, `tgkill(131)`, `sigaltstack(132)`, `rt_sigaction(134)`, `rt_sigprocmask(135)`, `rt_sigreturn(139)` + мутации `mkdirat(34)`, `unlinkat(35)`, `symlinkat(36)`, `linkat(37)`, `fchmodat(53)`, `ftruncate(46)`, `renameat2(276)` + сокеты `socket(198)`, `bind(200)`, `connect(203)`, `sendto(206)`, `recvfrom(207)`, `setsockopt(208)`, `getsockopt(209)`, `shutdown(210)`; per-process таблица 16 fd (`FdTables`; `fork` копирует, `execve` сохраняет), per-process таблица режимов для `fchmodat`/`fstat`, `copy_from_user`/`copy_to_user` (каноничность + нижняя половина Sv39, затем `U/R/W` по PTE; `SUM` только вокруг копии), `-errno`/`-ENOSYS`, `ecall → sepc + 4`, счётчики для selftest |
 | `selftest.rs` | тринадцать проверок для `selftest`: `user-abi-argv` (точная строка из фикстуры), `user-abi-syscalls` (все вызовы + секции потоков/фьютексов, сигналов и процессов + мутационная половина: mkdir/rmdir, rename, link, symlink, chmod, ftruncate, unlink; маркеры `abi: fork ok`/`wait ok`/`exec ok`/`exec wait ok`, с диском exit 0 и «все имена убраны», без `/mnt` — SKIP после no-fs половины), accept фикстуры, reject-матрица (16 мутаций заголовка/сегментов, включая два W^X-случая), отказ `run_image` на битом ELF, round-trip `hello`, fault-изоляция, запуск после fault, таймер-in-U, `user-stack-grows` (160 KiB цепочка возвращается, маркер `stack: deep recursion ok`, счётчики роста сдвинулись ≥ 16 страниц, ledger цел), `user-stack-cap` (1.2 MiB цепочка умирает `Exit::Fault` с `cause = store page fault`, рост ровно на 240 страниц, отказ зафиксирован, ledger цел), `user-stack-fork` (цепочка форкается на 30-м уровне, когда ~14 страниц уже выращены; ребёнок доходит до конца на копии, родитель ждёт `wait4` и получает pid; счётчики `forks`/`waits` сдвинулись, ledger цел) и `user-run-large-file` (100 KiB образ с нулевым хвостом через `run_file`) |
 
 ## Вход в U-mode и начальный стек
@@ -164,12 +164,25 @@ libpagh использует его как новый предел); рост м
 
 Номера и семантика — `pagh-api/docs/abi.md`; отличия, о которых должен знать
 userland, перечислены в конце. Проверка указателей — `copy_from_user` /
-`copy_to_user`: каждая страница диапазона обязана иметь `U=1` и `R=1` (плюс
-`W=1` для записи), `SUM` включается ровно вокруг копии и восстанавливается из
-точного значения `sstatus`. Поэтому запись в `.rodata` — `-EFAULT`, а не
-S-mode page fault (тот напечатал бы и остановил hart). Неизвестный номер —
-`-ENOSYS` со счётчиком; счётчики успешных вызовов (`reads`, `opens`, `brks`,
-`clocks`, …) читает selftest.
+`copy_to_user`: сначала `mmu::is_canonical` на обоих концах диапазона и
+обязательная нижняя (user) половина Sv39 ниже `USER_TOP`, затем каждая страница
+обязана иметь `U=1` и `R=1` (плюс `W=1` для записи); `SUM` включается ровно
+вокруг копии и восстанавливается из точного значения `sstatus`.
+
+Каноничность — не формальность (F-r2-rv-1): обход таблиц берёт из адреса
+только 39 бит (`mmu::vpn`), поэтому `0xdead_0000_0000_0000 | p` находил
+страницу `p` и проходил проверку, а копия затем грузила по полному 64-битному
+адресу — S-mode load page fault (`SPP=1`), который trap-диспетчер считает
+ошибкой ядра, печатает `[EXC]` и паркует hart. Одного `ecall` хватало, чтобы
+убить машину. Поэтому же проверяется половина: канонический supervisor-адрес
+(`0xffff_ffc0_…`) тоже прошёл бы `is_canonical`, а его младший алиас — та же
+user-страница; `USER_TOP` отсекает и его, и identity-адреса ядра. Защитно это
+закрыто и в примитивах: `paging::walk` (`flags`/`translate`) отвечает `None` на
+неканонический `va`, `protect_in`/`unmap_in` — `MapError::NotCanonical` (иначе
+mprotect/munmap правили бы чужую страницу по алиасу). Поэтому запись в
+`.rodata` — `-EFAULT`, а не S-mode page fault. Неизвестный номер — `-ENOSYS`
+со счётчиком; счётчики успешных вызовов (`reads`, `opens`, `brks`, `clocks`, …)
+читает selftest.
 
 Особые случаи:
 
@@ -513,8 +526,10 @@ root: тег — пространство имён TLB, а не обещание
    user `sp`. Ассемблер, `TrapFrame` и `docs/architecture.md` §4.1 меняются одним
    коммитом.
 5. **`ecall` возвращается на `sepc + 4`.** `dispatch` обязан сдвинуть `sepc`.
-6. **User-указатели не доверяются.** `copy_from_user`/`copy_to_user` проверяют
-   каждую страницу по PTE (`U=1`, `R=1`, для записи ещё `W=1`) **до** копии;
+6. **User-указатели не доверяются.** `copy_from_user`/`copy_to_user` сначала
+   требуют канонический Sv39-адрес в нижней половине ниже `USER_TOP`
+   (`mmu::is_canonical` + `is_user_half`), затем проверяют каждую страницу по
+   PTE (`U=1`, `R=1`, для записи ещё `W=1`) **до** копии;
    `SUM` включается вокруг `copy_nonoverlapping` и восстанавливается из точного
    прежнего значения. Адрес ядра, дырка или read-only user-страница → `-EFAULT`,
    а не page fault.
@@ -650,7 +665,13 @@ selftest         # SELFTEST user-*: 16/16 с /mnt (13/16 + 3 SKIP без дис�
 запускает `userland/abi.elf`: `write`, `openat` (существующий файл, создание,
 `O_APPEND`, `O_TRUNC`), `read`, `fstat`, `lseek`, `getdents64`, `readlinkat`,
 `brk` с записью/проверкой паттерна, `clock_gettime`, `nanosleep`, `uname`,
-`getpid`, `close`, `-ENOSYS`/`-EFAULT`/`-EBADF`/`-ENOMEM`, секцию потоков
+`getpid`, `close`, `-ENOSYS`/`-EFAULT`/`-EBADF`/`-ENOMEM`, reject-матрицу
+каноничности (F-r2-rv-1: префиксы `0xdead…`/`0x0000_0080…`, канонический
+supervisor-half, identity-адрес ядра и диапазон через `USER_TOP` — все через
+`write`/`openat`/`fstat`/`clock_gettime`/`nanosleep`/`futex`/`uname`/`getrandom`/
+`pipe2`/`poll`/`ppoll`/`rt_sigaction`/`rt_sigprocmask`/`sigaltstack`/`wait4`/
+`execve`/`clone`, плюс положительные контроли; маркер
+`abi: canonical pointers ok`), секцию потоков
 (`clone`/`gettid`/`set_tid_address`/futex/`exit`/`exit_group`), секцию сигналов
 (обработчик SIGUSR1 через `abi_sigrestorer`, `kill`/`kill(0)`/`kill(-1)`/`tgkill`,
 `SIG_IGN`, block→pending→unblock, SIGKILL/SIGSTOP/битые аргументы, `-EINTR` на

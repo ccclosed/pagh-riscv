@@ -1,0 +1,252 @@
+# Live security acceptance for pagh-riscv F-r2-rv-1 (0.24.2)
+# kernel: /home/oleg/pagh-riscv/target/riscv64gc-unknown-none-elf/debug/pagh
+# mode: fixed tree
+# disk: 16 MiB ext2 — /noncanon.elf (one canonical control openat, then
+#       openat(0xdead_0000_0000_0000 | path)), /hello.elf
+# harness: tools/test_noncanon.py (QEMU virt + OpenSBI, serial shell)
+#
+# Checks: -EFAULT for the non-canonical pointer with the shell alive,
+# selftest user 16/16 + net 12/12 (the ABI fixture carries the reject
+# matrix), clean halt; baseline halts with [EXC] load page fault.
+
+OpenSBI v1.7
+   ____                    _____ ____ _____
+  / __ \                  / ____|  _ \_   _|
+ | |  | |_ __   ___ _ __ | (___ | |_) || |
+ | |  | | '_ \ / _ \ '_ \ \___ \|  _ < | |
+ | |__| | |_) |  __/ | | |____) | |_) || |_
+  \____/| .__/ \___|_| |_|_____/|____/_____|
+        | |
+        |_|
+
+Platform Name               : riscv-virtio,qemu
+Platform Features           : medeleg
+Platform HART Count         : 1
+Platform IPI Device         : aclint-mswi
+Platform Timer Device       : aclint-mtimer @ 10000000Hz
+Platform Console Device     : uart8250
+Platform HSM Device         : ---
+Platform PMU Device         : ---
+Platform Reboot Device      : syscon-reboot
+Platform Shutdown Device    : syscon-poweroff
+Platform Suspend Device     : ---
+Platform CPPC Device        : ---
+Firmware Base               : 0x80000000
+Firmware Size               : 317 KB
+Firmware RW Offset          : 0x40000
+Firmware RW Size            : 61 KB
+Firmware Heap Offset        : 0x46000
+Firmware Heap Size          : 37 KB (total), 2 KB (reserved), 11 KB (used), 23 KB (free)
+Firmware Scratch Size       : 4096 B (total), 1400 B (used), 2696 B (free)
+Runtime SBI Version         : 3.0
+Standard SBI Extensions     : time,rfnc,ipi,base,hsm,srst,pmu,dbcn,fwft,legacy,dbtr,sse
+Experimental SBI Extensions : none
+
+Domain0 Name                : root
+Domain0 Boot HART           : 0
+Domain0 HARTs               : 0*
+Domain0 Region00            : 0x0000000000100000-0x0000000000100fff M: (I,R,W) S/U: (R,W)
+Domain0 Region01            : 0x0000000010000000-0x0000000010000fff M: (I,R,W) S/U: (R,W)
+Domain0 Region02            : 0x0000000002000000-0x000000000200ffff M: (I,R,W) S/U: ()
+Domain0 Region03            : 0x0000000080040000-0x000000008004ffff M: (R,W) S/U: ()
+Domain0 Region04            : 0x0000000080000000-0x000000008003ffff M: (R,X) S/U: ()
+Domain0 Region05            : 0x000000000c400000-0x000000000c5fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region06            : 0x000000000c000000-0x000000000c3fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region07            : 0x0000000000000000-0xffffffffffffffff M: () S/U: (R,W,X)
+Domain0 Next Address        : 0x0000000080200000
+Domain0 Next Arg1           : 0x000000008fe00000
+Domain0 Next Mode           : S-mode
+Domain0 SysReset            : yes
+Domain0 SysSuspend          : yes
+
+Boot HART ID                : 0
+Boot HART Domain            : root
+Boot HART Priv Version      : v1.12
+Boot HART Base ISA          : rv64imafdch
+Boot HART ISA Extensions    : sstc,zicntr,zihpm,zicboz,zicbom,sdtrig,svadu
+Boot HART PMP Count         : 16
+Boot HART PMP Granularity   : 2 bits
+Boot HART PMP Address Bits  : 54
+Boot HART MHPM Info         : 16 (0x0007fff8)
+Boot HART Debug Triggers    : 2 triggers
+Boot HART MIDELEG           : 0x0000000000001666
+Boot HART MEDELEG           : 0x0000000000f4b509
+framebuffer  ramfb 1280x800 stride 5120 cells 100x37
+
+========================================
+   pagh OS — RISC-V (RV64)
+========================================
+boot hart   0
+device tree 0x8fe00000
+memory      0x80000000..0x90000000 (256 MiB)
+timebase    10000000 Hz
+console     NS16550 @ 0x10000000
+pmm         62153/65536 frames free (256 MiB tracked), heap 0 KiB in 0 chunk(s)
+sv39        on, satp=0x8000000000080d35, identity 0x80000000..0x90000000 (RWX below 0x80d35000, RW above), 65549 pages, 13 device
+rtc         goldfish @ 0x101000 - 2026-11-13 22:08:33 UTC
+rtc         raw 0x0d39fc68 0x18e7ba35 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
+entropy     32 bytes from /chosen/rng-seed - TLS session keys available
+timer       10 ms ticks (100 Hz, timebase 10000000 Hz)
+plic        0xc000000 context 1, uart irq 10 (rx interrupt on)
+task        16 slots, 96 KiB stack + 4 KiB guard, quantum 8 ticks, timer clock
+virtio-blk: virtio-blk0 at 0x10007000: 32768 sectors (16 MiB)
+virtio-input: tablet at 0x10008000, abs X 0..32767, Y 0..32767
+fs          virtio-blk0 (32768 sectors, 16384 KiB)
+fs          ext2 on /mnt, 1024 B blocks, 15789/16384 blocks free, 4083/4096 inodes free
+virtio-net: no device
+net         no network device
+
+Type 'help' for the command list.
+
+pagh:rv64> run /mnt/noncanon.elf
+C: canonical openat fd=3
+F-r2-rv-1: openat(non-canonical path)
+N: non-canonical openat ret=-14
+run: /mnt/noncanon.elf exited with code 4294967282
+pagh:rv64> echo f-r2-rv-1 survived
+f-r2-rv-1 survived
+pagh:rv64> selftest
+[selftest] free frames before: 61977 of 65536
+SELFTEST frames-roundtrip PASS
+SELFTEST frame-pattern PASS
+SELFTEST sv39-map-roundtrip PASS
+SELFTEST sv39-translate PASS
+[selftest] heap: 11421 B in use, 65536 B mapped, 1 chunk(s)
+SELFTEST heap-vec PASS
+heap: double free of 0x80dd5e70 ignored
+heap: refusing to free 0x80d31118: not a heap block
+SELFTEST heap-defenses PASS
+SELFTEST heap-chunks PASS
+SELFTEST SUMMARY: 7/7 passed
+[selftest] PMM hygiene: free frames 61977 -> 61977
+SELFTEST block-memblock PASS
+virtio-blk: request failed: 513 bytes is not a non-empty, whole-sector buffer
+virtio-blk: request failed: 0 bytes is not a non-empty, whole-sector buffer
+virtio-blk: request failed: sectors 32768..32769 are outside the 32768-sector device
+SELFTEST block-device PASS
+[selftest] input: tablet at (640, 400), left=false, keyboard=absent
+SELFTEST input-device PASS
+[selftest] block heap: 3165 B used / 65536 B mapped (1 chunk(s)) before, 3165 B / 65536 B (1 chunk(s)) after
+SELFTEST block-heap-hygiene PASS
+SELFTEST SUMMARY (block): 4/4 passed
+[fs selftest] free frames before: 61977 of 65536
+SELFTEST ext2-format PASS
+SELFTEST ext2-write-read PASS
+SELFTEST ext2-dirs PASS
+SELFTEST ext2-truncate PASS
+SELFTEST ext2-symlink PASS
+SELFTEST ext2-rename PASS
+SELFTEST ext2-remount PASS
+SELFTEST ext2-free-space PASS
+SELFTEST ext2-corruption PASS
+SELFTEST ext2-policy PASS
+[fs selftest] on-device: virtio-blk0 root has 5 entries
+SELFTEST ext2-on-device PASS
+SELFTEST ext2 summary: 11/11 passed
+[fs selftest] PMM hygiene: free frames 61977 -> 61977
+SELFTEST timer-ticks PASS
+SELFTEST timer-interrupts PASS
+SELFTEST uart-ring PASS
+SELFTEST plic-uart-line PASS
+SELFTEST SUMMARY (arch): 4/4 passed
+[selftest] task PMM free frames before: 61977 of 65536
+[selftest] task interleave: 2 threads x 64 iterations, 130 switch-outs, 5 live slots
+SELFTEST task-interleave PASS
+[selftest] task exit: free frames 61977 -> 61952 (alive) -> 61977 (reaped), stack costs 25 frames
+SELFTEST task-exit-returns-stack PASS
+[selftest] task stack: base 0x81510000, top 0x81529000, guard 0x1000 + usable 98304 B, fill untouched (0 B used)
+SELFTEST task-stack-layout PASS
+[task] STACK OVERFLOW: guard/canary at 0x81529000 was overwritten; frames returned anyway
+[selftest] task canary: overflow detected on reap (violations 0 -> 1)
+SELFTEST task-canary PASS
+[selftest] task idle: entered 8 time(s) total, switched back to thread 0
+SELFTEST task-idle PASS
+SELFTEST SUMMARY (task): 5/5 passed
+[selftest] task PMM hygiene: free frames 61977 -> 61977
+[selftest] user PMM free frames before: 61977 of 65536
+argv: argc=3 argv[0]=argv.elf argv[1]=alpha argv[2]=beta env[0]=PWD=/
+SELFTEST user-abi-argv PASS
+abi: start
+mprotect
+abi: socket SKIP connect (no host server on 10.0.2.2:8000)
+abi: threads ok
+abi: signals ok
+abi: altstack ok
+abi: siginfo ok
+abi: jobcontrol ok
+abi: fork ok
+abi: wait ok
+abi: canonical pointers ok
+abi: exec ok argc=2 argv=exec-arg env=PWD=/mnt
+abi: exec wait ok
+abi: exec ok argc=2 argv=exec-arg env=PWD=/mnt
+abi: mutations ok
+abi: ok
+abi: exit_group ok
+SELFTEST user-abi-syscalls PASS
+SELFTEST user-elf-accept PASS
+SELFTEST user-elf-reject PASS
+SELFTEST user-run-rejects-bad-elf PASS
+hello from user mode
+hello from user mode
+SELFTEST user-hello-roundtrip PASS
+[user] fault killed: load page fault (cause=13, stval=0x0, sepc=0x1000a)
+SELFTEST user-fault-isolated PASS
+hello from user mode
+SELFTEST user-after-fault PASS
+SELFTEST user-timer-preempts PASS
+stack: deep recursion ok
+SELFTEST user-stack-grows PASS
+[user] stack-over killed: store page fault (cause=15, stval=0x3fefffc8, sepc=0x1001e)
+SELFTEST user-stack-cap PASS
+stack: fork child ok
+stack: fork parent ok
+SELFTEST user-stack-fork PASS
+hello from user mode
+SELFTEST user-run-large-file PASS
+tls: start
+tls: getrandom ok
+tls: abi ok
+tls: ok
+SELFTEST user-tls-abi PASS
+proc: version ok
+proc: meminfo ok
+proc: uptime ok
+proc: tasks ok
+proc: mounts ok
+proc: net ok
+proc: directory ok
+proc: readonly ok
+proc: missing ok
+proc: self ok
+proc: pid ok
+proc: kthreads ok
+proc: fork ok
+proc: done
+SELFTEST user-proc-fs PASS
+statfs: /mnt ext2 block=1024 blocks=15789/16384 files=4083/4096 namelen=255 fsid=17171568678096016589
+statfs: ext2 ok
+statfs: free-space ok
+statfs: fstatfs ok
+statfs: /proc procfs block=0 blocks=0/0 files=0/0 namelen=255 fsid=0
+statfs: procfs ok
+statfs: errors ok
+statfs: done
+SELFTEST user-statfs PASS
+SELFTEST SUMMARY (user): 16/16 passed
+[selftest] user PMM hygiene: free frames 61977 -> 61977
+SELFTEST net-checksum PASS
+SELFTEST net-ethernet PASS
+SELFTEST net-ipv4 PASS
+SELFTEST net-udp PASS
+SELFTEST net-icmp PASS
+SELFTEST net-arp PASS
+SELFTEST net-dhcp PASS
+SELFTEST net-dns PASS
+SELFTEST net-tcp PASS
+SELFTEST net-text PASS
+SELFTEST net-subnet PASS
+SELFTEST net-tls-session-gate PASS
+SELFTEST SUMMARY (net): 12/12 passed
+pagh:rv64> halt
+halt: powering off

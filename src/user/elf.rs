@@ -71,6 +71,14 @@ pub const USER_BASE: usize = 0x0001_0000;
 /// One past the highest image address; also the user stack's top.
 pub const USER_TOP: usize = 0x4000_0000;
 
+// The syscall pointer validator rejects any user range that reaches this
+// address (see `user::syscall::user_range_valid`), and the loader/`brk`/`mmap`
+// checks above are written against it. That is only sound while the whole user
+// window stays in the Sv39 *lower* canonical half: a `USER_TOP` at or past
+// 2^38 would put user pages in the non-canonical hole or the supervisor half,
+// where they could never be addressed. Keep the two in step at compile time.
+const _: () = assert!(USER_TOP < 1usize << (crate::arch::riscv64::mmu::VA_BITS - 1));
+
 /// Bytes of user stack the process starts with.
 pub const USER_STACK_SIZE: usize = 64 * 1024;
 

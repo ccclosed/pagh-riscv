@@ -26,6 +26,7 @@ Read in this order; do not rely on memory over these files:
 | `CONTRIBUTING.md` | contributor guide (RU): build, run, adding a subsystem, house rules |
 | `.github/smoke.py` | the executable list of strings a healthy boot must print |
 | `tools/test_security.py` | live security acceptance: crafted ext2 image + W^X ELFs, transcript `docs/live-security.txt` |
+| `tools/test_noncanon.py` | live F-r2-rv-1 acceptance: `userland/noncanon.elf` gets `-EFAULT` with the shell alive, transcript `docs/live-noncanon.txt` |
 
 ## Commands (all gates must be green before you push)
 
@@ -75,6 +76,8 @@ python3 tools/test_tcp_server.py             # builds nothing; writes docs/live-
 # live TLS 1.3: internet + shell https, negative chain/SAN/resolve cases, and the
 # libpagh https_get example in the guest (TLS syscalls 1100-1103); writes docs/live-tls.txt
 python3 tools/test_tls.py                    # needs host internet; --no-userland skips the example
+python3 tools/test_noncanon.py --transcript docs/live-noncanon.txt  # F-r2-rv-1 live run
+python3 tools/test_noncanon.py --baseline /tmp/pagh-rv-stock/target/riscv64gc-unknown-none-elf/debug/pagh  # pre-fix: [EXC]+halt
 ```
 
 `rustup target add riscv64gc-unknown-none-elf` once; the nightly is pinned in
@@ -450,7 +453,7 @@ fuzzing. That is a gap, not a policy — the rule stands:
 
 ## Versioning
 
-Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.24.1`,
+Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.24.2`,
 which `Cargo.lock` mirrors. **The two move together in one commit**: CI builds with
 `--locked`, and cargo refuses to rewrite the lock (`cannot update the lock file …
 because --locked was passed`), so a `Cargo.toml`-only bump fails the build job in
@@ -554,7 +557,20 @@ seconds. Verify locally with `cargo build --locked` after any version change.
   satp/process-root disagreement into `-EINVAL`; regressions are the
   `ext2-corruption` check, two new ELF reject-matrix cases and the
   `sv39-map-roundtrip` `protect_in` check, with the live transcript
-  `docs/live-security.txt` (`tools/test_security.py`). The same rule
+  `docs/live-security.txt` (`tools/test_security.py`); `0.24.2` is the round-2
+  follow-up: `user_range_valid` rejects non-canonical pointers — `mmu::is_canonical`
+  at both ends of the range plus a mandatory Sv39 lower-half/`USER_TOP` bound —
+  because the page-table walk keeps only nine bits per level and would otherwise
+  resolve the low 39-bit alias of a live user page; `paging::walk`
+  (`flags`/`translate`), `protect_in` and `unmap_in` refuse a non-canonical `va`
+  instead of touching the alias, and `wait4` computes `status + 4` with
+  `checked_add` so a debug kernel cannot panic on it. The ABI fixture carries the
+  reject matrix (`0xdead…`, `0x0000_0080…`, the canonical supervisor half, the
+  kernel identity mapping, a range across `USER_TOP`, plus positive controls) and
+  `mmu.rs`/`elf.rs` pin the rules with compile-time asserts; the round-2 PoC is
+  `userland/noncanon.elf`, and on the fixed kernel it gets `-EFAULT` with the
+  shell alive (`tools/test_noncanon.py`, transcript `docs/live-noncanon.txt`).
+  The same rule
   applies
   to both: the tag equals the manifest and the `Cargo.lock` entry, and the
   release is not optional.

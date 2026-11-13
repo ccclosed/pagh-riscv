@@ -1,6 +1,6 @@
 # `userland/` — статические RV64-программы для M6b и native ABI
 
-Одиннадцать крошечных программ без рантайма и libc — ровно столько, чтобы проверить
+Двенадцать крошечных программ без рантайма и libc — ровно столько, чтобы проверить
 точки входа ядра и контракт `pagh-api/docs/abi.md`. Все собраны в ELF заранее;
 ядро встраивает их через `include_bytes!` (`src/user/mod.rs`), поэтому чистый
 checkout собирается **без** кросс-компилятора.
@@ -18,6 +18,7 @@ checkout собирается **без** кросс-компилятора.
 | `proc.rs` / `proc.elf` | читает синтетический `/proc` обычными syscall'ами: `openat`+`getdents64` на `/proc` (девять статических записей с `d_type`, `self` — симлинк, `kthreads/` и `net/` — каталоги, плюс свой pid) и `/proc/net` (`arp`+`dev`), `fstat` (regular file 0o644, `size()` = числу прочитанных байт), чтение кусками по 7 B с `lseek(0)` и побайтовым сравнением (`version`), содержимое `meminfo` (`MemTotal`/`MemFree`, `free <= total`), `uptime`, `tasks`, `mounts`, `net/dev` (NIC есть или честно «no interface»), read-only-отказы (`mkdirat`/`unlinkat`/`write` → `-ENOTSUP`) и `-ENOENT` на неизвестные имена; **per-pid**: `readlink("/proc/self")` = `getpid()`, `/proc/self/{status,stat,cmdline}` совпадают с `/proc/<pid>/*`, `fork`-ребёнок читается по pid, пока жив, а после `wait4` его pid — `-ENOENT`, `/proc/kthreads/{0,1}` — shell/idle; печатает `proc: … ok` и выходит 0, любая ошибка — свой ненулевой код и строка `proc: FAIL` | userland-доступ к `/proc` через native ABI; снимок на проход чтения (`size`/`read` согласованы); read-only контракт синтетической ФС; per-pid namespace и `self` |
 | `statfs.rs` / `statfs.elf` | `statfs(43)`/`fstatfs(44)` через native ABI: `Statfs` — 96 B (10 little-endian `u64` + NUL-padded `type_name[16]`); проверяет поля ext2 (`magic=0xEF53`, power-of-two block size, `blocks_free<=blocks_total`, `blocks_available==blocks_free`, `files_free<=files_total`, `namelen=255`, `flags=0`, `type_name="ext2"`), живой учёт: create+write 4096 B двигает `blocks_free`/`files_free`, `unlink` возвращает; `fstatfs` на fd каталога совпадает с `statfs` пути, на `/proc` — `procfs` с нулями, на console — `-ENOTSUP`, на fd 999 — `-EBADF`; ошибки `-ENOENT`/`-ENOTSUP`/`-EINVAL`/`-EFAULT`; без диска печатает `statfs: no /mnt` и выходит 0; с диском — `statfs: … ok` и `statfs: done`, любая ошибка — свой код и `statfs: FAIL` | native `statfs`/`fstatfs`: реальные счётчики VFS, синтетическая ФС с нулевой ёмкостью, `fstatfs`-семантика fd и весь error-контракт |
 | `stack-fork.rs` / `stack-fork.elf` | та же цепочка, но на 30-м уровне (когда ниже начального окна уже выросли ~14 страниц) вызывается `fork(1000)`; родитель ждёт `wait4`, ребёнок доходит до конца на своей копии и печатает `stack: fork child ok`, родитель — `stack: fork parent ok`, оба выходят 0 (при ошибке fork/wait — 9) | `fork` копирует именно `stack_low..USER_STACK_BASE`, а `wait4` возвращает выросшие кадры ребёнка в PMM; рост продолжается и в ребёнке |
+| `noncanon.rs` / `noncanon.elf` | один канонический `openat("/mnt/hello.elf")` как контроль, затем тот же путь под `0xdead_0000_0000_0000`: печатает `C: canonical openat fd=3`, `F-r2-rv-1: openat(non-canonical path)`, `N: non-canonical openat ret=-14` и выходит с этим кодом (шелл: `exited with code 4294967282`) | неканонический user-указатель — обычный `-EFAULT`, а не S-mode page fault с `park_forever`; живой прогон `tools/test_noncanon.py`, `--baseline` воспроизводит `[EXC] halting` |
 | `user.ld` | линковка: `_start` = `0x1_0000`, PT_LOAD-раскладка | совпадает с окном из `src/user/elf.rs` |
 
 ELF-файлы **закоммичены** — это часть дерева, как шрифт `assets/font8x18.bin`.
@@ -120,7 +121,7 @@ proc: fork ok
 proc: done
 run: proc exited with code 0
 pagh:rv64> cat /proc/version
-pagh 0.24.1 (riscv64) #1
+pagh 0.24.2 (riscv64) #1
 pagh:rv64> cat /proc/self/status
 Name:	shell
 State:	R (running)

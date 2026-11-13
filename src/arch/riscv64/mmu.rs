@@ -282,9 +282,25 @@ pub const fn pte_permissions(pte: u64) -> u64 {
 /// Sv39 defines 39 bits of address, so bits 63..39 must repeat bit 38: the
 /// "hole" between the two halves is not address space, and a table walk started
 /// on one of those values would translate an address the program cannot mean.
+///
+/// **Both** halves are canonical. A canonicality check alone is therefore not a
+/// user-pointer check: the upper half (`0xffff_ffc0_…` and up) is supervisor
+/// space, and a walk on such a value would silently use bits 38..0, i.e. the
+/// address of a completely different page.
 pub const fn is_canonical(va: usize) -> bool {
     let upper = va >> (VA_BITS - 1);
     upper == 0 || upper == (1usize << (64 - VA_BITS + 1)) - 1
+}
+
+/// True when `va` is in the Sv39 *lower* (user) canonical half, `[0, 2^38)`.
+///
+/// This is the half U-mode can execute in; the kernel's own image and devices
+/// also live there numerically, so this is a *necessary* condition for a user
+/// address, not a sufficient one — the leaf's `U` bit is the sufficient one.
+/// It does rule out every non-canonical alias and the whole supervisor half in
+/// one comparison.
+pub const fn is_user_half(va: usize) -> bool {
+    va >> (VA_BITS - 1) == 0
 }
 
 /// Mask selecting the ASID field of `satp` (bits 59..44).
@@ -432,4 +448,19 @@ const _: () = {
     assert!(is_canonical(0x3f_ffff_ffff));
     assert!(!is_canonical(0x40_0000_0000));
     assert!(is_canonical(0xffff_ffc0_0000_0000));
+    // The two prefixes a user program actually sends (F-r2-rv-1): both are
+    // non-canonical, both alias a mapped page through `vpn`, and both used to
+    // pass `user_range_valid`.
+    assert!(!is_canonical(0xdead_0000_0000_0000));
+    assert!(!is_canonical(0xdead_0000_0000_0000 | 0x1_0000));
+    assert!(!is_canonical(0x0000_0080_0000_0000));
+    assert!(!is_canonical(0x0000_0080_0000_0000 | 0x1_0000));
+    // ...and the upper-half values that *are* canonical are still not user
+    // addresses: only the lower half is.
+    assert!(is_user_half(0) && is_user_half(0x3f_ffff_ffff));
+    assert!(!is_user_half(0x40_0000_0000));
+    assert!(!is_user_half(0xdead_0000_0000_0000));
+    assert!(!is_user_half(0x0000_0080_0000_0000));
+    assert!(!is_user_half(0xffff_ffc0_0000_0000));
+    assert!(!is_user_half(usize::MAX));
 };
