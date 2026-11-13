@@ -255,6 +255,7 @@ fn execute(line: &str, tree: &Fdt, state: &mut State) {
             crate::kprintln!(
                 "  run proc               read /proc through the userland syscall ABI"
             );
+            crate::kprintln!("  run statfs             statfs(2)/fstatfs(2) on /mnt from userland");
             crate::kprintln!("  net           network: MAC, IP/mask, gateway and DNS (after DHCP)");
             crate::kprintln!("  dhcp          re-run the DHCP client and print the lease");
             crate::kprintln!("  ping <ip> [n] send up to four ICMP echo requests (default 4)");
@@ -1111,6 +1112,7 @@ fn cmd_run<'a>(mut args: impl Iterator<Item = &'a str>, state: &mut State) {
         "fault" => run_one(crate::user::FAULT_ELF, "fault"),
         "spin" => run_one(crate::user::SPIN_ELF, "spin"),
         "proc" => run_one(crate::user::PROC_ELF, "proc"),
+        "statfs" => run_one(crate::user::STATFS_ELF, "statfs"),
         path => {
             let full = resolve_arg(state, path);
             let argv: alloc::vec::Vec<&str> = args.collect();

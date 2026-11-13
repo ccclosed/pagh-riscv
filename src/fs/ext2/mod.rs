@@ -235,14 +235,23 @@ impl Ext2Fs {
     }
 
     /// Capacity snapshot for the `statfs`-shaped VFS hook.
+    ///
+    /// `magic` is the validated superblock magic and `fsid` the first 8 bytes of
+    /// the superblock UUID (little-endian). A kernel-formatted blank image has
+    /// an all-zero UUID, so `fsid = 0` there is the honest answer — it means
+    /// "this image carries no identity", not "the value is unknown".
     pub fn fs_stat(&self) -> FsStat {
         let sb = self.inner.lock().sb;
+        let mut uuid = [0u8; 8];
+        uuid.copy_from_slice(&sb.s_uuid[..8]);
         FsStat {
+            magic: sb.s_magic as u64,
             block_size: self.block_size as u64,
             blocks_total: sb.s_blocks_count as u64,
             blocks_free: sb.s_free_blocks_count as u64,
             inodes_total: sb.s_inodes_count as u64,
             inodes_free: sb.s_free_inodes_count as u64,
+            fsid: u64::from_le_bytes(uuid),
         }
     }
 

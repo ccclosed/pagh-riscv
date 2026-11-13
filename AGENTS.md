@@ -58,7 +58,7 @@ unknown argument is rejected, not ignored. Checks that are not part of CI:
 
 ```sh
 # at the `pagh:rv64>` prompt
-selftest                                        # in-QEMU suites: 7 mem + 4 block/pointer + 11 fs + 4 arch/timer + 5 task + 15 user (15/15 with /mnt, 13/15 + 2 skip without) + 12 net + ledgers
+selftest                                        # in-QEMU suites: 7 mem + 4 block/pointer + 11 fs + 4 arch/timer + 5 task + 16 user (16/16 with /mnt, 13/16 + 3 skip without) + 12 net + ledgers
 # from the host
 python3 tools/run.py --keys "help\n" --shot /tmp/shot.png --check-font --scan-all
 python3 tools/run.py --disk /tmp/pagh.img --keys "ls /mnt\n" --shot /tmp/fs.png
@@ -352,7 +352,7 @@ kernel-halt     -> SBI SRST via the shell  # makes QEMU exit 0
 ## Testing philosophy
 
 What exists: the in-QEMU suites (shell `selftest`: 7 memory + 4 block/pointer + 11 ext2/VFS
-+ 4 interrupt/timer + 5 scheduler + 15 user-mode (including the native
++ 4 interrupt/timer + 5 scheduler + 16 user-mode (including the native
 thread/futex and the signal/altstack/siginfo/job-control sections, the three
 demand-grown-stack runs, `user-tls-abi` — `userland/tls.elf` exercising
 `getrandom(278)` and the fail-closed answer of every TLS syscall on a descriptor
@@ -360,7 +360,11 @@ that is not a session, with no server and no `/mnt` needed — and `user-proc-fs
 — `userland/proc.elf` reading `/proc` through `openat`/`read`/`getdents64`,
 including the read-only refusals, `-ENOENT`, `/proc/self`/its own pid, a live
 forked peer by pid and a reaped child that must be `-ENOENT` again, with no disk
-and no NIC needed)
+and no NIC needed — and `user-statfs` — `userland/statfs.elf` exercising
+`statfs(43)`/`fstatfs(44)`: the ext2 record's fields, the free block/inode counts
+tracking a real create+write+unlink, the `procfs` zero-capacity answer, and the
+`-ENOENT`/`-EBADF`/`-EINVAL`/`-EFAULT`/`-ENOTSUP` matrix; it needs `/mnt` and
+SKIPs without it)
 + 12 network
 checks, idempotent, each group prints a
 free-frame ledger; `net-tls-session-gate` adds the kernel-side view of the same
@@ -369,8 +373,9 @@ modes (serial, ramfb, disk-fresh, disk-existing, `--net`, `--keyboard`) — ever
 virtio-tablet and the boot log must carry `virtio-input: tablet at 0x…` — including the M5
 format/mount/persist acceptance and the M7 DHCP/ping acceptance, the `/proc`
 shell path (`cat /proc/version`, `ls /proc`, `cat /proc/meminfo`,
-`cat /proc/tasks`, `stat /proc/meminfo`, `run proc` in serial; the ARP row in
-`--net`; `/proc/mounts` in disk-fresh), and the pixel
+`cat /proc/tasks`, `stat /proc/meminfo`, `run proc`, `run statfs` in serial; the
+ARP row in `--net`; `/proc/mounts` and `run statfs` in the disk modes), and the
+pixel
 check that proves a screenshot is really the committed font. The network
 acceptance is deterministic: QEMU's slirp answers DHCP and ICMP to `10.0.2.2`
 without touching the runner's internet. The user-mode suite is the M6b/native-ABI evidence: ELF accept/reject matrix, round
@@ -444,7 +449,7 @@ fuzzing. That is a gap, not a policy — the rule stands:
 
 ## Versioning
 
-Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.23.0`,
+Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.24.0`,
 which `Cargo.lock` mirrors. **The two move together in one commit**: CI builds with
 `--locked`, and cargo refuses to rewrite the lock (`cannot update the lock file …
 because --locked was passed`), so a `Cargo.toml`-only bump fails the build job in
@@ -531,7 +536,14 @@ seconds. Verify locally with `cargo build --locked` after any version change.
   threads, which have no pid; `<pid>` is `getpid()` (the Process table is the
   source), a dead/reaped id is `-ENOENT`, `cmdline` is a bounded 128-byte argv
   snapshot copied at `run`/`execve` and through `fork`, and `stat` is a
-  documented native subset with no invented CPU-time columns. The same rule
+  documented native subset with no invented CPU-time columns; `0.24.0` adds
+  `statfs(43)`/`fstatfs(44)` with a native 96-byte `Statfs` (type name, magic,
+  block size, block/inode totals and free counts, UUID-prefix `fsid`,
+  `name_len = 255`, `flags = 0`), filled live from `VfsNode::fs_stat`; synthetic
+  filesystems answer with their type and zero counts, the synthetic root is
+  `-ENOTSUP`, `fstatfs` on a non-file descriptor is `-ENOTSUP`, and the 16th
+  user selftest `user-statfs` plus `run statfs` cover the fields, the real
+  create/write/unlink accounting and the error matrix. The same rule
   applies
   to both: the tag equals the manifest and the `Cargo.lock` entry, and the
   release is not optional.
@@ -563,7 +575,8 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
 | Processes are an MVP: `fork` deep-copies, sockets are not inherited (child gets `-ENOTSUP`), file offsets are copied rather than shared, `SIGCHLD` has no child-exit source, no init/reparenting (the foreground runner kills orphans), `MAX_PROCESSES = 6` | do not describe this as POSIX process semantics; wait status is `code<<8` or signal in low 7 bits; a new process resource belongs in `Process` (or a side table) and must be released by `run_source`, `wait4` and `cleanup_orphans` |
 | Signals are a documented subset: no `sigqueue`/`sival_ptr`/queued signals, no SIGFPE producer, no tty/process groups, `SA_RESTART` only for `futex`/`nanosleep` (full timeout again), `SIGCHLD` has no child-exit source (si_status 0), no cross-process `kill`, and `kill(0, SIGSTOP)` can park a whole process | the frame/`siginfo_t`/`ucontext_t` layouts are the ABI (see invariant 41) and must move with `docs/architecture.md` + `userland/abi.rs`; do not claim Linux signal semantics, and add queueing/tty/process-group state as a real design change rather than a flag |
 | 19 compiler warnings remain (unused diagnostic helpers; 20 before 0.22.0, which reads `timer::timebase_hz` from `/proc/cpuinfo`) | do not add more; warning-cleanup PRs are welcome |
-| `/proc` is a read-only slice (`src/vfs/proc.rs`) with per-pid only at process granularity: no `/proc/<pid>/task/<tid>`, `/proc/sys`, `/proc/stat`, no writes, no `statfs` | the tree tables, the renderers, `src/vfs/README.md` and the smoke/fixture markers move together; content is rendered on read and `size()` renders too, so keep both paths consistent. `cmdline` is a bounded snapshot (128 B, taken at `run`/`execve`), not live memory; `stat` is a native subset (no CPU-time accounting exists); zombies are `-ENOENT` until `wait4`; there are no permissions. `/proc/uptime`'s idle field is `0.00` and `/proc/net/arp` lists only fresh entries — do not "improve" either into `-1`/`0`/stale rows |
+| `/proc` is a read-only slice (`src/vfs/proc.rs`) with per-pid only at process granularity: no `/proc/<pid>/task/<tid>`, `/proc/sys`, `/proc/stat`, no writes | the tree tables, the renderers, `src/vfs/README.md` and the smoke/fixture markers move together; content is rendered on read and `size()` renders too, so keep both paths consistent. `cmdline` is a bounded snapshot (128 B, taken at `run`/`execve`), not live memory; `stat` is a native subset (no CPU-time accounting exists); zombies are `-ENOENT` until `wait4`; there are no permissions. `/proc/uptime`'s idle field is `0.00` and `/proc/net/arp` lists only fresh entries — do not "improve" either into `-1`/`0`/stale rows |
+| `statfs` is pagh's native 96-byte `Statfs`, not Linux's 120-byte record: no `f_frsize`/`f_spare`, `flags` is always 0 (no read-only mounts), `blocks_available == blocks_free` (no root reserve), `fsid` is the ext2 UUID prefix and is 0 on images without one | keep the layout in `README.md`/`src/user/syscall.rs` and the fixture `userland/statfs.rs` in lockstep; a field is only added when the VFS actually tracks it (no invented CPU-time/`f_bavail`/quota numbers). The UART receive ring is 256 B and the smoke driver sends scripts in 96-byte chunks — keep new smoke commands inside that budget or the tail (`halt`) is dropped |
 | No `LICENSE` file although `Cargo.toml` says MIT | do not add a license your work does not own |
 | `src/memory/paging.rs` owns the kernel root and creates process roots; `src/arch/riscv64/mmu.rs` is encoding only | do not map over the kernel image or drop the identity map while a device holds a physical address; `free_user_space` frees table frames only, the process teardown frees the leaves first |
 28. **The software cursor is frame content.** It is erased before text is drawn and
@@ -829,4 +842,22 @@ The authoritative list is `README.md` → «Чего нет», with per-mileston
     row or prints the truth (`/proc/uptime`'s second field is `0.00` because
     idle time is not accounted). Adding a file or a namespace moves the tree
     tables, the renderers, `src/vfs/README.md`, the fixture and the smoke markers
+    together.
+47. **`statfs` reports what the VFS tracks, and nothing it does not.** The native
+    `Statfs` (`src/user/syscall.rs`) is 96 bytes: ten little-endian `u64`s
+    (`magic`, `block_size`, `blocks_total`, `blocks_free`, `blocks_available`,
+    `files_total`, `files_free`, `fsid`, `name_len`, `flags`) followed by a
+    NUL-padded 16-byte `type_name`. The data comes from `VfsNode::fs_stat` plus
+    `fs_type`: ext2 fills magic `0xEF53`, the real block/inode totals and free
+    counts, and the first 8 bytes of the superblock UUID as `fsid`. A synthetic
+    filesystem has no capacity, so it answers with its type and zero counts
+    (`0` is the truth, not a guess); the synthetic root is `-ENOTSUP`. Keep the
+    real semantics: `blocks_available == blocks_free` because the formatter
+    reserves no root blocks, `flags == 0` because there is no read-only mount
+    state, `name_len == 255` because that is the VFS name limit. `fstatfs`
+    answers only for `File` descriptors — a console/pipe/socket/TLS fd is a real
+    descriptor with no filesystem behind it, so it is `-ENOTSUP`, not `-EBADF`,
+    and only a missing number is `-EBADF`. Do not add Linux columns the kernel
+    cannot honestly fill (`f_frsize`, `f_spare`, quotas); a new field moves the
+    struct, `README.md`, `userland/statfs.rs` and `SELFTEST user-statfs`
     together.

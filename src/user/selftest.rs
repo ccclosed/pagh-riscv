@@ -37,7 +37,7 @@ use crate::user::stack;
 use crate::user::syscall;
 use crate::user::{
     self, Exit, UserError, ABI_ELF, ARGV_ELF, EXEC_CHILD_ELF, FAULT_ELF, HELLO_ELF, PROC_ELF,
-    SPIN_ELF, STACK_ELF, STACK_FORK_ELF, STACK_OVER_ELF, TLS_ELF, USER_STACK_PAGES,
+    SPIN_ELF, STACK_ELF, STACK_FORK_ELF, STACK_OVER_ELF, STATFS_ELF, TLS_ELF, USER_STACK_PAGES,
 };
 use crate::vfs::{self, VfsError, VfsNode};
 
@@ -1345,6 +1345,80 @@ fn user_proc_fs(_buf: &mut Vec<u8>) -> Outcome {
     verdict(ok)
 }
 
+/// `SELFTEST user-statfs`: the `statfs` fixture drives the native `statfs(43)` /
+/// `fstatfs(44)` pair against the mounted ext2 image (`userland/statfs.rs`).
+///
+/// Needs a disk: a boot without `/mnt` has no filesystem to describe, so the
+/// check SKIPs (like `user-run-large-file`). The fixture compares the free
+/// block/inode counters before and after a real create+write+unlink, so a
+/// `statfs` that returned boot-time constants fails; it also checks the
+/// `procfs` zero-capacity answer, `fstatfs` on a directory fd against `statfs`
+/// on its path, and the whole error matrix. The PMM ledger is compared here as
+/// for every other fixture.
+fn user_statfs(_buf: &mut Vec<u8>) -> Outcome {
+    match vfs::walk("/mnt", true) {
+        Ok(node) if node.is_directory() => {}
+        Ok(_) => {
+            crate::kprintln!("[selftest] user: /mnt is not a directory");
+            return Outcome::Fail;
+        }
+        Err(VfsError::NotFound) => {
+            return Outcome::Skip("no filesystem mounted at /mnt");
+        }
+        Err(error) => {
+            crate::kprintln!("[selftest] user: cannot resolve /mnt: {}", error.as_str());
+            return Outcome::Fail;
+        }
+    }
+
+    let frames_before = frames();
+
+    user::capture_start();
+    let result = user::run_image(STATFS_ELF, "statfs.elf");
+    let captured = user::capture_stop();
+
+    let mut ok = true;
+    match result {
+        Ok(Exit::Code(0)) => {}
+        Ok(other) => {
+            crate::kprintln!("[selftest] user: the statfs fixture ended {other}");
+            ok = false;
+        }
+        Err(error) => {
+            crate::kprintln!("[selftest] user: the statfs fixture failed: {error}");
+            ok = false;
+        }
+    }
+    for marker in [
+        &b"statfs: ext2 ok\n"[..],
+        &b"statfs: free-space ok\n"[..],
+        &b"statfs: fstatfs ok\n"[..],
+        &b"statfs: procfs ok\n"[..],
+        &b"statfs: errors ok\n"[..],
+        &b"statfs: done\n"[..],
+    ] {
+        if !captured_contains(&captured, marker) {
+            crate::kprintln!(
+                "[selftest] user: statfs fixture marker {:?} missing",
+                core::str::from_utf8(marker).unwrap_or("<non-UTF-8>")
+            );
+            ok = false;
+        }
+    }
+    if captured_contains(&captured, b"statfs: FAIL") {
+        crate::kprintln!("[selftest] user: the statfs fixture reported a failure");
+        ok = false;
+    }
+    if frames() != frames_before {
+        crate::kprintln!(
+            "[selftest] user: the statfs fixture left the PMM at {} (was {frames_before})",
+            frames()
+        );
+        ok = false;
+    }
+    verdict(ok)
+}
+
 /// Run every check, print `SELFTEST user-<name> PASS|FAIL|SKIP`, and return how
 /// many passed.
 pub fn run() -> usize {
@@ -1370,7 +1444,7 @@ pub fn run() -> usize {
         total
     );
 
-    let checks: [(&str, fn(&mut Vec<u8>) -> Outcome); 15] = [
+    let checks: [(&str, fn(&mut Vec<u8>) -> Outcome); 16] = [
         ("user-abi-argv", user_abi_argv),
         ("user-abi-syscalls", user_abi_syscalls),
         ("user-elf-accept", |buf| verdict(elf_accept(buf))),
@@ -1390,6 +1464,7 @@ pub fn run() -> usize {
         ("user-run-large-file", user_run_large_file),
         ("user-tls-abi", user_tls_abi),
         ("user-proc-fs", user_proc_fs),
+        ("user-statfs", user_statfs),
     ];
     let mut passed = 0usize;
     let mut skipped = 0usize;

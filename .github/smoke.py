@@ -89,7 +89,7 @@ EXPECTED = [
     # entries appear here; the `run proc` fixture below checks that namespace
     # from inside a process.
     "pagh:rv64> cat /proc/version",
-    "pagh 0.23.0 (riscv64) #1",
+    "pagh 0.24.0 (riscv64) #1",
     "pagh:rv64> ls /proc",
     "cpuinfo\nkthreads/\nmeminfo\nmounts\nnet/\nself\ntasks\nuptime\nversion\n",
     "pagh:rv64> cat /proc/meminfo",
@@ -132,6 +132,11 @@ EXPECTED = [
     "proc: fork ok",
     "proc: done",
     "run: proc exited with code 0",
+    # `statfs(43)` on a boot with no disk: no filesystem to describe, and the
+    # fixture says so instead of inventing capacity.
+    "pagh:rv64> run statfs",
+    "statfs: no /mnt",
+    "run: statfs exited with code 0",
     "pagh:rv64> help",
     "commands:",
     "  help          this list",
@@ -160,7 +165,7 @@ COMMANDS = (b"mem\nhart\ntime\necho smoke ok\nnosuchcmd\n"
             b"cat /proc/version\nls /proc\ncat /proc/meminfo\ncat /proc/tasks\n"
             b"stat /proc/meminfo\ncat /proc/self/status\ncat /proc/self/stat\n"
             b"stat /proc/self\nls /proc/kthreads\ncat /proc/0/status\nrun proc\n"
-            b"help\nhalt\n")
+            b"run statfs\nhelp\nhalt\n")
 
 # ── the disk mode (M5) ─────────────────────────────────────────────────────
 # `--disk PATH` attaches a virtio-mmio block device and then behaves differently
@@ -178,9 +183,10 @@ DISK_MOUNTED = ["fs          ext2 on /mnt,"]
 DISK_COMMANDS_FRESH = (
     b"disk\ncat /proc/mounts\nls /mnt\nmkdir /mnt/ci\n"
     b"write /mnt/ci/marker.txt hello-from-ci\n"
-    b"cat /mnt/ci/marker.txt\nstat /mnt/ci/marker.txt\nselftest\nhalt\n"
+    b"cat /mnt/ci/marker.txt\nstat /mnt/ci/marker.txt\n"
+    b"run statfs\nselftest\nhalt\n"
 )
-DISK_COMMANDS_EXISTING = b"disk\ncat /mnt/ci/marker.txt\nselftest\nhalt\n"
+DISK_COMMANDS_EXISTING = b"disk\ncat /mnt/ci/marker.txt\nrun statfs\nselftest\nhalt\n"
 DISK_EXPECTED_FRESH = [
     "pagh:rv64> disk",
     "disk: virtio-blk0",
@@ -195,6 +201,17 @@ DISK_EXPECTED_FRESH = [
     "write: wrote",
     "hello-from-ci",
     "size:",
+    # The native statfs/fstatfs pair, driven from userland: the ext2 record with
+    # real block/inode counts, a procfs record with zero capacity, then the
+    # selftest's `user-statfs` check.
+    "pagh:rv64> run statfs",
+    "statfs: /mnt ext2 ",
+    "statfs: free-space ok",
+    "statfs: fstatfs ok",
+    "statfs: procfs ok",
+    "statfs: errors ok",
+    "statfs: done",
+    "run: statfs exited with code 0",
     "SELFTEST SUMMARY: 7/7 passed",
     "SELFTEST ext2 summary: 11/11 passed",
     # The entropy + TLS surface, exercised in-guest by `userland/tls.elf`:
@@ -204,7 +221,8 @@ DISK_EXPECTED_FRESH = [
     # session-table gate is the kernel-side view of the same table.
     "SELFTEST user-tls-abi PASS",
     "SELFTEST user-proc-fs PASS",
-    "SELFTEST SUMMARY (user): 15/15 passed",
+    "SELFTEST user-statfs PASS",
+    "SELFTEST SUMMARY (user): 16/16 passed",
     "SELFTEST net-tls-session-gate PASS",
     "SELFTEST SUMMARY (net): 12/12 passed",
     "halt: powering off",
@@ -235,15 +253,24 @@ NET_EXPECTED = NET_BOOT + [
 DISK_EXPECTED_EXISTING = [
     "pagh:rv64> cat /mnt/ci/marker.txt",
     "hello-from-ci",
+    "pagh:rv64> run statfs",
+    "statfs: /mnt ext2 ",
+    "statfs: done",
+    "run: statfs exited with code 0",
     "SELFTEST ext2 summary: 11/11 passed",
     "SELFTEST user-tls-abi PASS",
     "SELFTEST user-proc-fs PASS",
-    "SELFTEST SUMMARY (user): 15/15 passed",
+    "SELFTEST user-statfs PASS",
+    "SELFTEST SUMMARY (user): 16/16 passed",
     "halt: powering off",
 ]
 
 BANNER = "Type 'help' for the command list."
 HALT = "halt: powering off"
+# One write to the serial chardev must stay well under the guest's 256-byte
+# receive ring (`RING_CAPACITY` in `src/drivers/uart.rs`); see `boot()`.
+COMMAND_CHUNK = 96
+COMMAND_CHUNK_PAUSE = 0.25
 QEMU = os.environ.get("QEMU", "qemu-system-riscv64")
 # Firmware: QEMU's `-bios default` looks for the OpenSBI image it was built
 # against, which some distributions install somewhere else. PAGH_BIOS names the
@@ -305,8 +332,15 @@ def boot(kernel, ramfb=False, disk=None, commands=COMMANDS, timeout=120.0, net=F
 
     reached = pump_until(BANNER)
     if reached:
-        proc.stdin.write(commands)
-        proc.stdin.flush()
+        # The guest's UART receive ring holds 256 bytes and the shell does not
+        # drain it while a command runs, so one large write can overflow the
+        # ring and drop the tail of the script (that is how `halt` once arrived
+        # as `ha`). Send it in chunks with a pause: worst case is
+        # `2 * COMMAND_CHUNK` bytes in flight, comfortably under the ring.
+        for start in range(0, len(commands), COMMAND_CHUNK):
+            proc.stdin.write(commands[start:start + COMMAND_CHUNK])
+            proc.stdin.flush()
+            time.sleep(COMMAND_CHUNK_PAUSE)
         reached = pump_until(HALT)
 
     # `halt` must power the machine off; give QEMU a moment to exit on its own.

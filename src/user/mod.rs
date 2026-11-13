@@ -152,6 +152,14 @@ pub const TLS_ELF: &[u8] = include_bytes!("../../userland/tls.elf");
 /// `userland/proc.rs` and `SELFTEST user-proc-fs`.
 pub const PROC_ELF: &[u8] = include_bytes!("../../userland/proc.elf");
 
+/// Embedded `statfs` fixture: asks the native `statfs(43)`/`fstatfs(44)` for the
+/// filesystem behind a path and a descriptor, checks the record field by field,
+/// proves the free counts follow a real allocation and a real unlink, and walks
+/// the error matrix (`-ENOENT`/`-EBADF`/`-EINVAL`/`-EFAULT`/`-ENOTSUP`). It needs
+/// `/mnt`: without it the fixture prints `statfs: no /mnt` and exits 0, while the
+/// `user-statfs` selftest SKIPs. See `userland/statfs.rs`.
+pub const STATFS_ELF: &[u8] = include_bytes!("../../userland/statfs.elf");
+
 pub use elf::{ElfError, ImageSource, SourceError, USER_STACK_BASE, USER_STACK_PAGES, USER_TOP};
 
 /// Longest program name kept for the fault diagnostic; the shell's path may be

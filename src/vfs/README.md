@@ -18,6 +18,7 @@
 | `replace_contents` | `mod.rs:584` | атомарная замена содержимого файла (truncate+write) |
 | `rename` | `mod.rs:599` | переименование через `VfsNode::rename` |
 | `proc` | `proc.rs` | синтетический read-only `/proc`: живые файлы состояния, per-pid (`<pid>/{status,stat,cmdline}`), `/proc/kthreads` для kernel-потоков и `/proc/self`-симлинк; рендер при чтении; монтируется в `init` |
+| `FsStat`/`fs_stat`/`fs_type` | `mod.rs` | то, из чего `statfs(43)`/`fstatfs(44)` собирают `Statfs`: magic, `block_size`, блоки/inode'ы, UUID-префикс (`fsid`), имя типа; синтетический узел отвечает `None`/`procfs` |
 
 ## `/proc`: синтетический срез живого состояния
 
@@ -57,6 +58,28 @@ offset 0 перерисовывает (живое состояние), след�
 `fork` копирует ребёнку); это не живая память программы. Проверки —
 `SELFTEST user-proc-fs` (self/свой pid/живой ребёнок/reaped `-ENOENT`,
 kthreads) и serial/net/disk smoke-режимы.
+
+## `statfs(2)`/`fstatfs(2)`: откуда берутся цифры
+
+Syscall `statfs(43)`/`fstatfs(44)` (`src/user/syscall.rs`) не считает ничего
+сам: он берёт снимок [`FsStat`](mod.rs) у узла, к которому привёл путь (или fd),
+и добавляет [`fs_type`](VfsNode::fs_type). Для ext2 это `magic = 0xEF53`,
+`block_size`, реальные `s_blocks_count`/`s_free_blocks_count` и
+`s_inodes_count`/`s_free_inodes_count`, и `fsid` — первые 8 байт `s_uuid`
+(little-endian; у образа без UUID он `0`, и это честный ноль, а не «неизвестно»).
+`blocks_available` равен `blocks_free`: форматтер пишет `s_r_blocks_count = 0`,
+резерва для root нет. `flags` — `0`, потому что read-only монтирований в ядре
+нет. `name_len` — 255: это контракт VFS на имя компонента, а не свойство драйвера.
+
+У синтетического filesystem (`/proc`) ёмкости нет, но тип есть: он отвечает
+`procfs` и нулями во всех счётчиках — ноль здесь правда. Синтетический **корень**
+(`/`) не является чужой ФС: `-ENOTSUP`. Относительный путь — `-EINVAL` (в ABI нет
+cwd), отсутствующий — `-ENOENT`, `NULL`-запись — `-EFAULT`. `fstatfs` работает
+только для `File`-дескрипторов: console/pipe/socket/TLS — существующие fd без
+файловой системы за ними, поэтому `-ENOTSUP`; несуществующий номер — `-EBADF`.
+Проверки — `userland/statfs.rs` (`run statfs`) и `SELFTEST user-statfs`;
+последняя сравнивает счётчики до/после реального create+write+unlink, так что
+`statfs`, возвращающий константы, её не пройдёт.
 
 ## Почему два примитива разрешения путей
 
@@ -102,5 +125,6 @@ kthreads) и serial/net/disk smoke-режимы.
 #        cat /proc/mounts; stat /proc/meminfo; run proc
 # per-pid: ls /proc/kthreads; cat /proc/self/status; cat /proc/self/stat;
 #          stat /proc/self; cat /proc/0/status  (не процесс -> not found)
+# statfs: run statfs   (с диском: /mnt ext2 ...; без диска: statfs: no /mnt)
 # selftest: SELFTEST ext2-* (11/11), SELFTEST user-proc-fs, PMM ledger одинаков
 ```

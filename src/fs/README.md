@@ -46,7 +46,9 @@ x86-версии (`Pagh-OS/src/fs/ext2/`) без журнала и с тремя
 ## Формат на диске (то, что пишет `format`)
 
 * блок 1 (байт 1024) — суперблок: `s_magic = 0xEF53`, `s_log_block_size`,
-  счётчики блоков/inode, `s_first_data_block`, размер inode;
+  счётчики блоков/inode, `s_first_data_block`, размер inode; те же счётчики
+  (плюс `s_magic` и первые 8 байт `s_uuid`) `Ext2Fs::fs_stat` отдаёт
+  `statfs(2)`/`fstatfs(2)`;
 * дальше таблица дескрипторов групп (`Ext2GroupDesc`) — по одной записи на
   группу, каждая указывает битмапы и таблицу inode;
 * корень — inode 2 (`.` и `..`), `lost+found` — inode 11;

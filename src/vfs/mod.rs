@@ -100,16 +100,25 @@ impl VfsError {
     }
 }
 
-/// Filesystem capacity snapshot for a future `statfs`: block counts are in units
-/// of `block_size`. Filesystems that track usage (ext2) report it; synthetic
-/// nodes keep the [`VfsNode::fs_stat`] default of `None`.
+/// Filesystem identity and capacity snapshot for `statfs(2)` / `fstatfs(2)`:
+/// block counts are in units of `block_size`. Filesystems that track usage
+/// (ext2) report it; synthetic nodes keep the [`VfsNode::fs_stat`] default of
+/// `None`, and the syscall reports their type with zero counts instead.
 #[derive(Debug, Clone, Copy)]
 pub struct FsStat {
+    /// On-disk superblock magic when the filesystem has one (`ext2` = `0xEF53`);
+    /// `0` for a synthetic filesystem, which has no superblock to identify.
+    pub magic: u64,
     pub block_size: u64,
     pub blocks_total: u64,
     pub blocks_free: u64,
     pub inodes_total: u64,
     pub inodes_free: u64,
+    /// Filesystem identity: the first 8 bytes of the ext2 superblock UUID,
+    /// little-endian. `0` when the image carries no UUID (a kernel-formatted
+    /// blank disk writes zeros) or the filesystem is synthetic — it is an
+    /// identity, not a checksum, and `magic`/`type` already name the type.
+    pub fsid: u64,
 }
 
 /// A node in the filesystem tree. Implemented by ext2's directory/file/link

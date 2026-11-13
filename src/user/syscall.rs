@@ -126,6 +126,11 @@ const SYS_LINKAT: usize = 37;
 const SYS_FCHMODAT: usize = 53;
 const SYS_FTRUNCATE: usize = 46;
 const SYS_RENAMEAT2: usize = 276;
+// `statfs`/`fstatfs` keep their generic RISC-V numbers; the record they fill is
+// pagh's native 96-byte `Statfs` (the ABI is documented in README.md and
+// `pagh-api/docs/abi.md`), not Linux's 120-byte layout.
+const SYS_STATFS: usize = 43;
+const SYS_FSTATFS: usize = 44;
 // The BSD-socket subset. Numbers are the generic RISC-V table: 198 socket,
 // 200 bind, 201 listen, 202 accept, 203 connect, 206 sendto, 207 recvfrom,
 // 208/209 setsockopt/getsockopt, 210 shutdown. Linux's `send`/`recv` are libc wrappers
@@ -1371,6 +1376,8 @@ pub fn dispatch(frame: &mut TrapFrame) {
         SYS_CLOSE => close(frame.a0),
         SYS_LSEEK => lseek(frame.a0, frame.a1, frame.a2),
         SYS_FSTAT => fstat(frame.a0, frame.a1),
+        SYS_STATFS => statfs(frame.a0, frame.a1),
+        SYS_FSTATFS => fstatfs(frame.a0, frame.a1),
         SYS_GETDENTS64 => getdents64(frame.a0, frame.a1, frame.a2),
         SYS_READLINKAT => readlinkat(frame.a0, frame.a1, frame.a2, frame.a3),
         SYS_MKDIRAT => mkdirat(frame.a0, frame.a1, frame.a2),
@@ -3954,6 +3961,19 @@ fn lseek(fd: usize, offset: usize, whence: usize) -> isize {
     }
 }
 
+/// Longest single path component the VFS guarantees: `statfs` reports it as the
+/// filesystem's `name_len`.
+const NAME_MAX: u64 = 255;
+
+/// Native `Statfs` (96 bytes): `magic`, `block_size`, `blocks_total`,
+/// `blocks_free`, `blocks_available`, `files_total`, `files_free`, `fsid`,
+/// `name_len`, `flags`, then `type_name[16]` NUL-padded ASCII.
+const STATFS_SIZE: usize = 96;
+/// Offset of `type_name` inside [`STATFS_SIZE`]; the ten words before it are
+/// little-endian `u64`s at offsets 0, 8, ..., 72.
+const STATFS_TYPE_OFFSET: usize = 80;
+const STATFS_TYPE_CAPACITY: usize = 16;
+
 /// `struct Stat` from the ABI: `u32 mode`, `u32 kind`, `u64 size`, `u64 ino`.
 const STAT_SIZE: usize = 24;
 const KIND_FILE: u32 = 0;
@@ -4106,6 +4126,130 @@ fn getdents64(fd: usize, buf: usize, len: usize) -> isize {
         DIRENTS.fetch_add(1, Ordering::Relaxed);
     }
     total as isize
+}
+
+// ─── statfs / fstatfs ──────────────────────────────────────────────────────
+
+/// `statfs(path, buf)`: fill the native [`STATFS_SIZE`]-byte `Statfs` record for
+/// the filesystem behind `path`.
+///
+/// `path` is absolute (the ABI has no cwd) and the final symlink is followed, so
+/// `statfs("/mnt/link")` reports the filesystem the link resolves to. The data
+/// comes from the VFS hook [`VfsNode::fs_stat`] plus the node's
+/// [`VfsNode::fs_type`]:
+///
+/// * a filesystem that tracks capacity (ext2) reports its superblock magic
+///   (`0xEF53`), block size, block/inode totals and free counts, and its UUID
+///   prefix as `fsid`;
+/// * a synthetic filesystem (`/proc`) has no capacity to report, so it answers
+///   with its type name and zero counts — `0` is the truth there, not a guess;
+/// * the synthetic **root** is not a filesystem at all: `-ENOTSUP`.
+///
+/// `blocks_available` equals `blocks_free`: this kernel reserves no blocks for a
+/// root user (the ext2 formatter writes `s_r_blocks_count = 0`), so the two
+/// numbers are the same fact. `flags` is `0` because no flag is defined — there
+/// is no read-only mount state; a read-only device fails at the first write.
+/// `name_len` is [`NAME_MAX`] for every filesystem: names are bounded by the VFS
+/// contract, not by what a driver happens to support.
+fn statfs(path_ptr: usize, buf_ptr: usize) -> isize {
+    let mut path_buf = [0u8; PATH_CAPACITY];
+    let length = match read_user_path(path_ptr, &mut path_buf) {
+        Ok(length) => length,
+        Err(error) => return error,
+    };
+    let Ok(path) = core::str::from_utf8(&path_buf[..length]) else {
+        return EINVAL;
+    };
+    if !path.starts_with('/') {
+        return EINVAL;
+    }
+    let node = match vfs::walk(path, true) {
+        Ok(node) => node,
+        Err(error) => return errno(error),
+    };
+    let record = match statfs_record(&node) {
+        Ok(record) => record,
+        Err(error) => return error,
+    };
+    if let Err(error) = copy_to_user(buf_ptr, &record) {
+        return error;
+    }
+    0
+}
+
+/// `fstatfs(fd, buf)`: the same record for the filesystem behind an open file or
+/// directory descriptor.
+///
+/// Only `File` descriptors carry a VFS node; a pipe, socket or TLS session has
+/// no filesystem behind it, and neither does the console, so those answer
+/// `-ENOTSUP` (an existing descriptor that simply is not a file). A bad number
+/// is `-EBADF`.
+fn fstatfs(fd: usize, buf_ptr: usize) -> isize {
+    let node = match lookup(fd) {
+        Ok(OpenFd::File { node, .. }) => node,
+        // ConsoleIn/ConsoleOut, pipes, sockets, TLS sessions and inherited
+        // socket tombstones: real descriptors, no filesystem to describe.
+        Ok(_) => return ENOTSUP,
+        Err(error) => return error,
+    };
+    let record = match statfs_record(&node) {
+        Ok(record) => record,
+        Err(error) => return error,
+    };
+    if let Err(error) = copy_to_user(buf_ptr, &record) {
+        return error;
+    }
+    0
+}
+
+/// Build the native `Statfs` record for one node. `Err(-ENOTSUP)` means the node
+/// is not part of any filesystem (the synthetic root).
+fn statfs_record(node: &Arc<dyn VfsNode>) -> Result<[u8; STATFS_SIZE], isize> {
+    let fs_type = node.fs_type();
+    let (magic, block_size, blocks_total, blocks_free, files_total, files_free, fsid) =
+        match node.fs_stat() {
+            Some(stat) => (
+                stat.magic,
+                stat.block_size,
+                stat.blocks_total,
+                stat.blocks_free,
+                stat.inodes_total,
+                stat.inodes_free,
+                stat.fsid,
+            ),
+            // A synthetic filesystem has a type but no capacity: report the type
+            // with zero counts. Anything else that cannot describe itself is
+            // not a filesystem this ABI can answer for.
+            None if fs_type != "synthetic" => (0, 0, 0, 0, 0, 0, 0),
+            None => return Err(ENOTSUP),
+        };
+    let mut record = [0u8; STATFS_SIZE];
+    for (index, value) in [
+        magic,
+        block_size,
+        blocks_total,
+        blocks_free,
+        // `blocks_available`: no reserved blocks, so the free count is the
+        // available count (see the function docs).
+        blocks_free,
+        files_total,
+        files_free,
+        fsid,
+        NAME_MAX,
+        // `flags`: no flag is defined. A read-only mount would set bit 0, but
+        // this kernel has no such state.
+        0,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let offset = index * 8;
+        record[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    let name = fs_type.as_bytes();
+    let take = name.len().min(STATFS_TYPE_CAPACITY - 1);
+    record[STATFS_TYPE_OFFSET..STATFS_TYPE_OFFSET + take].copy_from_slice(&name[..take]);
+    Ok(record)
 }
 
 // ─── readlinkat / time / uname / brk ──────────────────────────────────────
