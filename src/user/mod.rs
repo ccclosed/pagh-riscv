@@ -1161,6 +1161,15 @@ pub(crate) fn munmap(addr: usize, pages: usize) -> Result<(), MmapError> {
 
 /// `mprotect`: rewrite the permission bits of every mapped user page in the
 /// range, keeping the frames in place.
+///
+/// The pages are validated in the *calling process's own* root, and the same
+/// root is the one written: [`paging::protect_in`] takes the root explicitly
+/// instead of using whatever `satp` points at. The two used to be different
+/// calls (`flags_in(root, …)` for the check, `protect(page, …)` for the write),
+/// so a satp that disagreed with the process table — a fragile invariant, not a
+/// reachable path today — would have validated one address space and rewritten
+/// another. The equality check below makes that disagreement a refusal rather
+/// than a cross-space write.
 pub(crate) fn mprotect(addr: usize, pages: usize, bits: u64) -> Result<(), MmapError> {
     if pages == 0 || addr % FRAME_SIZE != 0 {
         return Err(MmapError::Invalid);
@@ -1178,6 +1187,13 @@ pub(crate) fn mprotect(addr: usize, pages: usize, bits: u64) -> Result<(), MmapE
         return Err(MmapError::Invalid);
     };
     let root = process::peek(pid, |run| run.root).ok_or(MmapError::Invalid)?;
+    // The scheduler installs a task's satp before switching to it and restores it
+    // when the task resumes, so this is an invariant; check it instead of
+    // assuming it, because the consequence of being wrong is a write into
+    // another process's page tables.
+    if paging::active_root() != root {
+        return Err(MmapError::Invalid);
+    }
 
     let mut page = addr;
     while page < end {
@@ -1193,7 +1209,7 @@ pub(crate) fn mprotect(addr: usize, pages: usize, bits: u64) -> Result<(), MmapE
     let flags = Flags::from_bits(bits);
     page = addr;
     while page < end {
-        paging::protect(page, flags).map_err(|_| MmapError::Invalid)?;
+        paging::protect_in(root, page, flags).map_err(|_| MmapError::Invalid)?;
         page += FRAME_SIZE;
     }
     crate::arch::riscv64::mmu::fence_i();
