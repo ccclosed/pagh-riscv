@@ -546,6 +546,111 @@ fn sv39_map_roundtrip() -> bool {
         ok = false;
     }
 
+    // `protect_in(root, …)` rewrites the leaf of the root it is *given*, not the
+    // root that happens to be active. That is the primitive the user `mprotect`
+    // now uses so it can only ever touch the calling process's own page tables
+    // (it used to validate one root and PTE-write whichever `satp` named). A
+    // fresh process root is the witness: the kernel root's `TEST_VA` leaf was
+    // cloned into it, so protecting the process root read-only must leave the
+    // kernel-root leaf writable. A protect that ignored its `root` argument
+    // would show the exact opposite pair of results.
+    match paging::create_user_space() {
+        Ok(space) => {
+            let read_only = Flags::from_bits(mmu::PTE_V | mmu::PTE_R | mmu::PTE_A | mmu::PTE_D);
+            match paging::protect_in(space.root, TEST_VA, read_only) {
+                Ok(()) => {}
+                Err(error) => {
+                    crate::kprintln!(
+                        "[selftest] protect_in(process root, {TEST_VA:#x}) failed: {error}"
+                    );
+                    ok = false;
+                }
+            }
+            match paging::flags_in(space.root, TEST_VA) {
+                Some(flags) if flags.bits() & (mmu::PTE_W | mmu::PTE_X) == 0 => {}
+                Some(flags) => {
+                    crate::kprintln!(
+                        "[selftest] the process-root leaf at {TEST_VA:#x} has flags {:#x}, not read-only",
+                        flags.bits()
+                    );
+                    ok = false;
+                }
+                None => {
+                    crate::kprintln!(
+                        "[selftest] protecting the process root unmapped {TEST_VA:#x} in it"
+                    );
+                    ok = false;
+                }
+            }
+            match paging::flags_in(paging::active_root(), TEST_VA) {
+                Some(flags) if flags.bits() & mmu::PTE_W != 0 => {}
+                Some(flags) => {
+                    crate::kprintln!(
+                        "[selftest] protect_in changed the active root's leaf at {TEST_VA:#x} to {:#x}",
+                        flags.bits()
+                    );
+                    ok = false;
+                }
+                None => {
+                    crate::kprintln!(
+                        "[selftest] protect_in unmapped {TEST_VA:#x} in the active root"
+                    );
+                    ok = false;
+                }
+            }
+            // The refusals of the explicit-root API, on the same root.
+            if !matches!(
+                paging::protect_in(space.root, TEST_VA + 1, read_only),
+                Err(MapError::Misaligned(_))
+            ) {
+                crate::kprintln!(
+                    "[selftest] a misaligned protect_in of {:#x} was not refused",
+                    TEST_VA + 1
+                );
+                ok = false;
+            }
+            if !matches!(
+                paging::protect_in(space.root, UNMAPPED_VA, read_only),
+                Err(MapError::NotMapped(_))
+            ) {
+                crate::kprintln!(
+                    "[selftest] protect_in({UNMAPPED_VA:#x}) of an unmapped page did not fail"
+                );
+                ok = false;
+            }
+            if !matches!(
+                paging::protect_in(0, TEST_VA, read_only),
+                Err(MapError::NotInitialised)
+            ) {
+                crate::kprintln!("[selftest] protect_in with root 0 was not refused");
+                ok = false;
+            }
+            paging::free_user_space(space.root);
+        }
+        Err(error) => {
+            crate::kprintln!("[selftest] no process root for the protect_in check: {error}");
+            ok = false;
+        }
+    }
+
+    // The active-root convenience wrapper (`protect`) keeps its contract too:
+    // narrow this space's leaf, read the change back through `flags`, and put
+    // RW back for the write checks below. `mprotect` no longer uses it (it must
+    // name the root it validated), so this is what keeps the wrapper honest.
+    let read_only_active =
+        Flags::from_bits(mmu::PTE_V | mmu::PTE_R | mmu::PTE_G | mmu::PTE_A | mmu::PTE_D);
+    if let Err(error) = paging::protect(TEST_VA, read_only_active) {
+        crate::kprintln!("[selftest] protect({TEST_VA:#x}, read-only) failed: {error}");
+        ok = false;
+    } else if paging::flags(TEST_VA).map(|flags| flags.bits() & mmu::PTE_W != 0) != Some(false) {
+        crate::kprintln!("[selftest] protect({TEST_VA:#x}) did not clear W on the active leaf");
+        ok = false;
+    }
+    if let Err(error) = paging::protect(TEST_VA, Flags::kernel_rw()) {
+        crate::kprintln!("[selftest] protect({TEST_VA:#x}, kernel_rw) failed: {error}");
+        ok = false;
+    }
+
     // The same words through both names: the virtual address proves the walk, the
     // physical address proves the mapping points at *this* frame rather than at a
     // second one that happens to hold the same pattern.

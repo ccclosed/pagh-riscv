@@ -116,6 +116,23 @@ peer-адрес в `sockaddr_in`; ожидание опрашивает NIC до
 (TCP-сервер: `mke2fs -d` + QEMU `hostfwd`); транскрипты —
 `docs/live-sockets.txt`, `docs/live-udp.txt`, `docs/live-tcp-server.txt`.
 
+Версия **0.24.1** — security-патч по итогам аудита RV64-ядра (три находки,
+все с регрессионными тестами и живым прогоном `python3 tools/test_security.py`,
+транскрипт `docs/live-security.txt`). **F-rv-1**: `read_symlink()` больше не
+размеряет аллокацию по `i_size` из образа — цель slow-симлинки обязана влезать
+в один блок, иначе `FsError::Corrupt`; crafted-inode с `i_size=0xFFFFFF00`
+больше не приводит к alloc-panic, машина жива, а `cat /mnt/biglink` печатает
+ошибку. **F-rv-2**: ELF-загрузчик соблюдает W^X — одиночный сегмент
+`PF_R|PF_W|PF_X` и слияние прав перекрывающихся `PT_LOAD` (`PF_R|PF_X` +
+`PF_R|PF_W` на одной странице) отвергаются `ElfError::WxOverlap`, по тому же
+правилу, что `mmap`/`mprotect` отвергают W+X. **F-rv-3**: `mprotect` валидирует
+и переписывает **один и тот же** корень (корень своего процесса через
+`paging::protect_in`), а расхождение с активным `satp` стало отказом, а не
+записью в чужое адресное пространство. Регрессии: `ext2-corruption` (crafted
+`i_size` на RAM-устройстве), reject-матрица ELF (+2 W^X-случая) и
+`sv39-map-roundtrip` (`protect_in` меняет только названный root); PoC-исходники —
+`tools/craft_symlink.py` и `tools/craft_wx_elf.py`.
+
 Версия **0.24.0** добавляет **`statfs(43)`/`fstatfs(44)`** — нативный
 96-байтный `Statfs`, который отдаёт то, что VFS уже знает о файловой системе:
 тип (`type_name`, NUL-padded ASCII), `magic` (superblock magic: ext2 `0xEF53`,
@@ -322,7 +339,7 @@ SELFTEST SUMMARY: 7/7 passed
 | Таймер | готово | тик 100 Гц через SBI TIME: абсолютный дедлайн (+10 мс на прерывание, без накопления дрейфа), `sie.STIE`, `sleep`/`uptime` в тиках; холостой цикл — `wfi` | `src/arch/riscv64/timer.rs` |
 | Прерывания / PLIC | готово | PLIC из DTB (`riscv,plic0`), контекст S-mode, UART source из DTB (10 на QEMU `virt`), claim/complete, счётчики и `overrun`; диспетчер различает timer/external и возвращается через `sret` | `src/arch/riscv64/plic.rs`, `src/arch/riscv64/traps.rs` |
 | Блочное устройство | готово | virtio-mmio (modern virtio 1.x, version 2), polled: окна транспорта находятся через DTB, read/write/flush, опрос завершения с ограничением и FAILED после таймаута; `-global virtio-mmio.force-legacy=false` обязателен (иначе QEMU даёт legacy-транспорт) | `src/drivers/block.rs`, `src/drivers/virtio_mmio.rs` |
-| Файловая система (ext2) | готово | чтение/запись файлов (direct + single/double indirect), truncate, каталоги, create/unlink/mkdir/rmdir/rename, симлинки; совместимо с образом хостового `mkfs.ext2 -t ext2`; форматируется только пустое устройство (MBR/GPT/чужие данные — отказ с причиной); журнала/WAL нет | `src/fs/ext2/`, `src/fs/format_policy.rs` |
+| Файловая система (ext2) | готово | чтение/запись файлов (direct + single/double indirect), truncate, каталоги, create/unlink/mkdir/rmdir/rename, симлинки (цель slow-ссылки читается только если влезает в один блок — crafted `i_size` даёт `Corrupt`, а не alloc-panic); совместимо с образом хостового `mkfs.ext2 -t ext2`; форматируется только пустое устройство (MBR/GPT/чужие данные — отказ с причиной); журнала/WAL нет | `src/fs/ext2/`, `src/fs/format_policy.rs` |
 | VFS | готово | `VfsNode`, синтетический корень, монтирования `/proc` (из `vfs::init`) и `/mnt` (из boot-пути), два примитива разрешения путей (`lookup_path` без последней симлинки / `walk` с переходом и бюджетом), `fs_type`/`fs_stat` (magic, блоки, inode'ы, UUID-префикс) — источник `/proc/mounts` и `statfs` | `src/vfs/mod.rs` |
 | `statfs(2)`/`fstatfs(2)` | готово | нативный `Statfs` (96 B): `type_name`, `magic`, `block_size`, `blocks_total/free/available`, `files_total/free`, `fsid`, `name_len=255`, `flags=0`; цифры — из `VfsNode::fs_stat` живьём (создание/запись/`unlink` двигают счётчики), синтетическая ФС — нулевая ёмкость, корень — `-ENOTSUP`, `fstatfs` на не-файловых fd — `-ENOTSUP`; `run statfs` + `SELFTEST user-statfs` | `src/user/syscall.rs`, `src/vfs/mod.rs`, `src/fs/ext2/mod.rs` |
 | `/proc` (синтетический, 0.23.0 — per-pid) | готово | read-only файлы живого состояния: `cpuinfo`, `meminfo`, `mounts`, `tasks`, `uptime`, `version`, `net/{dev,arp}`; `kthreads/<tid>/{status,stat}` для kernel-потоков и `<pid>/{status,stat,cmdline}` для процессов (`<pid>` = `getpid()`, `self` — симлинк на свою запись, мёртвый id — `-ENOENT`); контент рендерится при чтении (`read` с offset 0 — новый снимок, продолжение — тот же), `size()` = длина рендера; write/mkdir/unlink — `-ENOTSUP`; работает без диска; читается шеллом (`ls`/`cat`/`stat`) и userland'ом (`openat`/`read`/`getdents64`) | `src/vfs/proc.rs` |
@@ -331,7 +348,7 @@ SELFTEST SUMMARY: 7/7 passed
 | Сеть (M7) | готово | virtio-net (modern, polled) + свой стек: Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP-клиент, DNS-резолвер, `net`/`dhcp`/`ping`/`dns`/`http`; TCP/IP свой, без smoltcp (TLS-клиент — vendored `embedded-tls`, см. `docs/tls.md`). Для userland — один active-open TCP-сокет (`AF_INET`/`SOCK_STREAM`, IPv4-литерал) и UDP-сокеты (`AF_INET`/`SOCK_DGRAM`, `bind`/per-port-очередь/`sendto`/`recvfrom`); syscall'ы сами опрашивают NIC; `read`/`write`/`poll` работают на сокете | `src/net/`, `src/drivers/virtio_net.rs`, `src/user/syscall.rs` |
 | Пакеты (`pkg`) | MVP | нативный установщик (не apt): плоский `index` и `.ppkg` с репозитория по **plain HTTP** (`http://IP:port/`, в QEMU хост — `10.0.2.2`), потоковая загрузка в `/mnt/pkg` кусками 4 KiB, шлюз «размер + SHA-256 из индекса» **до** разбора `PPKG0001`; `kind=app` → `/mnt/bin/<name>`, `applet-bundle` → `/mnt/bin/paghbox` + симлинки; манифест в `/mnt/pkg/<name>.manifest`; TLS-транспорта, OpenPGP и apt у `pkg` по-прежнему нет | `src/pkg/` |
 | apt / OpenPGP | **нет** | apt намеренно не подключён, пока нет проверки подписей Debian (OpenPGP); `pkg` — отдельный нативный путь для портов. TLS 1.3-клиент есть с 0.19.0 (шелл `https`; 0.21.0 — userland-сессии 1100–1103), но `pkg` его не использует | — |
-| Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 4 блока/указателя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 16 user-mode (включая `user-tls-abi` — `getrandom` и fail-closed матрица 1100–1103; `user-proc-fs` — `userland/proc.elf` читает `/proc` через `openat`/`read`/`getdents64`, включая read-only-отказы, `-ENOENT`, `/proc/self`/свой pid, живой ребёнок по pid и reaped child → `-ENOENT`; `user-statfs` — `userland/statfs.elf` проверяет `statfs(43)`/`fstatfs(44)`: ext2-поля, живой учёт блоков/inode'ов после create/write/unlink, `procfs` с нулевой ёмкостью и всю матрицу ошибок; ABI-фикстуры `argv`/`abi` с секциями потоков/фьютексов, сигналов и TCP-сервера: bind/listen/nonblocking accept/EAGAIN/dup-ENOTSUP; `user-stack-grows` — цепочка 160 KiB возвращается через `stack: deep recursion ok`, `user-stack-cap` — цепочка 1.2 MiB умирает `store page fault` на guard-странице, `user-stack-fork` — fork на выросшем стеке, обе стороны доходят до конца, `wait4` возвращает pid; 16/16 с диском, 13/16 + 3 SKIP без `/mnt`) + 12 сети (идемпотентность по ledger'у, `net-tls-session-gate`), QEMU-smoke в шести режимах (serial, ramfb, диск-fresh, диск-existing, net, keyboard), установка пакета проверяется отдельным тестом `pkg`, живые сокетные прогоны — `tools/test_sockets.py` (TCP-клиент), `tools/test_udp.py` (UDP), `tools/test_tcp_server.py` (TCP-сервер: `mke2fs -d` + QEMU `hostfwd`) и `tools/test_tls.py` (живой TLS 1.3 + userland `https_get`; libpagh-фикстуры, не в CI); проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/net/selftest.rs`, `src/pkg/`, `.github/smoke.py`, `tools/` |
+| Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 4 блока/указателя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 16 user-mode (включая `user-tls-abi` — `getrandom` и fail-closed матрица 1100–1103; `user-proc-fs` — `userland/proc.elf` читает `/proc` через `openat`/`read`/`getdents64`, включая read-only-отказы, `-ENOENT`, `/proc/self`/свой pid, живой ребёнок по pid и reaped child → `-ENOENT`; `user-statfs` — `userland/statfs.elf` проверяет `statfs(43)`/`fstatfs(44)`: ext2-поля, живой учёт блоков/inode'ов после create/write/unlink, `procfs` с нулевой ёмкостью и всю матрицу ошибок; ABI-фикстуры `argv`/`abi` с секциями потоков/фьютексов, сигналов и TCP-сервера: bind/listen/nonblocking accept/EAGAIN/dup-ENOTSUP; `user-stack-grows` — цепочка 160 KiB возвращается через `stack: deep recursion ok`, `user-stack-cap` — цепочка 1.2 MiB умирает `store page fault` на guard-странице, `user-stack-fork` — fork на выросшем стеке, обе стороны доходят до конца, `wait4` возвращает pid; 16/16 с диском, 13/16 + 3 SKIP без `/mnt`) + 12 сети (идемпотентность по ledger'у, `net-tls-session-gate`), QEMU-smoke в шести режимах (serial, ramfb, диск-fresh, диск-existing, net, keyboard), установка пакета проверяется отдельным тестом `pkg`, живые сокетные прогоны — `tools/test_sockets.py` (TCP-клиент), `tools/test_udp.py` (UDP), `tools/test_tcp_server.py` (TCP-сервер: `mke2fs -d` + QEMU `hostfwd`) и `tools/test_tls.py` (живой TLS 1.3 + userland `https_get`; libpagh-фикстуры, не в CI); security-регрессии аудита — `tools/test_security.py` (crafted ext2-образ и W^X-ELF в QEMU, транскрипт `docs/live-security.txt`); проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/net/selftest.rs`, `src/pkg/`, `.github/smoke.py`, `tools/` |
 | CI | готово | `fmt`, debug/release build, QEMU-smoke в шести режимах: serial, ramfb, диск-fresh (формат/монтирование/запись), диск-existing (повторная загрузка читает файл), net (DHCP + ping шлюза), keyboard (virtio-keyboard печатает `help`/`halt` через монитор QEMU); во всех приложен virtio-tablet, в keyboard — ещё и virtio-keyboard | `.github/workflows/ci.yml` |
 
 ---
@@ -468,7 +485,7 @@ selftest        # + SELFTEST user-*: 16/16 с /mnt (без диска 13/16 + 3 
 | 72 | `ppoll` | `Timespec` округляется вверх до мс, `NULL` — навсегда; `sigmask`/`sigsetsize` принимаются и игнорируются; остальное как `poll` |
 | 222 | `mmap` | только `MAP_PRIVATE|MAP_ANONYMOUS`, `fd = -1`, `offset = 0`; `PROT_READ|WRITE|EXEC`, W^X (W и X вместе — `-EINVAL`), `PROT_NONE` — `-EINVAL`; `addr` — подсказка, окно `USER_MMAP_BASE..TOP`; кадры выделяются и обнуляются сразу, ошибка откатывает всё; предел 256 страниц/регионов 8 |
 | 215 | `munmap` | только страницы, созданные `mmap` этого процесса; `addr` выровнен, `length > 0`; частичный unmap делит регион; чужая страница/дырка — `-EINVAL` |
-| 226 | `mprotect` | `PROT_*` как у `mmap`; все страницы диапазона обязаны быть живыми user-leaf (`U|R`) до первой записи PTE; W^X; смена прав сохраняет кадр и делает `fence.i` |
+| 226 | `mprotect` | `PROT_*` как у `mmap`; все страницы диапазона обязаны быть живыми user-leaf (`U|R`) до первой записи PTE; W^X; валидация и запись идут в root **своего** процесса (`paging::protect_in`), расхождение с активным `satp` — `-EINVAL` (запись в чужое адресное пространство исключена); смена прав сохраняет кадр и делает `fence.i` |
 | 198 | `socket` | `AF_INET` (2), protocol 0: `SOCK_STREAM` (1) — один активный TCP-клиент (второй — `-ENOSPC`; listener и принятые соединения — отдельные дескрипторы); `SOCK_DGRAM` (2) — UDP-сокет, можно много; `SOCK_NONBLOCK` (`0x800`) допустим для обоих (UDP `recvfrom`, stream `accept`); иначе `-EAFNOSUPPORT`; fd ≥ 3 |
 | 200 | `bind` | 16-байтный `sockaddr_in`; `addrlen = 16`, family 2; адрес `0.0.0.0` или текущий lease, иначе `-EADDRNOTAVAIL`; port 0 — эфемерный. UDP: занятый порт — `-EADDRINUSE`, повторный bind — `-EINVAL`. TCP: порт резервируется для `listen`, второй listener-резерв — `-EADDRINUSE`, bind connected/listener — `-EINVAL` |
 | 201 | `listen` | TCP: `fd` после `bind(200)`, `backlog` зажимается в `1..=4` (один listener, фиксированная очередь на 4); повторный `listen` меняет backlog; unbound/connected — `-EINVAL`, UDP — `-ENOTSUP` |
@@ -953,10 +970,14 @@ docs/net.png                   снимок net / ping / dns через собс
 docs/live-proc.txt            транскрипт: cat /proc/* и run proc из-под QEMU
 docs/live-proc-pid.txt        транскрипт: /proc/self, kthreads и per-pid /proc
 docs/live-statfs.txt          транскрипт: statfs/fstatfs на /mnt и /proc
+docs/live-security.txt        транскрипт: crafted ext2-симлинка, W^X-ELF, selftest
 assets/font8x18.bin            шрифт покрытия 8×18 (8 бит на пиксель)
 tools/run.py                   запуск + screendump + проверка шрифта
 tools/gen_font.py              офлайн-растеризация шрифта в ассет
 tools/font_check.py            сверка пикселей снимка с ассетом
+tools/test_security.py         живая приёмка security-фиксов (crafted ext2/ELF)
+tools/craft_symlink.py         PoC: slow-симлинка с огромным i_size
+tools/craft_wx_elf.py          PoC: W+X ELF (одиночный сегмент и overlap PT_LOAD)
 .github/smoke.py               QEMU-smoke: serial, ramfb, keyboard, net и дисковые режимы
 .github/workflows/ci.yml       fmt + debug/release build + smoke
 run.sh                         единственный лаунчер (QEMU virt + OpenSBI)

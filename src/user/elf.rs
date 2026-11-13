@@ -13,8 +13,11 @@
 //! * **Validate before mapping where possible.** Header, program-header table,
 //!   per-segment bounds, flags, alignment, the entry point and the page count are
 //!   all checked against the [`ImageSource`]'s length and the user window before
-//!   the first frame is allocated. A request that fails here costs the PMM
-//!   nothing.
+//!   the first frame is allocated. The permission checks are the W^X ones
+//!   `mmap`/`mprotect` use: a segment that asks for W and X is refused, and so
+//!   is the union of two overlapping `PT_LOAD` segments that would produce a
+//!   writable+executable page ([`ElfError::WxOverlap`]). A request that fails
+//!   here costs the PMM nothing.
 //! * **Stream, never buffer.** The image is read through [`ImageSource`] in
 //!   bounded pieces: a 64-byte header, a program-header table bounded by
 //!   [`MAX_PHDRS`], and each `PT_LOAD` segment copied into its already-mapped
@@ -256,6 +259,13 @@ pub enum ElfError {
     BadBias,
     /// A header field overflows when biased or rounded to a page.
     Overflow,
+    /// W^X: a segment asks for both write and execute, or two overlapping
+    /// `PT_LOAD` segments would merge into a writable+executable page.
+    ///
+    /// The loader's own policy (`mmap`/`mprotect` refuse the same pair) and the
+    /// one a crafted image can otherwise bypass: merging `PF_R|PF_X` and
+    /// `PF_R|PF_W` segments page-wise used to hand out a user W+X leaf.
+    WxOverlap,
     /// The page is already mapped (a kernel/device page or a duplicate segment
     /// in the same image).
     AddressInUse(usize),
@@ -287,6 +297,7 @@ impl ElfError {
             ElfError::EntryOutsideText => "entry point is outside an executable segment",
             ElfError::BadBias => "invalid load bias",
             ElfError::Overflow => "ELF field overflows the address space",
+            ElfError::WxOverlap => "PT_LOAD permissions would create a write-execute page (W^X)",
             ElfError::AddressInUse(_) => "a segment would replace a live mapping",
             ElfError::OutOfFrames => "the frame allocator is empty",
             ElfError::Map(_) => "page mapping failed",
@@ -315,7 +326,9 @@ struct Segment {
     filesz: usize,
 }
 
-/// One page to install, with the union of the flags of every segment covering it.
+/// One page to install, with the union of the flags of every segment covering
+/// it. A union that would be both writable and executable is refused before the
+/// page is mapped (see [`ElfError::WxOverlap`]).
 #[derive(Clone, Copy)]
 struct PagePlan {
     vaddr: usize,
@@ -534,6 +547,12 @@ pub fn load_in<S: ImageSource + ?Sized>(
         if flags & PF_R == 0 {
             return Err(ElfError::BadSegment);
         }
+        // A single segment that asks for both write and execute is refused by
+        // the same W^X rule `mmap`/`mprotect` enforce; a loader is not allowed
+        // to be the one hole in that policy.
+        if flags & PF_W != 0 && flags & PF_X != 0 {
+            return Err(ElfError::WxOverlap);
+        }
         let file_end = file_offset.checked_add(filesz).ok_or(ElfError::Overflow)?;
         if file_end as u64 > source_len {
             return Err(ElfError::BadSegment);
@@ -581,7 +600,19 @@ pub fn load_in<S: ImageSource + ?Sized>(
                 merged |= PTE_X;
             }
             match plans.iter_mut().find(|plan| plan.vaddr == page) {
-                Some(plan) => plan.flags |= merged,
+                Some(plan) => {
+                    let union = plan.flags | merged;
+                    // Two `PT_LOAD` segments can cover the same page. Merging
+                    // their permission bits used to be enough to turn a
+                    // `PF_R|PF_X` text page and a `PF_R|PF_W` data segment into
+                    // one writable+executable leaf. Refuse that union by name
+                    // instead: the final leaf is checked against the same W^X
+                    // policy, not just the individual headers.
+                    if union & (PTE_W | PTE_X) == PTE_W | PTE_X {
+                        return Err(ElfError::WxOverlap);
+                    }
+                    plan.flags = union;
+                }
                 None => {
                     if plans.len() == MAX_IMAGE_PAGES {
                         return Err(ElfError::ImageTooLarge);

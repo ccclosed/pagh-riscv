@@ -120,7 +120,7 @@ proc: fork ok
 proc: done
 run: proc exited with code 0
 pagh:rv64> cat /proc/version
-pagh 0.24.0 (riscv64) #1
+pagh 0.24.1 (riscv64) #1
 pagh:rv64> cat /proc/self/status
 Name:	shell
 State:	R (running)
