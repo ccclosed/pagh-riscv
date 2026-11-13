@@ -1,0 +1,67 @@
+name: release
+
+# Tag-driven GitHub releases.
+#
+#   stable tag      vX.Y.Z       must be reachable from `main`  -> full release
+#   pre-release tag vX.Y.Z-rc.N  must be reachable from `dev`   -> GitHub pre-release
+#
+# Bare numeric tags (`0.24.1`), which this repository has historically used, are
+# accepted too; anything with a `-` suffix (for example `-rc.1`, `-pre.3`) is
+# published as a pre-release. `release.yml` refuses a tag cut from the wrong
+# branch, so a stable release can never point at unmerged `dev` work by accident.
+#
+# Every release (stable or pre-release) also builds the RV64 kernel with the
+# toolchain pinned in `rust-toolchain.toml` and attaches the ELF to the release.
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - '[0-9]*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check the tag source branch
+        shell: bash
+        run: |
+          git fetch --no-tags origin main dev
+          tag="$GITHUB_REF_NAME"
+          case "$tag" in
+            *-*) branch=dev ;;
+            *)   branch=main ;;
+          esac
+          echo "tag=$tag expected-branch=$branch"
+          git merge-base --is-ancestor "$GITHUB_SHA" "origin/$branch" || {
+            echo "::error::tag $tag must point to a commit reachable from $branch"
+            exit 1
+          }
+
+      # Same recipe as `.github/workflows/ci.yml`: the pin lives only in
+      # rust-toolchain.toml, so bumping the nightly is still a one-line change.
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          echo "rust-toolchain.toml pins: $channel"
+          rustup toolchain install "$channel" --profile minimal \
+            --component rust-src --component llvm-tools \
+            --target riscv64gc-unknown-none-elf
+
+      - name: Build the release kernel
+        run: cargo build --release --locked
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: target/riscv64gc-unknown-none-elf/release/pagh
