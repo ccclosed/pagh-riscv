@@ -2036,8 +2036,15 @@ pub(crate) fn wait4(pid_spec: isize, status_ptr: usize, options: usize, _rusage:
     if pid_spec < -1 {
         return EINVAL;
     }
-    if status_ptr != 0 && !syscall::user_range_valid(status_ptr, status_ptr + 4, true) {
-        return EFAULT;
+    if status_ptr != 0 {
+        // `status_ptr` comes from U-mode: `+ 4` must not overflow, or a debug
+        // kernel would panic on a pointer that a release kernel rejects.
+        let Some(status_end) = status_ptr.checked_add(core::mem::size_of::<i32>()) else {
+            return EFAULT;
+        };
+        if !syscall::user_range_valid(status_ptr, status_end, true) {
+            return EFAULT;
+        }
     }
     let Some(parent) = process::current_pid() else {
         return ECHILD;

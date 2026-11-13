@@ -161,6 +161,7 @@ const SYS_LINKAT: usize = 37;
 const SYS_FCHMODAT: usize = 53;
 const SYS_FTRUNCATE: usize = 46;
 const SYS_RENAMEAT2: usize = 276;
+const SYS_GETRANDOM: usize = 278;
 const SYS_SOCKET: usize = 198;
 const SYS_BIND: usize = 200;
 const SYS_LISTEN: usize = 201;
@@ -2238,6 +2239,293 @@ fn process_section() {
     check(syscall1(SYS_GETPPID, 0) == 0, 317, "getppid after exec errors");
 }
 
+/// Sv39 canonicality of user pointers (F-r2-rv-1), the reject matrix for the
+/// bug that made one `ecall` a machine kill.
+///
+/// `user_range_valid` walks the page tables with `mmu::vpn`, which keeps only
+/// nine bits per level: for a non-canonical address the walk silently resolves
+/// the low 39-bit alias, said "mapped", and the copy then dereferenced the full
+/// 64-bit value. An S-mode load/store page fault has `SPP = 1`, so the trap
+/// handler printed `[EXC]` and parked the hart — userland could stop the OS.
+///
+/// Every case ORs a bad prefix with a genuinely mapped user address, so the low
+/// 39 bits are a live `U|R|W` page and only the new canonicality/user-half rule
+/// can reject it. All of them must answer `-EFAULT` (or `-EINVAL` for the
+/// pointer-shaped `clone` arguments) with the fixture and the machine alive.
+fn pointer_canonical_section() {
+    /// `0xdead_…`: the prefix the round-2 PoC used; inside the Sv39 hole.
+    const NONCANON_HIGH: usize = 0xdead_0000_0000_0000;
+    /// Bit 39 set: the other non-canonical shape (a "low" address that is not).
+    const NONCANON_LOW: usize = 0x0000_0080_0000_0000;
+    /// Canonical **upper** half: `is_canonical` alone accepts it, but a user
+    /// page can never live there — and its low 39-bit alias is a user page.
+    const KERNEL_HIGH: usize = 0xffff_ffc0_0000_0000;
+    /// The kernel image's own identity mapping: canonical, low half, `U = 0`.
+    const KERNEL_IDENTITY: usize = 0x8000_0000;
+    /// One past the highest user address (`elf::USER_TOP`).
+    const USER_TOP: usize = 0x4000_0000;
+
+    let mut scratch = [0u8; 64];
+    let data = scratch.as_mut_ptr() as usize;
+    let mut word = 0u32;
+    let word_addr = &mut word as *mut u32 as usize;
+    let path = b"/mnt/abi-syscalls.txt\0";
+    let name = path.as_ptr() as usize;
+    let null_argv = [0usize; 1];
+    let null_env = [0usize; 1];
+    let mut alt = SigAltStack {
+        ss_sp: 0,
+        ss_flags: 0,
+        _pad: 0,
+        ss_size: MINSIGSTKSZ,
+    };
+    let mut timespec = [0u8; 16];
+    let mut canonical_stat = Stat {
+        mode: 0,
+        kind: 0,
+        size: 0,
+        ino: 0,
+    };
+
+    // ── 0xdead_…: what the PoC sends, through every copy-helper shape ──
+    check(
+        syscall3(SYS_WRITE, 1, NONCANON_HIGH | data, 8) == EFAULT,
+        3100,
+        "write 0xdead prefix",
+    );
+    // `read(0, …)` answers `-EAGAIN` before it validates anything when the console
+    // ring is empty, so the read-side copy is exercised through `ppoll`'s timeout
+    // pointer instead: that one is copied (validated) unconditionally.
+    check(
+        syscall3(SYS_PPOLL, 0, 0, NONCANON_HIGH | data) == EFAULT,
+        3101,
+        "ppoll 0xdead timeout prefix",
+    );
+    check(
+        syscall4(SYS_OPENAT, 0, NONCANON_HIGH | name, O_RDONLY, 0) == EFAULT,
+        3102,
+        "openat 0xdead path prefix",
+    );
+    check(
+        syscall2(SYS_FSTAT, 1, NONCANON_HIGH | data) == EFAULT,
+        3103,
+        "fstat 0xdead struct prefix",
+    );
+    check(
+        syscall2(SYS_CLOCK_GETTIME, 0, NONCANON_HIGH | data) == EFAULT,
+        3104,
+        "clock_gettime 0xdead struct prefix",
+    );
+    check(
+        syscall2(SYS_NANOSLEEP, NONCANON_HIGH | data, 0) == EFAULT,
+        3105,
+        "nanosleep 0xdead struct prefix",
+    );
+    // `FUTEX_WAIT` reads the word first (that is where the pointer check is);
+    // `FUTEX_WAKE` does not touch it. A zero timeout keeps a broken kernel from
+    // parking the fixture here instead of failing the check.
+    timespec.fill(0);
+    check(
+        futex_wait_word(NONCANON_HIGH | word_addr, 0, timespec.as_mut_ptr() as usize) == EFAULT,
+        3106,
+        "futex 0xdead word prefix",
+    );
+    check(
+        syscall1(SYS_UNAME, NONCANON_HIGH | data) == EFAULT,
+        3107,
+        "uname 0xdead struct prefix",
+    );
+    check(
+        syscall3(SYS_GETRANDOM, NONCANON_HIGH | data, 16, 0) == EFAULT,
+        3108,
+        "getrandom 0xdead buffer prefix",
+    );
+    check(
+        syscall2(SYS_PIPE2, NONCANON_HIGH | data, 0) == EFAULT,
+        3109,
+        "pipe2 0xdead fd-array prefix",
+    );
+    check(
+        syscall3(SYS_POLL, NONCANON_HIGH | data, 1, 0) == EFAULT,
+        3110,
+        "poll 0xdead fd-array prefix",
+    );
+    check(
+        syscall4(SYS_RT_SIGACTION, SIGUSR1, NONCANON_HIGH | data, 0, 8) == EFAULT,
+        3111,
+        "rt_sigaction 0xdead struct prefix",
+    );
+    check(
+        syscall4(SYS_RT_SIGPROCMASK, SIG_BLOCK, NONCANON_HIGH | data, 0, 8) == EFAULT,
+        3112,
+        "rt_sigprocmask 0xdead mask prefix",
+    );
+    // The alternate stack is validated page by page when it is installed, so a
+    // non-canonical `ss_sp` is refused before it can ever become a signal frame.
+    alt.ss_sp = NONCANON_HIGH | data;
+    check(
+        syscall2(SYS_SIGALTSTACK, &alt as *const SigAltStack as usize, 0) == EFAULT,
+        3113,
+        "sigaltstack 0xdead ss_sp prefix",
+    );
+    check(
+        syscall4(
+            SYS_WAIT4,
+            (-1isize) as usize,
+            NONCANON_HIGH | data,
+            0,
+            0,
+        ) == EFAULT,
+        3114,
+        "wait4 0xdead status prefix",
+    );
+    check(
+        syscall3(
+            SYS_EXECVE,
+            NONCANON_HIGH | name,
+            null_argv.as_ptr() as usize,
+            null_env.as_ptr() as usize,
+        ) == EFAULT,
+        3115,
+        "execve 0xdead path prefix",
+    );
+    check(
+        syscall3(
+            SYS_EXECVE,
+            b"/\0".as_ptr() as usize,
+            NONCANON_HIGH | null_argv.as_ptr() as usize,
+            null_env.as_ptr() as usize,
+        ) == EFAULT,
+        3116,
+        "execve 0xdead argv prefix",
+    );
+    // `clone` takes two bare pointers (stack, entry) and checks them with
+    // `paging::flags`; the alias must fail that walk even though its low bits
+    // are a mapped page. `-EINVAL` is the documented answer for both.
+    let stack_base = (data + 15) & !0xf;
+    check(
+        spawn_thread(
+            THREAD_FLAGS,
+            NONCANON_HIGH | stack_base,
+            spawn_marker_entry as *const () as usize,
+            0,
+        )
+            == EINVAL,
+        3117,
+        "clone 0xdead stack prefix",
+    );
+    check(
+        spawn_thread(
+            THREAD_FLAGS,
+            stack_base,
+            NONCANON_HIGH | (spawn_marker_entry as *const () as usize),
+            0,
+        ) == EINVAL,
+        3118,
+        "clone 0xdead entry prefix",
+    );
+
+    // ── 0x0000_0080_…: bit 39 set, non-canonical on the other side ──
+    check(
+        syscall3(SYS_WRITE, 1, NONCANON_LOW | data, 8) == EFAULT,
+        3119,
+        "write bit-39 prefix",
+    );
+    check(
+        syscall4(SYS_OPENAT, 0, NONCANON_LOW | name, O_RDONLY, 0) == EFAULT,
+        3120,
+        "openat bit-39 path prefix",
+    );
+    check(
+        syscall2(SYS_CLOCK_GETTIME, 0, NONCANON_LOW | data) == EFAULT,
+        3121,
+        "clock_gettime bit-39 struct prefix",
+    );
+
+    // ── The upper half: canonical, so a bare `is_canonical` would pass it ──
+    check(
+        syscall3(SYS_WRITE, 1, KERNEL_HIGH | data, 8) == EFAULT,
+        3122,
+        "write canonical kernel-half prefix",
+    );
+    check(
+        syscall4(SYS_OPENAT, 0, KERNEL_HIGH | name, O_RDONLY, 0) == EFAULT,
+        3123,
+        "openat canonical kernel-half path prefix",
+    );
+    check(
+        syscall2(SYS_FSTAT, 1, KERNEL_HIGH | data) == EFAULT,
+        3124,
+        "fstat canonical kernel-half struct prefix",
+    );
+
+    // ── Kernel addresses must never validate as user buffers ──
+    check(
+        syscall3(SYS_WRITE, 1, KERNEL_IDENTITY, 8) == EFAULT,
+        3125,
+        "write kernel identity mapping",
+    );
+    check(
+        syscall2(SYS_FSTAT, 1, KERNEL_IDENTITY) == EFAULT,
+        3126,
+        "fstat kernel identity mapping",
+    );
+    check(
+        syscall4(SYS_OPENAT, 0, KERNEL_IDENTITY, O_RDONLY, 0) == EFAULT,
+        3127,
+        "openat kernel identity mapping",
+    );
+
+    // ── A range that starts in the stack but ends past USER_TOP is refused,
+    //    even though its first page is a perfectly good user page. ──
+    check(
+        syscall3(SYS_WRITE, 1, USER_TOP - 2, 4) == EFAULT,
+        3128,
+        "write range past USER_TOP",
+    );
+    check(
+        syscall2(SYS_NANOSLEEP, USER_TOP - 8, 0) == EFAULT,
+        3129,
+        "nanosleep range past USER_TOP",
+    );
+
+    // Positive controls: the same calls with the genuine pointers still work, so
+    // the new rule rejects only what it must.
+    let hello = b"abi: canonical pointers ok\n";
+    check(
+        syscall3(SYS_WRITE, 1, hello.as_ptr() as usize, hello.len()) == hello.len() as isize,
+        3130,
+        "write canonical buffer",
+    );
+    timespec.fill(0);
+    check(
+        syscall2(SYS_CLOCK_GETTIME, 1, timespec.as_mut_ptr() as usize) == 0,
+        3131,
+        "clock_gettime canonical struct",
+    );
+    canonical_stat.mode = 0;
+    check(
+        syscall2(
+            SYS_FSTAT,
+            1,
+            &mut canonical_stat as *mut Stat as usize,
+        ) == 0,
+        3132,
+        "fstat canonical struct",
+    );
+    check(
+        syscall4(SYS_OPENAT, 0, b"/\0".as_ptr() as usize, O_RDONLY, 0) >= 3,
+        3133,
+        "openat canonical root",
+    );
+}
+
+/// A trivial thread entry `clone` never reaches (the argument checks refuse it
+/// first); it only needs a real code address for the entry-pointer control.
+fn spawn_marker_entry(_arg: usize) -> ! {
+    loop {}
+}
+
 /// A forked child execs `/mnt/exec-child`; the parent's `wait4` status 0 proves
 /// the image ran with the expected `argv[1]` and environment.
 fn exec_section() {
@@ -3698,6 +3986,11 @@ pub extern "C" fn abi_main() -> i32 {
 
     // ── process family: fork/wait4/getppid, before the filesystem split ──
     process_section();
+
+    // ── Sv39 canonicality of user pointers (F-r2-rv-1): the reject matrix for
+    //    every copy-helper shape, the two non-canonical prefixes, the
+    //    supervisor half and kernel addresses; runs with or without /mnt. ──
+    pointer_canonical_section();
 
     // ── the filesystem half: skip when the selftest could not provide /mnt ──
     let path = b"/mnt/abi-syscalls.txt\0";

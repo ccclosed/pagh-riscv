@@ -122,6 +122,26 @@ peer-адрес в `sockaddr_in`; ожидание опрашивает NIC до
 (TCP-сервер: `mke2fs -d` + QEMU `hostfwd`); транскрипты —
 `docs/live-sockets.txt`, `docs/live-udp.txt`, `docs/live-tcp-server.txt`.
 
+Версия **0.24.2** — hotfix по round-2 аудиту RV64-ядра. **F-r2-rv-1**:
+неканонический user-указатель больше не доходит до копии. `user_range_valid`
+проверяет `mmu::is_canonical` на обоих концах диапазона **и** то, что диапазон
+лежит в нижней (user) половине Sv39 ниже `USER_TOP`: без первой проверки
+`0xdead_0000_0000_0000 | p` проходил валидацию (обход таблиц берёт только
+младшие 39 бит и находил живую страницу), а `copy_from_user` затем грузил по
+полному 64-битному адресу — S-mode load page fault (`SPP=1`), `park_forever` и
+мёртвая машина после одного `ecall`; без второй проходил канонический
+upper-half (`0xffff_ffc0_…`), чей младший алиас — та же user-страница.
+Защитно закрыты и примитивы: `paging::walk` (`flags`/`translate`) возвращает
+`None` на неканонический `va`, `protect_in`/`unmap_in` — `MapError::NotCanonical`
+вместо правки/снятия алиаса, а `wait4` считает `status + 4` через `checked_add`
+(debug-ядро не паникует на переполнении). Регрессия — reject-матрица в
+`userland/abi.elf` (префиксы `0xdead…` и `0x0000_0080…`, канонический
+upper-half, identity-адрес ядра, диапазон через `USER_TOP`, плюс
+положительные контроли) и compile-time asserts в `mmu.rs`; PoC round-2
+(`openat` с неканоническим путём) на исправленном ядре получает `-EFAULT`,
+шелл и `halt` живы. Транскрипт — `docs/live-noncanon.txt`
+(`python3 tools/test_noncanon.py`, `--baseline` воспроизводит старую машину-килл).
+
 Версия **0.24.1** — security-патч по итогам аудита RV64-ядра (три находки,
 все с регрессионными тестами и живым прогоном `python3 tools/test_security.py`,
 транскрипт `docs/live-security.txt`). **F-rv-1**: `read_symlink()` больше не

@@ -455,6 +455,11 @@ pub fn protect_in(root: usize, va: usize, flags: Flags) -> Result<(), MapError> 
     if va % FRAME_SIZE != 0 {
         return Err(MapError::Misaligned(va));
     }
+    // Same rule as `map_in`, and for the same reason: `vpn` would find the
+    // low 39-bit alias of a different page and rewrite *its* permissions.
+    if !mmu::is_canonical(va) {
+        return Err(MapError::NotCanonical(va));
+    }
     let active = active_root();
     with_space(|_space| {
         if root == 0 {
@@ -505,6 +510,11 @@ pub fn unmap(va: usize) -> Result<usize, MapError> {
 pub fn unmap_in(root: usize, va: usize) -> Result<usize, MapError> {
     if va % FRAME_SIZE != 0 {
         return Err(MapError::Misaligned(va));
+    }
+    // As in `map_in`/`protect_in`: a non-canonical `va` must not quietly unmap
+    // the page its low 39 bits alias.
+    if !mmu::is_canonical(va) {
+        return Err(MapError::NotCanonical(va));
     }
     let active = active_root();
     let result = with_space(|space| {
@@ -716,8 +726,15 @@ pub fn flags_in(root: usize, va: usize) -> Option<Flags> {
 
 /// Walk the tables of `root` to the leaf covering `va`: `(physical address,
 /// entry bits)`.
+///
+/// A non-canonical `va` is `None`: `mmu::vpn` keeps only nine bits per level, so
+/// a value in the Sv39 hole or the wrong half would otherwise resolve the *low
+/// 39-bit alias* of a completely different page — the bug class behind
+/// F-r2-rv-1. Every caller (`translate`, `flags`, and through them the syscall
+/// pointer validator) trusts this function to answer "is this address mapped",
+/// so the check belongs here, not in each caller.
 fn walk(root: usize, va: usize) -> Option<(usize, u64)> {
-    if root == 0 {
+    if root == 0 || !mmu::is_canonical(va) {
         return None;
     }
     let mut table = root;

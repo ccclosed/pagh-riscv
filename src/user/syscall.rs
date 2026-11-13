@@ -56,7 +56,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::arch::riscv64::csr;
-use crate::arch::riscv64::mmu::{PTE_A, PTE_D, PTE_R, PTE_U, PTE_V, PTE_W, PTE_X};
+use crate::arch::riscv64::mmu::{self, PTE_A, PTE_D, PTE_R, PTE_U, PTE_V, PTE_W, PTE_X};
 use crate::arch::riscv64::traps::TrapFrame;
 use crate::memory::{paging, FRAME_SIZE};
 use crate::net::tcp;
@@ -4837,17 +4837,50 @@ fn read_path<'a>(pointer: usize, out: &'a mut [u8; PATH_CAPACITY]) -> Result<&'a
 
 // ─── user pointers ─────────────────────────────────────────────────────────
 
-/// True when every page covering `[start, end)` is mapped for U-mode read (and
-/// write, when `write` is set).
+/// True when every byte of `[start, end)` is a U-mode-accessible user address
+/// that is mapped for read (and write, when `write` is set).
 ///
-/// `end == start` is trivially true. `paging::flags` walks the same tables the
-/// hardware will; a leaf without `U` (a kernel page, a device window) is not a
-/// user buffer even if it is mapped supervisor-RW. `W` is checked for writes
-/// because `SUM` only lifts the U-permission check — a store to a read-only
-/// user page (`.text`, `.rodata`) would otherwise become an S-mode page fault
-/// and halt the machine.
+/// Three checks, in the order a bad pointer is most likely to fail them:
+///
+/// 1. **Sv39 canonicality**, at both ends of the range. Bits 63..39 must repeat
+///    bit 38; an address in the hole has no translation at all. Without this a
+///    value like `0xdead_0000_0000_0000 | p` used to validate — `mmu::vpn`
+///    keeps nine bits per level, so the walk silently resolved `p` and said
+///    "mapped", while the copy below dereferenced the full 64-bit value and
+///    raised an S-mode page fault the trap handler treats as a kernel bug
+///    (F-r2-rv-1: one `ecall` parked the hart). This is why the check cannot
+///    live only in the walker: two different addresses can share one alias.
+/// 2. **The user half**, and **below [`crate::user::USER_TOP`]**. `is_canonical`
+///    also admits the supervisor half (`0xffff_ffc0_…`), whose low 39-bit alias
+///    is a perfectly good user page; only the lower half can be user space, and
+///    this kernel creates every user mapping below `USER_TOP`. Kernel addresses
+///    must therefore never reach the copy helpers through here, even the ones
+///    that happen to alias a mapped user page.
+/// 3. **The leaf flags.** `paging::flags` walks the same tables the hardware
+///    will; a leaf without `U` (a kernel page, a device window) is not a user
+///    buffer even if it is mapped supervisor-RW. `W` is checked for writes
+///    because `SUM` only lifts the U-permission check — a store to a read-only
+///    user page (`.text`, `.rodata`) would otherwise become an S-mode page fault
+///    and halt the machine.
+///
+/// `end == start` is trivially true (nothing is dereferenced). `end < start` is
+/// false: every caller computes the end with `checked_add`, so a wrapped range
+/// is a bug, not an empty one.
 pub(crate) fn user_range_valid(start: usize, end: usize, write: bool) -> bool {
     if end < start {
+        return false;
+    }
+    if end == start {
+        return true;
+    }
+    let last = end - 1;
+    if !mmu::is_canonical(start) || !mmu::is_canonical(last) {
+        return false;
+    }
+    if !mmu::is_user_half(start) {
+        return false;
+    }
+    if last >= crate::user::USER_TOP {
         return false;
     }
     let mut page = start & !(FRAME_SIZE - 1);

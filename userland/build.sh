@@ -35,3 +35,4 @@ build stack.rs stack.elf
 build stack-over.rs stack-over.elf
 build stack-fork.rs stack-fork.elf
 build tls.rs tls.elf
+build noncanon.rs noncanon.elf
