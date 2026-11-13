@@ -25,6 +25,7 @@ Read in this order; do not rely on memory over these files:
 | `src/<subsystem>/README.md` | each folder documents itself; update it when the design changes |
 | `CONTRIBUTING.md` | contributor guide (RU): build, run, adding a subsystem, house rules |
 | `.github/smoke.py` | the executable list of strings a healthy boot must print |
+| `tools/test_security.py` | live security acceptance: crafted ext2 image + W^X ELFs, transcript `docs/live-security.txt` |
 
 ## Commands (all gates must be green before you push)
 
@@ -449,7 +450,7 @@ fuzzing. That is a gap, not a policy — the rule stands:
 
 ## Versioning
 
-Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.24.0`,
+Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.24.1`,
 which `Cargo.lock` mirrors. **The two move together in one commit**: CI builds with
 `--locked`, and cargo refuses to rewrite the lock (`cannot update the lock file …
 because --locked was passed`), so a `Cargo.toml`-only bump fails the build job in
@@ -543,7 +544,17 @@ seconds. Verify locally with `cargo build --locked` after any version change.
   filesystems answer with their type and zero counts, the synthetic root is
   `-ENOTSUP`, `fstatfs` on a non-file descriptor is `-ENOTSUP`, and the 16th
   user selftest `user-statfs` plus `run statfs` cover the fields, the real
-  create/write/unlink accounting and the error matrix. The same rule
+  create/write/unlink accounting and the error matrix; `0.24.1` is the security
+  patch from the RV64 audit: `read_symlink` bounds a slow link's on-disk `i_size`
+  to one block (a crafted inode is `Corrupt`, never an alloc-panic), the ELF
+  loader refuses a single `PF_W|PF_X` segment and any overlapping-`PT_LOAD` union
+  that would be writable+executable (`ElfError::WxOverlap`, the same W^X rule
+  `mmap`/`mprotect` use; PoC in `tools/craft_wx_elf.py`), and `mprotect` validates
+  and rewrites the same, own root via `paging::protect_in`, turning a
+  satp/process-root disagreement into `-EINVAL`; regressions are the
+  `ext2-corruption` check, two new ELF reject-matrix cases and the
+  `sv39-map-roundtrip` `protect_in` check, with the live transcript
+  `docs/live-security.txt` (`tools/test_security.py`). The same rule
   applies
   to both: the tag equals the manifest and the `Cargo.lock` entry, and the
   release is not optional.
