@@ -68,9 +68,24 @@ const E_ENTRY: usize = 24;
 const E_PHOFF: usize = 32;
 const E_EHSIZE: usize = 52;
 const E_PHNUM: usize = 56;
+const PHDR_SIZE: usize = 56;
+const PHDR_FLAGS: usize = 4;
+const PHDR_OFFSET: usize = 8;
 const PHDR_VADDR: usize = PHDR0 + 16;
 const PHDR_FILESZ: usize = PHDR0 + 32;
 const PHDR_MEMSZ: usize = PHDR0 + 40;
+
+/// The second `PT_LOAD` header (`rodata`, R) in the fixture: the segment the
+/// overlap case moves onto the text page.
+const PHDR1: usize = PHDR0 + PHDR_SIZE;
+const PHDR1_VADDR: usize = PHDR1 + 16;
+const PHDR1_FILESZ: usize = PHDR1 + 32;
+const PHDR1_MEMSZ: usize = PHDR1 + 40;
+
+/// ELF `p_flags` bits the mutations use (`PF_X = 1`, `PF_W = 2`, `PF_R = 4`).
+const PF_X: u32 = 1;
+const PF_W: u32 = 2;
+const PF_R: u32 = 4;
 
 /// Free frames in the PMM: the number every case has to leave unchanged.
 fn frames() -> usize {
@@ -100,6 +115,16 @@ fn put_u16(buf: &mut [u8], offset: usize, value: u16) -> bool {
 
 fn put_u64(buf: &mut [u8], offset: usize, value: u64) -> bool {
     match buf.get_mut(offset..offset + 8) {
+        Some(slot) => {
+            slot.copy_from_slice(&value.to_le_bytes());
+            true
+        }
+        None => false,
+    }
+}
+
+fn put_u32(buf: &mut [u8], offset: usize, value: u32) -> bool {
+    match buf.get_mut(offset..offset + 4) {
         Some(slot) => {
             slot.copy_from_slice(&value.to_le_bytes());
             true
@@ -207,6 +232,25 @@ fn image_too_large(buf: &mut [u8]) {
     let _ = put_u64(buf, PHDR_MEMSZ, (MAX_IMAGE_BYTES + 1) as u64);
 }
 
+/// W^X, single header: the text segment asks for write as well as execute. The
+/// loader must use the same rule `mmap`/`mprotect` use, not accept a
+/// writable+executable page just because it came from a file.
+fn wx_segment(buf: &mut [u8]) {
+    let _ = put_u32(buf, PHDR0 + PHDR_FLAGS, PF_R | PF_W | PF_X);
+}
+
+/// W^X, merged headers: the second `PT_LOAD` (`rodata`, R) is moved onto the
+/// first segment's text page and made writable. The union of a `PF_R|PF_X` and a
+/// `PF_R|PF_W` segment is one writable+executable leaf; the loader used to merge
+/// it, and must now refuse the overlap explicitly.
+fn wx_overlap(buf: &mut [u8]) {
+    let _ = put_u32(buf, PHDR1 + PHDR_FLAGS, PF_R | PF_W);
+    let _ = put_u64(buf, PHDR1 + PHDR_OFFSET, 0x2000);
+    let _ = put_u64(buf, PHDR1_VADDR, 0x0001_0000);
+    let _ = put_u64(buf, PHDR1_FILESZ, 0);
+    let _ = put_u64(buf, PHDR1_MEMSZ, 0x1000);
+}
+
 /// The happy path: the shipped fixture loads, its pages are exactly the three
 /// expected addresses, a second concurrent load is refused, and the release puts
 /// every frame back.
@@ -300,6 +344,10 @@ fn elf_rejects(buf: &mut Vec<u8>) -> bool {
     );
     ok &= reject(buf, ElfError::EntryOutsideText, entry_outside_text);
     ok &= reject(buf, ElfError::ImageTooLarge, image_too_large);
+    // W^X: the same permission pair `mmap`/`mprotect` refuse must be refused
+    // here, whether one header asks for it or two overlapping ones add up to it.
+    ok &= reject(buf, ElfError::WxOverlap, wx_segment);
+    ok &= reject(buf, ElfError::WxOverlap, wx_overlap);
 
     // `ET_EXEC` may only be loaded at bias 0; the loader must say so instead of
     // placing the image somewhere the linker did not intend.
