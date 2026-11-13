@@ -28,6 +28,7 @@ build fault.rs fault.elf
 build spin.rs spin.elf
 build argv.rs argv.elf
 build abi.rs abi.elf
+build proc.rs proc.elf
 build exec.rs exec-child.elf
 build stack.rs stack.elf
 build stack-over.rs stack-over.elf

@@ -17,6 +17,26 @@
 | `walk` | `mod.rs:520` | переход по путям **с** симлинками и бюджетом шагов (`cat`/`cd`/`write`) |
 | `replace_contents` | `mod.rs:584` | атомарная замена содержимого файла (truncate+write) |
 | `rename` | `mod.rs:599` | переименование через `VfsNode::rename` |
+| `proc` | `proc.rs` | синтетический read-only `/proc`: фиксированное дерево файлов с живым состоянием ядра, рендер при чтении; монтируется в `init` |
+
+## `/proc`: синтетический срез живого состояния
+
+`vfs::init` монтирует `/proc` (`proc::root()` в `proc.rs`) **до** диска, потому
+что диагностический filesystem нужен именно тогда, когда `/mnt` нет. Дерево
+фиксировано: `cpuinfo`, `meminfo`, `mounts`, `tasks`, `uptime`, `version` и
+каталог `net/` с `dev` (интерфейс + DHCP-lease) и `arp` (живой ARP-кэш). Файл —
+это рендерер, а не буфер: `lookup`/`readdir` создают новый узел, `read` с
+offset 0 перерисовывает (живое состояние), следующие offset'ы продолжают тот же
+рендер (один проход чтения не склеивает два разных uptime), `size()` равен
+длине рендера, чтобы `stat`/`fstat` и `lseek(SEEK_END)` видели ту же длину, что
+вернёт чтение (EOF здесь — ответ `read` = 0, а не `size()`). `write`/`truncate`/`create_*`/`remove` остаются дефолтами
+`NotSupported` → `-ENOTSUP`; неизвестное имя — `-ENOENT`. Рендерер работает без
+блокировки узла (порядок «сначала состояние, потом узел») и берёт не больше
+одной подсистемной блокировки за раз. Для `mounts` у узла появился
+`fs_type()` (`ext2`, `procfs`, `synthetic`), а `mount_snapshot()` отдаёт таблицу
+монтирований снимком — так `/proc/mounts` не держит её лок, пока форматирует
+строку. Форматы файлов описаны в `proc.rs`, а проверка — `SELFTEST user-proc-fs`
+и serial/net/disk smoke-режимы.
 
 ## Почему два примитива разрешения путей
 
@@ -45,9 +65,11 @@
 
 ## Чего нет
 
-`/proc`, `/dev`, `ramfs`; hard links и права; page cache и отложенная запись;
-`open`/`close`-дескрипторы (шелл адресует файлы путями). Всё это — за пределами
-M5 и названо в `docs/roadmap.md` и `README.md`.
+`/dev`, `ramfs`, per-pid дерево `/proc/<pid>`, `/proc/sys` и запись в `/proc`;
+hard links и права; page cache и отложенная запись; `open`/`close`-дескрипторы
+(шелл адресует файлы путями). `/proc` существует как фиксированный read-only
+срез (см. выше); остальное — за пределами M5 и названо в `docs/roadmap.md` и
+`README.md`.
 
 ## Как проверить
 
@@ -56,5 +78,7 @@ M5 и названо в `docs/roadmap.md` и `README.md`.
 #   ls /mnt && mkdir /mnt/d && write /mnt/d/a.txt hi && cat /mnt/d/a.txt
 #   cp /mnt/d/a.txt /mnt/d/b.txt && mv /mnt/d/b.txt /mnt/d/c.txt && rm /mnt/d/c.txt
 # без диска: одна строка "no block device", шелл работает
-# selftest: SELFTEST ext2-* (11/11), PMM ledger одинаков в двух прогонах
+# /proc: ls /proc; cat /proc/version; cat /proc/meminfo; cat /proc/tasks;
+#        cat /proc/mounts; stat /proc/meminfo; run proc
+# selftest: SELFTEST ext2-* (11/11), SELFTEST user-proc-fs, PMM ledger одинаков
 ```

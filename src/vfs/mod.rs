@@ -5,17 +5,20 @@
 //!
 //! * **One trait, no filesystem-specific types.** [`VfsNode`] is what the shell
 //!   and (later) the syscall layer program against; the ext2 implementation lives
-//!   in [`crate::fs::ext2`] and is reached only through this trait. Mutating
-//!   operations default to `NotSupported`, so a read-only node (a future `/proc`,
-//!   `/dev`) needs no code.
+//!   in [`crate::fs::ext2`], the synthetic `/proc` in [`proc`], and both are
+//!   reached only through this trait. Mutating operations default to
+//!   `NotSupported`, so a read-only node (`/proc`, a future `/dev`) needs no
+//!   code.
 //! * **Paths are UTF-8 `String`s.** The shell reads lines of text and the kernel
 //!   has no `OsStr`; a name that is not UTF-8 in a foreign image is displayed
 //!   lossily by ext2 rather than being unrepresentable.
-//! * **The tree is mounted at `/mnt`, inside the synthetic root.** The root
+//! * **Mounts hang off the synthetic root under one name each.** The root
 //!   directory is a kernel-owned `VfsNode` with no backing store; [`mount_at`]
-//!   splices a filesystem's root node into it under one name. Resolution is
-//!   relative to the synthetic root, so `/mnt/x` walks the mount and `/` answers
-//!   with the (usually empty) root directory.
+//!   splices a filesystem's root node into it under one name. [`init`] mounts
+//!   `/proc` itself (it must exist without a disk); [`crate::fs`] mounts the
+//!   ext2 disk at `/mnt` when there is one. Resolution is relative to the
+//!   synthetic root, so `/mnt/x` walks the mount and `/` answers with the root
+//!   directory listing.
 //! * **Two resolution primitives, on purpose.** [`lookup_path`] returns the node
 //!   a path names *without* following a final symbolic link (`lstat`, `readlink`,
 //!   `rm`); [`walk`] follows links with a loop budget (`cat`, `cd`, `write`).
@@ -30,12 +33,16 @@
 //! Everything here is `core` + `alloc` and prints nothing; the in-QEMU suite
 //! (`src/fs/selftest.rs`) drives it over a RAM block device, and a real disk is
 //! checked by the boot path and the shell commands (see `src/vfs/README.md`).
+//! `proc` renders live kernel state as files; `fs_type` and [`mount_snapshot`]
+//! are what `/proc/mounts` reads.
 
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::sync::Spinlock;
+
+pub mod proc;
 
 /// Path resolution result.
 pub type VfsResult<T> = Result<T, VfsError>;
@@ -118,6 +125,13 @@ pub trait VfsNode: Send + Sync {
     /// Capacity of the filesystem behind this node, when it tracks one.
     fn fs_stat(&self) -> Option<FsStat> {
         None
+    }
+
+    /// The filesystem type name `/proc/mounts` reports for a mount root
+    /// (`"ext2"`, `"procfs"`). The synthetic root never reaches this method;
+    /// the default is the honest answer for a node no mount owns.
+    fn fs_type(&self) -> &'static str {
+        "synthetic"
     }
 
     /// Read up to `buf.len()` bytes at `offset`. Returns the byte count read;
@@ -288,6 +302,10 @@ impl VfsNode for MountNode {
         self.inner.fs_stat()
     }
 
+    fn fs_type(&self) -> &'static str {
+        self.inner.fs_type()
+    }
+
     fn read(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
         self.inner.read(offset, buf)
     }
@@ -391,6 +409,15 @@ pub fn init() {
     });
     *ROOT_DIR.lock() = Some(Arc::clone(&root));
     *VFS_ROOT.lock() = Some(root as Arc<dyn VfsNode>);
+    // `/proc` is part of the base tree: it reports live kernel state and must
+    // exist on a machine whose disk is absent, unreadable or refused by the
+    // format policy, because that is exactly when it is worth reading. The disk
+    // mount (`/mnt`) is added by the boot path later, once ext2 has mounted.
+    // `mount_at` cannot fail for a single-component name and a live root, and a
+    // `debug_assert` keeps the impossible case loud in development.
+    let mounted = mount_at("/proc", proc::root()).is_ok();
+    debug_assert!(mounted, "mounting the built-in /proc failed");
+    let _ = mounted;
 }
 
 /// The synthetic root node, when [`init`] has run.
@@ -438,6 +465,25 @@ pub fn unmount_at(path: &str) -> VfsResult<()> {
         .ok_or_else(|| VfsError::InvalidArgument)?;
     root.children.lock().retain(|c| c.name() != name);
     Ok(())
+}
+
+/// The mount table as `(mount name, filesystem type)`, in `ls /` order.
+///
+/// This is what `/proc/mounts` renders. It is a snapshot, not a live view: the
+/// returned vector borrows nothing and the lock is released before a caller
+/// formats a line, so a renderer can never hold the mount table while taking
+/// another subsystem's lock.
+pub fn mount_snapshot() -> Vec<(String, &'static str)> {
+    let Some(root) = ROOT_DIR.lock().clone() else {
+        return Vec::new();
+    };
+    let mounts: Vec<(String, &'static str)> = root
+        .children
+        .lock()
+        .iter()
+        .map(|child| (child.name().to_string(), child.fs_type()))
+        .collect();
+    mounts
 }
 
 // ─── path resolution ───────────────────────────────────────────────────────

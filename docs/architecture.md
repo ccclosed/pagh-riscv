@@ -438,7 +438,7 @@ SELFTEST SUMMARY: 6/6 passed
 |---|---|---|
 | шов блочного слоя | `src/drivers/block.rs` | трейт `BlockDevice` (512-байтные секторы, `read/write/flush`, `sector_count`), **один** слот реестра и RAM-диск `MemBlock` для тестов. Короткий трансфер — `Err`, а не EOF: молча укороченное чтение — это способ испортить метаданные ФС |
 | драйвер | `src/drivers/virtio_mmio.rs` | modern virtio 1.x (transport version 2), split virtqueue, один запрос в полёте, polled: прерываний пока нет (M3). Окна транспорта приходят из DTB. Запрос — три дескриптора (заголовок, данные, статус); `used.len` обязан совпасть с длиной данных, ненулевой статус — ошибка. Опрос ограничен; исчерпание помечает устройство FAILED (индексы кольца больше нельзя считать согласованными) |
-| ФС | `src/fs/ext2/` + `src/vfs/` | ext2 на диске: суперблок/группы/inode/dirent, direct + single/double indirect, truncate, каталоги, create/unlink/mkdir/rmdir/rename, симлинки. Геометрия (block size, inode size, `s_first_data_block`) читается из суперблока, поэтому образ хостового `mkfs.ext2` монтируется. VFS — один трейт `VfsNode`, синтетический корень, `/mnt`, и два разрешения пути: `lookup_path` (без последней симлинки) и `walk` (с переходом и бюджетом) |
+| ФС | `src/fs/ext2/` + `src/vfs/` | ext2 на диске: суперблок/группы/inode/dirent, direct + single/double indirect, truncate, каталоги, create/unlink/mkdir/rmdir/rename, симлинки. Геометрия (block size, inode size, `s_first_data_block`) читается из суперблока, поэтому образ хостового `mkfs.ext2` монтируется. VFS — один трейт `VfsNode`, синтетический корень, `/proc` (монтируется из `vfs::init`) и `/mnt` (boot-путь), два разрешения пути: `lookup_path` (без последней симлинки) и `walk` (с переходом и бюджетом), плюс `fs_type`/`mount_snapshot` для `/proc/mounts` |
 
 **Формат — разрушительная операция, поэтому решение вынесено отдельно.**
 `init_fs` сначала пытается смонтировать; только после неудачи спрашивает
@@ -454,6 +454,21 @@ SELFTEST SUMMARY: 6/6 passed
 оставить операцию недоделанной — WAL x86-версии в M5 сознательно не портирован
 (`docs/roadmap.md`). `flush` устройства вызывается на границах операций
 (`sync` у узла ФС).
+
+**`/proc` — синтетический read-only слой поверх VFS.** `src/vfs/proc.rs`
+монтирует `/proc` из `vfs::init`, то есть до и независимо от диска: на машине
+без `/mnt` это единственный способ увидеть живое состояние. Дерево фиксировано —
+`cpuinfo`, `meminfo`, `mounts`, `tasks`, `uptime`, `version`, `net/{dev,arp}`;
+файл не буфер, а рендерер: `lookup`/`readdir` создают новый узел, `read` с
+offset 0 перерисовывает содержимое (живое состояние), последующие offset'ы
+продолжают тот же рендер, а `size()` равен длине рендера, чтобы `stat`/`fstat`
+и `lseek(SEEK_END)` показывали ту же длину, что вернёт чтение (EOF — это ответ
+`read` = 0). `write`/`truncate`/`create_*`/`remove` остаются
+дефолтами трейта (`-ENOTSUP`), неизвестное имя — `-ENOENT`; per-pid дерева,
+`/proc/sys` и записи в `/proc` в этом срезе нет. `SELFTEST user-proc-fs`
+(`userland/proc.elf`) проходит userland-половину через `openat`/`read`/
+`getdents64` без диска и без NIC, serial/`--net`/disk-fresh smoke проверяют
+шелловую половину.
 
 **Тесты.** `selftest` печатает три группы: 7 проверок памяти, 3 блочного слоя
 (RAM round-trip; реальный диск только читается) и 11 ext2/VFS на RAM-устройствах
@@ -1084,12 +1099,16 @@ exec проверяет сброс `SIG_IGN` в `SIG_DFL` и сохранени�
 файл даёт `-ENOEXEC`, процесс выживает.
 `SELFTEST user-abi-syscalls` требует, чтобы `forks`/`waits`/`getppids`/
 `execs` выросли, `live_processes() == 0`, `live_pipes() == 0`, а selftest с
-диском проходит 14/14 (12/14 + 2 SKIP без `/mnt`); PMM-ledger в двух прогонах
+диском проходит 15/15 (13/15 + 2 SKIP без `/mnt`); PMM-ledger в двух прогонах
 совпадает. Отдельная проверка `user-tls-abi` гоняет `userland/tls.elf`:
 `getrandom(278)` (нули/флаги/`-EFAULT`/короткое чтение на 64 KiB-потолке) и
 fail-closed ответ всех четырёх TLS-вызовов (1100–1103) на дескрипторе, который
 не является сессией, — без сервера и без `/mnt`, с проверкой счётчиков
 `getrandoms`/`faults`, отсутствия живых сессий и неизменных PMM/heap-ledger'ов.
+`user-proc-fs` гоняет `userland/proc.elf`: `getdents64` на `/proc` (семь
+записей, `net/` — каталог) и `/proc/net`, `fstat`/chunked-read/`lseek` на
+`/proc/version`, разбор `meminfo`/`uptime`/`tasks`/`mounts`/`net`, отказы
+`-ENOTSUP` на запись и `-ENOENT` на неизвестные имена; диск и NIC не нужны.
 
 ## 10. Консоль, экран и шелл
 
@@ -1219,20 +1238,21 @@ fail-closed ответ всех четырёх TLS-вызовов (1100–1103) 
   16 KiB, из них два системных. `State::Stopped` и `stop_current`/
   `continue_task` есть для job control. TLS/PI/requeue, `join`/`waitid` и
   `CLONE_SETTLS` отсутствуют; процессов ≤ 6, `fork` — deep copy без COW.
-* **Нет журнала/WAL, procfs, прав/uid, нескольких дисков, кэша страниц, fsck** —
+* **Нет журнала/WAL, полного procfs (только фиксированный read-only `/proc`),
+  прав/uid, нескольких дисков, кэша страниц, fsck** —
   границы M5 названы в `docs/roadmap.md`; формат совместим с `mkfs.ext2`/`e2fsck`,
   поэтому образ можно проверять хостовыми инструментами.
 * **Нет SMP**: работает один hart.
 * **Нет host-тестов**: есть in-QEMU selftests (7 памяти, 4 блока/указателя, 11
-  ext2/VFS, 4 таймера/PLIC, 5 планировщика, 14 user-mode — с диском 14/14, без
-  `/mnt` 12/14 + 2 SKIP, 12 сети), QEMU-smoke в шести режимах (serial, ramfb, диск
+  ext2/VFS, 4 таймера/PLIC, 5 планировщика, 15 user-mode — с диском 15/15, без
+  `/mnt` 13/15 + 2 SKIP, 12 сети), QEMU-smoke в шести режимах (serial, ramfb, диск
   fresh/existing, net, keyboard) и проверка пикселей `tools/font_check.py`;
   чистая логика (`fdt.rs`) тестами не покрыта.
 * **Инструментов сборки нет**: `run.sh` — единственный лаунчер; в `tools/` только
   шрифт и запуск/скриншот.
 * **Предупреждения сборки**: неиспользуемые диагностические хелперы
-  (`timer::timebase_hz`, `plic::routed`, `uart::get_byte`, …); 20 штук, CI их
-  не гейтит. Это не ошибки, но и не «чисто».
+  (`plic::routed`, `uart::get_byte`, …); после 0.22.0 их 19 — `timer::timebase_hz`
+  теперь читает `/proc/cpuinfo`; CI их не гейтит. Это не ошибки, но и не «чисто».
 * **LICENSE-файла нет**, хотя `Cargo.toml:6` объявляет MIT.
 
 ### 12.1 Ловушка, которая была закрыта вместе с M3 (и правило на будущее)
@@ -1258,16 +1278,17 @@ fork/exec/wait подтверждены живыми прогонами (`run de
 killed, `run spin` → 7 с таймером в U; маркеры `abi: threads ok`,
 `abi: signals ok`, `abi: altstack ok`, `abi: siginfo ok`, `abi: jobcontrol ok`,
 `abi: fork ok`, `abi: wait ok`, `abi: exec ok`, `abi: exec wait ok`),
-`SELFTEST user-* 14/14` с диском (`user-run-large-file`: 100 KiB образ с нулевым
+`SELFTEST user-* 15/15` с диском (`user-run-large-file`: 100 KiB образ с нулевым
 хвостом через `run_file`; `user-stack-grows`/`user-stack-cap`/`user-stack-fork`:
 рост до 1 MiB, guard и fork на выросшем стеке; `user-tls-abi`: `getrandom` и
-fail-closed матрица TLS-вызовов; без `/mnt` — 12/14 + 2 SKIP), PMM-ledger до/после
+fail-closed матрица TLS-вызовов; `user-proc-fs`: userland читает `/proc` через
+`openat`/`read`/`getdents64`; без `/mnt` — 13/15 + 2 SKIP), PMM-ledger до/после
 каждого блока совпадает в двух прогонах, smoke проходит serial/net/ramfb/
 disk-fresh/disk-existing/keyboard. Следующие шаги —
 из `docs/roadmap.md`:
 
-* Linux-compat слой (перенос подхода x86: syscall-номера, `/proc`, Linux-ELF) —
-  только после того, как появится userland, которому он нужен;
+* Linux-compat слой (перенос подхода x86: syscall-номера, per-pid `/proc/<pid>`,
+  Linux-ELF) — только после того, как появится userland, которому он нужен;
 * COW/`MAP_SHARED`/demand paging в per-process root'ах и `SIGCHLD` как
   настоящий child-exit источник (сейчас `wait4` будит родителя напрямую);
 * init-процесс/усыновление сирот вместо политики «сирота умирает с foreground»;

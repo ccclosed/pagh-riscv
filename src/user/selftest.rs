@@ -36,8 +36,8 @@ use crate::user::elf::{self, ElfError, MAX_IMAGE_BYTES};
 use crate::user::stack;
 use crate::user::syscall;
 use crate::user::{
-    self, Exit, UserError, ABI_ELF, ARGV_ELF, EXEC_CHILD_ELF, FAULT_ELF, HELLO_ELF, SPIN_ELF,
-    STACK_ELF, STACK_FORK_ELF, STACK_OVER_ELF, TLS_ELF, USER_STACK_PAGES,
+    self, Exit, UserError, ABI_ELF, ARGV_ELF, EXEC_CHILD_ELF, FAULT_ELF, HELLO_ELF, PROC_ELF,
+    SPIN_ELF, STACK_ELF, STACK_FORK_ELF, STACK_OVER_ELF, TLS_ELF, USER_STACK_PAGES,
 };
 use crate::vfs::{self, VfsError, VfsNode};
 
@@ -1278,6 +1278,66 @@ fn user_tls_abi(_buf: &mut Vec<u8>) -> Outcome {
     verdict(ok)
 }
 
+/// `SELFTEST user-proc-fs`: the `/proc` fixture reads the synthetic filesystem
+/// through the ordinary syscall ABI (`userland/proc.rs`).
+///
+/// Needs neither a disk nor a NIC: the fixture accepts "no interface" and only
+/// requires the always-present files, so this is the check that keeps `/proc`
+/// honest on CI's serial-only boot as well as on a fully equipped one. The
+/// fixture also proves the read-only side (a failed `write` must be `-ENOTSUP`,
+/// not a silent no-op) and that unknown names stay `-ENOENT`.
+///
+/// The PMM ledger is compared like every other fixture: rendering allocates a
+/// `Vec` per reading pass, and a render that leaked its buffer would show up
+/// here even though `/proc` owns no frames of its own.
+fn user_proc_fs(_buf: &mut Vec<u8>) -> Outcome {
+    let frames_before = frames();
+
+    user::capture_start();
+    let result = user::run_image(PROC_ELF, "proc.elf");
+    let captured = user::capture_stop();
+
+    let mut ok = true;
+    match result {
+        Ok(Exit::Code(0)) => {}
+        Ok(other) => {
+            crate::kprintln!("[selftest] user: the /proc fixture ended {other}");
+            ok = false;
+        }
+        Err(error) => {
+            crate::kprintln!("[selftest] user: the /proc fixture failed: {error}");
+            ok = false;
+        }
+    }
+    for marker in [
+        &b"proc: version ok\n"[..],
+        &b"proc: directory ok\n"[..],
+        &b"proc: readonly ok\n"[..],
+        &b"proc: missing ok\n"[..],
+        &b"proc: done\n"[..],
+    ] {
+        if !captured_contains(&captured, marker) {
+            crate::kprintln!(
+                "[selftest] user: /proc fixture marker {:?} missing",
+                core::str::from_utf8(marker).unwrap_or("<non-UTF-8>")
+            );
+            ok = false;
+        }
+    }
+    if captured_contains(&captured, b"proc: FAIL") {
+        crate::kprintln!("[selftest] user: the /proc fixture reported a failure");
+        ok = false;
+    }
+    if frames() != frames_before {
+        crate::kprintln!(
+            "[selftest] user: the /proc fixture left the PMM at {} (was {frames_before})",
+            frames()
+        );
+        ok = false;
+    }
+    verdict(ok)
+}
+
 /// Run every check, print `SELFTEST user-<name> PASS|FAIL|SKIP`, and return how
 /// many passed.
 pub fn run() -> usize {
@@ -1303,7 +1363,7 @@ pub fn run() -> usize {
         total
     );
 
-    let checks: [(&str, fn(&mut Vec<u8>) -> Outcome); 14] = [
+    let checks: [(&str, fn(&mut Vec<u8>) -> Outcome); 15] = [
         ("user-abi-argv", user_abi_argv),
         ("user-abi-syscalls", user_abi_syscalls),
         ("user-elf-accept", |buf| verdict(elf_accept(buf))),
@@ -1322,6 +1382,7 @@ pub fn run() -> usize {
         ("user-stack-fork", |buf| verdict(user_stack_fork(buf))),
         ("user-run-large-file", user_run_large_file),
         ("user-tls-abi", user_tls_abi),
+        ("user-proc-fs", user_proc_fs),
     ];
     let mut passed = 0usize;
     let mut skipped = 0usize;

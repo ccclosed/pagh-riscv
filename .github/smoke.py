@@ -81,6 +81,31 @@ EXPECTED = [
     "pagh:rv64> run demo alpha beta",
     "hello from user mode",
     "run: demo exited with code 42",
+    # `/proc` is mounted by `vfs::init`, so it exists on this serial-only boot
+    # too (no disk, no NIC). The shell reads it with the ordinary file commands;
+    # the listing is asserted as one block so order and completeness are checked,
+    # not just the presence of a name.
+    "pagh:rv64> cat /proc/version",
+    "pagh 0.22.0 (riscv64) #1",
+    "pagh:rv64> ls /proc",
+    "cpuinfo\nmeminfo\nmounts\nnet/\ntasks\nuptime\nversion\n",
+    "pagh:rv64> cat /proc/meminfo",
+    "MemTotal:",
+    "MemFree:",
+    "pagh:rv64> cat /proc/tasks",
+    # The live-count line is asserted by prefix: `live_tasks` counts slots that
+    # held a thread, exited ones included, and the `run demo` above leaves one.
+    "tasks: ",
+    "  id  name       state",
+    "  0   shell",
+    "pagh:rv64> stat /proc/meminfo",
+    "type:  regular file",
+    "mode:  0644",
+    # The userland half of the same contract: a static program reads /proc
+    # through openat/read/getdents64 and prints the markers itself.
+    "pagh:rv64> run proc",
+    "proc: done",
+    "run: proc exited with code 0",
     "pagh:rv64> help",
     "commands:",
     "  help          this list",
@@ -105,7 +130,10 @@ SCREEN_MARKER = {
 # Sent as one write, after the banner: the shell is line-based and its UART has
 # a FIFO, so a burst is fine once the kernel is listening.
 COMMANDS = (b"mem\nhart\ntime\necho smoke ok\nnosuchcmd\n"
-            b"run demo alpha beta\nhelp\nhalt\n")
+            b"run demo alpha beta\n"
+            b"cat /proc/version\nls /proc\ncat /proc/meminfo\ncat /proc/tasks\n"
+            b"stat /proc/meminfo\nrun proc\n"
+            b"help\nhalt\n")
 
 # ── the disk mode (M5) ─────────────────────────────────────────────────────
 # `--disk PATH` attaches a virtio-mmio block device and then behaves differently
@@ -121,7 +149,7 @@ DISK_BOOT_PREFIX = [
 DISK_FRESH_BOOT = ["fs          virtio-blk0 is blank — formatting ext2"]
 DISK_MOUNTED = ["fs          ext2 on /mnt,"]
 DISK_COMMANDS_FRESH = (
-    b"disk\nls /mnt\nmkdir /mnt/ci\n"
+    b"disk\ncat /proc/mounts\nls /mnt\nmkdir /mnt/ci\n"
     b"write /mnt/ci/marker.txt hello-from-ci\n"
     b"cat /mnt/ci/marker.txt\nstat /mnt/ci/marker.txt\nselftest\nhalt\n"
 )
@@ -130,6 +158,11 @@ DISK_EXPECTED_FRESH = [
     "pagh:rv64> disk",
     "disk: virtio-blk0",
     "sector 0 readable",
+    # The mount table as `/proc/mounts` reports it: the synthetic root's two
+    # mounts, the built-in procfs and the ext2 disk that `init_fs` just mounted.
+    "pagh:rv64> cat /proc/mounts",
+    "/proc /proc procfs rw 0 0",
+    "/mnt /mnt ext2 rw 0 0",
     "pagh:rv64> ls /mnt",
     "lost+found/",
     "write: wrote",
@@ -143,7 +176,8 @@ DISK_EXPECTED_FRESH = [
     # ledger unchanged -- no server, no extra boot mode. The net suite's
     # session-table gate is the kernel-side view of the same table.
     "SELFTEST user-tls-abi PASS",
-    "SELFTEST SUMMARY (user): 14/14 passed",
+    "SELFTEST user-proc-fs PASS",
+    "SELFTEST SUMMARY (user): 15/15 passed",
     "SELFTEST net-tls-session-gate PASS",
     "SELFTEST SUMMARY (net): 12/12 passed",
     "halt: powering off",
@@ -151,7 +185,7 @@ DISK_EXPECTED_FRESH = [
 # ── the network mode (M7) ─────────────────────────────────────────────────
 # The DHCP client runs during boot, before the shell; the commands then exercise
 # the lease (`net`), the ARP/ICMP path (`ping` the gateway) and the shell itself.
-NET_COMMANDS = b"net\nping 10.0.2.2\nhalt\n"
+NET_COMMANDS = b"net\nping 10.0.2.2\ncat /proc/net/arp\nhalt\n"
 NET_BOOT = [
     "virtio-net: virtio-net0 at 0x",
     "net         DHCP ip 10.0.2.15/",
@@ -163,6 +197,11 @@ NET_EXPECTED = NET_BOOT + [
     "ip 10.0.2.15 mask 255.255.255.0 gateway 10.0.2.2",
     "pagh:rv64> ping 10.0.2.2",
     "ping: reply from 10.0.2.2",
+    # The ARP cache is live state the stack has always kept and no command
+    # showed. QEMU's user-mode network gives the gateway a fixed MAC, and the
+    # ping above is what put the entry there.
+    "pagh:rv64> cat /proc/net/arp",
+    "IP address       HW address        Device\n10.0.2.2         52:55:0a:00:02:02 virtio-net0\n",
     "halt: powering off",
 ]
 
@@ -171,7 +210,8 @@ DISK_EXPECTED_EXISTING = [
     "hello-from-ci",
     "SELFTEST ext2 summary: 11/11 passed",
     "SELFTEST user-tls-abi PASS",
-    "SELFTEST SUMMARY (user): 14/14 passed",
+    "SELFTEST user-proc-fs PASS",
+    "SELFTEST SUMMARY (user): 15/15 passed",
     "halt: powering off",
 ]
 

@@ -1,6 +1,6 @@
 # `userland/` — статические RV64-программы для M6b и native ABI
 
-Девять крошечных программ без рантайма и libc — ровно столько, чтобы проверить
+Десять крошечных программ без рантайма и libc — ровно столько, чтобы проверить
 точки входа ядра и контракт `pagh-api/docs/abi.md`. Все собраны в ELF заранее;
 ядро встраивает их через `include_bytes!` (`src/user/mod.rs`), поэтому чистый
 checkout собирается **без** кросс-компилятора.
@@ -15,6 +15,7 @@ checkout собирается **без** кросс-компилятора.
 | `exec.rs` / `exec-child.elf` | цель `execve`: проверяет, что ядро собрало `argv[1] = "exec-arg"` и `envp[0] = "PWD=/mnt"`, печатает `abi: exec ok argc=2 argv=exec-arg env=PWD=/mnt`, выходит 0 | замена образа/стека/регистров при `execve`, сохранение pid/ppid/fd, сброс обработчиков сигналов |
 | `stack.rs` / `stack.elf` | рекурсивная цепочка `descend`: 40 уровней по 4 KiB (160 KiB), в каждом уровне `sd` в дно кадра; печатает `stack: deep recursion ok` и выходит 0 | деманд-рост user-стека: первые ~96 KiB ниже начального окна обязаны быть домаплены ядром, иначе первый же store за `USER_STACK_BASE` убил бы программу |
 | `stack-over.rs` / `stack-over.elf` | та же цепочка на 300 уровней (1.2 MiB); если она **вернётся**, выходит 111 | потолок 1 MiB на процесс: рост обязан упереться в guard ниже `USER_STACK_FLOOR` и умереть `store page fault`, не съев PMM |
+| `proc.rs` / `proc.elf` | читает синтетический `/proc` обычными syscall'ами: `openat`+`getdents64` на `/proc` (семь записей с `d_type`, `net/` — каталог) и `/proc/net` (`arp`+`dev`), `fstat` (regular file 0o644, `size()` = числу прочитанных байт), чтение кусками по 7 B с `lseek(0)` и побайтовым сравнением (`version`), содержимое `meminfo` (`MemTotal`/`MemFree`, `free <= total`), `uptime`, `tasks`, `mounts`, `net/dev` (NIC есть или честно «no interface»), read-only-отказы (`mkdirat`/`unlinkat`/`write` → `-ENOTSUP`) и `-ENOENT` на неизвестные имена; печатает `proc: … ok` и выходит 0, любая ошибка — свой ненулевой код и строка `proc: FAIL` | userland-доступ к `/proc` через native ABI; снимок на проход чтения (`size`/`read` согласованы); read-only контракт синтетической ФС |
 | `stack-fork.rs` / `stack-fork.elf` | та же цепочка, но на 30-м уровне (когда ниже начального окна уже выросли ~14 страниц) вызывается `fork(1000)`; родитель ждёт `wait4`, ребёнок доходит до конца на своей копии и печатает `stack: fork child ok`, родитель — `stack: fork parent ok`, оба выходят 0 (при ошибке fork/wait — 9) | `fork` копирует именно `stack_low..USER_STACK_BASE`, а `wait4` возвращает выросшие кадры ребёнка в PMM; рост продолжается и в ребёнке |
 | `user.ld` | линковка: `_start` = `0x1_0000`, PT_LOAD-раскладка | совпадает с окном из `src/user/elf.rs` |
 
@@ -100,4 +101,18 @@ run: spin exited with code 7
 pagh:rv64> selftest
 SELFTEST user-abi-argv PASS
 SELFTEST user-abi-syscalls PASS     # с /mnt (abi: threads/signals/fork/wait/exec/mutations ok); без него SKIP
+pagh:rv64> run proc
+proc: version ok
+proc: meminfo ok
+proc: uptime ok
+proc: tasks ok
+proc: mounts ok
+proc: net ok
+proc: directory ok
+proc: readonly ok
+proc: missing ok
+proc: done
+run: proc exited with code 0
+pagh:rv64> cat /proc/version
+pagh 0.22.0 (riscv64) #1
 ```
