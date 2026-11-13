@@ -756,7 +756,74 @@ fn corrupt_input() -> bool {
         }
     }
 
-    // 4. A broken directory `rec_len` chain: the mount succeeds (mount reads
+    // 4. A slow symlink whose on-disk `i_size` is huge. The reader used to
+    //    size `vec![0u8; i_size]` from the raw field, so a crafted image made
+    //    the kernel's alloc-error handler abort the machine (panic = "abort").
+    //    A slow link's target fits one block by construction, so the reader must
+    //    report corruption instead of allocating.
+    {
+        let fs = match Ext2Fs::mount_fs(Arc::clone(&dev)) {
+            Ok(fs) => fs,
+            Err(_) => return false,
+        };
+        let root = fs.root_node();
+        let long: alloc::string::String = core::iter::repeat('y').take(100).collect();
+        if root
+            .create_symlink("crafted-link", long.as_bytes())
+            .is_err()
+        {
+            return false;
+        }
+        let ino = match fs.lookup_entry(EXT2_ROOT_INO, "crafted-link") {
+            Ok(ino) => ino,
+            Err(_) => return false,
+        };
+        // Patch `i_size` (the second u32 of an ext2 inode) on the RAM device.
+        let (block, offset) = match fs.inode_disk_location(ino) {
+            Ok(location) => location,
+            Err(_) => return false,
+        };
+        let bs = fs.block_size();
+        let sectors = fs.sectors_per_block() as u64;
+        let mut raw = vec![0u8; bs];
+        let mut patched = true;
+        for sector in 0..sectors {
+            let slot = &mut raw[sector as usize * 512..][..512];
+            patched &= dev.read_block(block * sectors + sector, slot).is_ok();
+        }
+        raw[offset + 4..offset + 8].copy_from_slice(&0xFFFF_FF00u32.to_le_bytes());
+        for sector in 0..sectors {
+            let slot = &raw[sector as usize * 512..][..512];
+            patched &= dev.write_block(block * sectors + sector, slot).is_ok();
+        }
+        check!(
+            ok,
+            patched,
+            "[fs selftest] could not patch the crafted symlink inode"
+        );
+        check!(
+            ok,
+            matches!(fs.read_symlink(ino), Err(FsError::Corrupt)),
+            "[fs selftest] slow symlink with i_size=0xFFFFFF00 was not reported as Corrupt"
+        );
+        // The shell path (`cat /mnt/link`) goes through the VFS walk: a clean
+        // `Corrupt` is what keeps the prompt alive, and the same route must not
+        // resurrect the allocation one level up.
+        if vfs::mount_at("/crafted", fs.root_node()).is_err() {
+            return false;
+        }
+        check!(
+            ok,
+            matches!(
+                vfs::walk("/crafted/crafted-link", true),
+                Err(vfs::VfsError::Corrupt)
+            ),
+            "[fs selftest] VFS walk of the crafted symlink did not fail cleanly"
+        );
+        let _ = vfs::unmount_at("/crafted");
+    }
+
+    // 5. A broken directory `rec_len` chain: the mount succeeds (mount reads
     //    metadata only) but reading the directory must report corruption.
     {
         let fs = match Ext2Fs::mount_fs(Arc::clone(&dev)) {

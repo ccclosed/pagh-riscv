@@ -303,6 +303,18 @@ impl Ext2Fs {
         Ok(unsafe { read_struct::<Ext2Inode>(&buf[off..]) })
     }
 
+    /// On-disk location of inode `ino`: `(device block, byte offset in it)`.
+    ///
+    /// Read-only geometry, exposed so the filesystem self-test can patch one
+    /// inode field on its RAM device and prove that a crafted value is rejected
+    /// instead of sized into an allocation (the crafted slow-symlink
+    /// regression). Every reader in this module goes through the same
+    /// [`inode_location`] validation.
+    pub fn inode_disk_location(&self, ino: u32) -> Result<(u64, usize), FsError> {
+        let inner = self.inner.lock();
+        inode_location(&inner.sb, &inner.gds, self.block_size, ino)
+    }
+
     // ── mounting ──
 
     /// True when the device carries a structurally valid ext2 superblock and
@@ -694,6 +706,17 @@ impl Ext2Fs {
         let size = inode.i_size as usize;
         if size == 0 {
             return Ok(Vec::new());
+        }
+        // A slow symlink stores its whole target in ONE data block, so an
+        // `i_size` above the block size is not a shape the format can hold —
+        // and this value comes straight from the disk. It is also the
+        // allocation bound: `vec![0u8; size]` below must never size an
+        // allocation from unchecked metadata, because this heap refuses any
+        // single request above one 64 KiB chunk and the alloc-error handler is
+        // `panic!` in a `panic = "abort"` kernel (the machine dies). Crafted
+        // images therefore answer `Corrupt`, never abort.
+        if size > self.block_size {
+            return Err(FsError::Corrupt);
         }
         if inode::block_for_offset(self, &inode, 0)?.is_none() {
             return Err(FsError::Corrupt);
