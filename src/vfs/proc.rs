@@ -21,17 +21,28 @@
 //!   `-ENOTSUP`. There is no flag that makes a proc file writable.
 //! * **No invented state.** A file reports what the kernel already tracks: the
 //!   second field of `/proc/uptime` is `0.00` because idle time is not
-//!   accounted, and `/proc/net/arp` lists only entries the cache still
-//!   considers fresh. There is no `/proc/<pid>` tree in this slice: unknown
-//!   names are `NotFound` (`-ENOENT`), never synthesised.
+//!   accounted, `/proc/net/arp` lists only entries the cache still considers
+//!   fresh, and a per-pid file exists only for a process that has at least one
+//!   live thread. A missing id is `NotFound` (`-ENOENT`), never synthesised.
+//! * **Two namespaces.** `/proc/<pid>` is a *process*: the id is `getpid()`, the
+//!   identity the userland ABI already hands out, and the files describe the
+//!   whole program (its threads included). Kernel threads have no pid, so they
+//!   are listed under `/proc/kthreads/<tid>` (a pagh extension, not Linux); that
+//!   is what makes `/proc/self` work for the shell too. `/proc/self` is a
+//!   symlink to the reader's own entry — `<pid>` for a user thread,
+//!   `kthreads/<tid>` for a kernel thread — resolved by the ordinary VFS walk.
+//! * **No permissions.** pagh has no users or modes it enforces for reads;
+//!   every live entry is readable by any caller, and this file says so instead
+//!   of pretending a check happened.
 //! * **Mounted from [`crate::vfs::init`], not from the disk path.** `/proc`
 //!   must exist when `/mnt` does not — a machine without a disk is exactly the
 //!   case where a diagnostic filesystem is worth having.
 //! * **Lock order is state-then-node.** [`ProcFile::refresh`] renders *before*
-//!   taking the node's own buffer lock, and the renderers take at most one
-//!   subsystem lock at a time (the PMM bitmap, the heap, the scheduler table,
-//!   the net config, the ARP cache, the mount table). A node lock is never held
-//!   across a render.
+//!   taking the node's own buffer lock, and a renderer takes one subsystem lock
+//!   at a time: the PMM bitmap, the heap, the scheduler table, the process
+//!   table, the net config, the ARP cache or the mount table. A node lock is
+//!   never held across a render, and the process table is never held while the
+//!   scheduler lock is taken (process reads copy a value out and release).
 //!
 //! The files, all under `/proc`:
 //!
@@ -42,12 +53,21 @@
 //! | `mounts` | the mount table, Linux `/proc/mounts` field order |
 //! | `net/dev` | the interface, its MAC and the DHCP lease |
 //! | `net/arp` | the live ARP cache |
-//! | `tasks` | the scheduler table — kernel threads and user threads (a pagh extension) |
+//! | `tasks` | the whole scheduler table — kernel threads and user threads (a pagh extension) |
 //! | `uptime` | seconds since boot (Linux shape; the idle field is always 0.00) |
 //! | `version` | kernel name, crate version, machine, build number |
+//! | `kthreads/<tid>/{status,stat}` | one kernel thread (name, state, switches, stack) |
+//! | `<pid>/{status,stat,cmdline}` | one process: aggregate state of its live threads, the pid/ppid/thread count and the argv snapshot |
+//!
+//! The per-pid files are a documented native format, not Linux's 52-field
+//! `stat`: this kernel has no per-task CPU accounting to report, so the line
+//! carries only fields that are real (see [`render_stat`]). `cmdline` *is* the
+//! Linux shape — NUL-separated arguments with a trailing NUL — but it is a
+//! bounded snapshot taken when the kernel built the entry frame (`Cmdline` in
+//! `src/user/mod.rs`), not a live view of the program's stack.
 
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
@@ -56,6 +76,9 @@ use crate::arch::riscv64::timer;
 use crate::memory::FRAME_SIZE;
 use crate::net::wire::{format_ipv4, format_mac};
 use crate::sync::Spinlock;
+use crate::task::scheduler::{self, State, TaskInfo};
+use crate::user::process;
+use crate::user::{Cmdline, RunName};
 
 use super::{VfsError, VfsNode, VfsResult};
 
@@ -64,13 +87,24 @@ pub fn root() -> Arc<dyn VfsNode> {
     Arc::new(ProcDir::new(Dir::Root))
 }
 
-// ─── the fixed tree ────────────────────────────────────────────────────────
+// ─── the fixed tree plus its two dynamic namespaces ────────────────────────
 
-/// One directory in the tree.
+/// One directory. `Pid`/`Kthread` carry the identity the path component named;
+/// the two dynamic directories exist only while that entry is live.
 #[derive(Clone, Copy)]
 enum Dir {
     Root,
     Net,
+    Kthreads,
+    Pid(u64),
+    Kthread(u64),
+}
+
+/// Which task a per-task file belongs to.
+#[derive(Clone, Copy)]
+enum Target {
+    Process(u64),
+    Kthread(u64),
 }
 
 /// One file in the tree. The variant is the renderer; nothing about the content
@@ -85,66 +119,118 @@ enum File {
     Tasks,
     Uptime,
     Version,
+    Status(Target),
+    Cmdline(Target),
+    Stat(Target),
 }
 
-/// A child of a directory: either a file or another directory.
+/// A fixed child of the root. `self` is listed here so `/proc` has one stable
+/// order; its target is computed when it is resolved, not stored.
 #[derive(Clone, Copy)]
-enum Child {
+enum RootChild {
     File(File),
     Dir(Dir),
+    SelfLink,
 }
 
-/// The root's children, in `ls` order (alphabetical, so the listing is stable).
-const ROOT_CHILDREN: [(&str, Child); 7] = [
-    ("cpuinfo", Child::File(File::CpuInfo)),
-    ("meminfo", Child::File(File::MemInfo)),
-    ("mounts", Child::File(File::Mounts)),
-    ("net", Child::Dir(Dir::Net)),
-    ("tasks", Child::File(File::Tasks)),
-    ("uptime", Child::File(File::Uptime)),
-    ("version", Child::File(File::Version)),
+/// The root's fixed children, in `ls` order (alphabetical so the listing is
+/// stable; the dynamic `/proc/<pid>` entries are appended numerically after
+/// them).
+const ROOT_CHILDREN: [RootChild; 9] = [
+    RootChild::File(File::CpuInfo),
+    RootChild::Dir(Dir::Kthreads),
+    RootChild::File(File::MemInfo),
+    RootChild::File(File::Mounts),
+    RootChild::Dir(Dir::Net),
+    RootChild::SelfLink,
+    RootChild::File(File::Tasks),
+    RootChild::File(File::Uptime),
+    RootChild::File(File::Version),
 ];
 
 /// `/proc/net`'s children, in `ls` order.
-const NET_CHILDREN: [(&str, Child); 2] = [
-    ("arp", Child::File(File::NetArp)),
-    ("dev", Child::File(File::NetDev)),
-];
+const NET_CHILDREN: [File; 2] = [File::NetArp, File::NetDev];
 
-fn children(kind: Dir) -> &'static [(&'static str, Child)] {
-    match kind {
-        Dir::Root => &ROOT_CHILDREN,
-        Dir::Net => &NET_CHILDREN,
+fn file_name(file: File) -> &'static str {
+    match file {
+        File::CpuInfo => "cpuinfo",
+        File::MemInfo => "meminfo",
+        File::Mounts => "mounts",
+        File::NetArp => "arp",
+        File::NetDev => "dev",
+        File::Tasks => "tasks",
+        File::Uptime => "uptime",
+        File::Version => "version",
+        File::Status(_) => "status",
+        File::Cmdline(_) => "cmdline",
+        File::Stat(_) => "stat",
     }
+}
+
+/// The three files every per-task directory has, in `ls` order.
+fn target_files(target: Target) -> [File; 3] {
+    [
+        File::Cmdline(target),
+        File::Stat(target),
+        File::Status(target),
+    ]
+}
+
+fn root_child_name(child: RootChild) -> &'static str {
+    match child {
+        RootChild::File(file) => file_name(file),
+        RootChild::Dir(Dir::Net) => "net",
+        RootChild::Dir(Dir::Kthreads) => "kthreads",
+        // The root's fixed table names only those two directories; a dynamic
+        // namespace is never a `RootChild`.
+        RootChild::Dir(_) => "?",
+        RootChild::SelfLink => "self",
+    }
+}
+
+fn root_child_node(child: RootChild) -> Arc<dyn VfsNode> {
+    match child {
+        RootChild::File(file) => Arc::new(ProcFile::new(file)),
+        RootChild::Dir(dir) => Arc::new(ProcDir::new(dir)),
+        RootChild::SelfLink => Arc::new(ProcLink),
+    }
+}
+
+/// Parse a numeric path component strictly: digits only, no sign, fits `u64`.
+fn parse_id(name: &str) -> Option<u64> {
+    if name.is_empty() || !name.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    name.parse().ok()
 }
 
 // ─── directory node ────────────────────────────────────────────────────────
 
 /// A synthetic directory. It owns no children: every `lookup`/`readdir` builds
-/// fresh file nodes, which is what keeps two readers' snapshots apart.
+/// fresh nodes, which is what keeps two readers' snapshots apart.
 struct ProcDir {
     kind: Dir,
+    /// The entry name this node was reached through (a dynamic directory's name
+    /// is the decimal id, so it is owned rather than `&'static str`).
+    name: String,
 }
 
 impl ProcDir {
-    const fn new(kind: Dir) -> Self {
-        ProcDir { kind }
-    }
-
-    fn child_node(name: &'static str, child: Child) -> Arc<dyn VfsNode> {
-        match child {
-            Child::File(file) => Arc::new(ProcFile::new(name, file)),
-            Child::Dir(dir) => Arc::new(ProcDir::new(dir)),
-        }
+    fn new(kind: Dir) -> Self {
+        let name = match kind {
+            Dir::Root => String::from("proc"),
+            Dir::Net => String::from("net"),
+            Dir::Kthreads => String::from("kthreads"),
+            Dir::Pid(pid) => pid.to_string(),
+            Dir::Kthread(tid) => tid.to_string(),
+        };
+        ProcDir { kind, name }
     }
 }
 
 impl VfsNode for ProcDir {
     fn name(&self) -> &str {
-        match self.kind {
-            Dir::Root => "proc",
-            Dir::Net => "net",
-        }
+        &self.name
     }
 
     fn is_directory(&self) -> bool {
@@ -152,22 +238,85 @@ impl VfsNode for ProcDir {
     }
 
     fn readdir(&self) -> VfsResult<Vec<Arc<dyn VfsNode>>> {
-        let mut entries = Vec::with_capacity(children(self.kind).len());
-        for (name, child) in children(self.kind) {
-            entries.push(ProcDir::child_node(name, *child));
+        let mut entries: Vec<Arc<dyn VfsNode>> = Vec::new();
+        match self.kind {
+            Dir::Root => {
+                for child in ROOT_CHILDREN {
+                    entries.push(root_child_node(child));
+                }
+                // Live processes, ascending: the shell can never see one through
+                // its own `ls` (a foreground `run` owns the console), but
+                // userland listing `/proc` from inside its own process does.
+                let mut pids = [0u64; process::MAX_PROCESSES];
+                let count = process::live_pids(&mut pids);
+                pids[..count].sort_unstable();
+                for pid in &pids[..count] {
+                    entries.push(Arc::new(ProcDir::new(Dir::Pid(*pid))));
+                }
+            }
+            Dir::Net => {
+                for file in NET_CHILDREN {
+                    entries.push(Arc::new(ProcFile::new(file)));
+                }
+            }
+            Dir::Kthreads => {
+                let mut ids = [0u64; scheduler::MAX_TASKS];
+                let count = scheduler::kthread_ids(&mut ids);
+                ids[..count].sort_unstable();
+                for id in &ids[..count] {
+                    entries.push(Arc::new(ProcDir::new(Dir::Kthread(*id))));
+                }
+            }
+            Dir::Pid(pid) => {
+                for file in target_files(Target::Process(pid)) {
+                    entries.push(Arc::new(ProcFile::new(file)));
+                }
+            }
+            Dir::Kthread(tid) => {
+                for file in target_files(Target::Kthread(tid)) {
+                    entries.push(Arc::new(ProcFile::new(file)));
+                }
+            }
         }
         Ok(entries)
     }
 
     fn lookup(&self, name: &str) -> VfsResult<Arc<dyn VfsNode>> {
-        // The table is per directory, not global: `arp` only exists under
-        // `/proc/net`, and asking the root for it is a miss, not a hit.
-        for (child_name, child) in children(self.kind) {
-            if *child_name == name {
-                return Ok(ProcDir::child_node(child_name, *child));
+        match self.kind {
+            Dir::Root => {
+                for child in ROOT_CHILDREN {
+                    if root_child_name(child) == name {
+                        return Ok(root_child_node(child));
+                    }
+                }
+                // `/proc/<pid>`: only a process with a live thread is a
+                // directory. A stale or never-used number is `-ENOENT`.
+                if let Some(pid) = parse_id(name) {
+                    if process::is_live(pid) {
+                        return Ok(Arc::new(ProcDir::new(Dir::Pid(pid))));
+                    }
+                }
+                Err(VfsError::NotFound)
             }
+            Dir::Net => {
+                for file in NET_CHILDREN {
+                    if file_name(file) == name {
+                        return Ok(Arc::new(ProcFile::new(file)));
+                    }
+                }
+                Err(VfsError::NotFound)
+            }
+            Dir::Kthreads => {
+                if let Some(id) = parse_id(name) {
+                    if scheduler::task_info(id).is_some_and(|info| info.group == 0) {
+                        return Ok(Arc::new(ProcDir::new(Dir::Kthread(id))));
+                    }
+                }
+                Err(VfsError::NotFound)
+            }
+            Dir::Pid(pid) => target_file(Target::Process(pid), name),
+            Dir::Kthread(tid) => target_file(Target::Kthread(tid), name),
         }
-        Err(VfsError::NotFound)
     }
 
     fn mode(&self) -> u16 {
@@ -185,12 +334,77 @@ impl VfsNode for ProcDir {
     }
 }
 
+/// Look one name up in a per-task directory.
+fn target_file(target: Target, name: &str) -> VfsResult<Arc<dyn VfsNode>> {
+    for file in target_files(target) {
+        if file_name(file) == name {
+            return Ok(Arc::new(ProcFile::new(file)));
+        }
+    }
+    Err(VfsError::NotFound)
+}
+
+// ─── `/proc/self` link ─────────────────────────────────────────────────────
+
+/// The one dynamic symbolic link: `/proc/self` points at the reader's own entry.
+///
+/// The target is computed in [`read_link`](VfsNode::read_link), which runs in
+/// the reader's context, so two processes see different targets from the same
+/// node. A user thread's process id names `/proc/<pid>`; a kernel thread has no
+/// pid, so it points into `/proc/kthreads/<tid>`. The ordinary VFS `walk`
+/// expands the link, which is why `cat /proc/self/status` works without any
+/// special case.
+struct ProcLink;
+
+impl VfsNode for ProcLink {
+    fn name(&self) -> &str {
+        "self"
+    }
+
+    fn is_directory(&self) -> bool {
+        false
+    }
+
+    fn is_symlink(&self) -> bool {
+        true
+    }
+
+    fn read_link(&self) -> Option<String> {
+        Some(self_target())
+    }
+
+    fn size(&self) -> u64 {
+        self_target().len() as u64
+    }
+
+    fn mode(&self) -> u16 {
+        // Symbolic link, 0o777 like the ext2 links.
+        0o120777
+    }
+
+    fn nlink(&self) -> u64 {
+        1
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+fn self_target() -> String {
+    let group = scheduler::current_group();
+    if group != 0 {
+        format!("{group}")
+    } else {
+        format!("kthreads/{}", scheduler::current_id())
+    }
+}
+
 // ─── file node ─────────────────────────────────────────────────────────────
 
-/// A synthetic file: its name, its renderer, and the render of the current
-/// reading pass. The buffer is `None` until the first `size()`/`read()`.
+/// A synthetic file: the renderer plus the render of the current reading pass.
+/// The buffer is `None` until the first `size()`/`read()`.
 struct ProcFile {
-    name: &'static str,
     file: File,
     /// The current reading pass's text. A read from offset 0 replaces it; a
     /// later offset continues it. `None` means "not rendered yet".
@@ -198,55 +412,96 @@ struct ProcFile {
 }
 
 impl ProcFile {
-    fn new(name: &'static str, file: File) -> Self {
+    fn new(file: File) -> Self {
         ProcFile {
-            name,
             file,
             buf: Spinlock::new(None),
         }
     }
 
     /// Render the file's current text. Called with **no** node lock held: it
-    /// reaches into the PMM, heap, scheduler, net and mount table, each of which
-    /// takes its own lock.
-    fn render(&self) -> Vec<u8> {
-        let mut out = String::with_capacity(512);
+    /// reaches into the PMM, heap, scheduler, process, net and mount state, each
+    /// of which takes its own lock.
+    fn render(&self) -> VfsResult<Vec<u8>> {
         match self.file {
-            File::CpuInfo => render_cpuinfo(&mut out),
-            File::MemInfo => render_meminfo(&mut out),
-            File::Mounts => render_mounts(&mut out),
-            File::NetArp => render_net_arp(&mut out),
-            File::NetDev => render_net_dev(&mut out),
-            File::Tasks => render_tasks(&mut out),
-            File::Uptime => render_uptime(&mut out),
+            File::Cmdline(target) => render_cmdline(target),
+            File::Stat(target) => {
+                let mut out = String::with_capacity(128);
+                render_stat(&mut out, target)?;
+                Ok(out.into_bytes())
+            }
+            File::Status(target) => {
+                let mut out = String::with_capacity(512);
+                render_status(&mut out, target)?;
+                Ok(out.into_bytes())
+            }
+            File::CpuInfo => {
+                let mut out = String::with_capacity(256);
+                render_cpuinfo(&mut out);
+                Ok(out.into_bytes())
+            }
+            File::MemInfo => {
+                let mut out = String::with_capacity(512);
+                render_meminfo(&mut out);
+                Ok(out.into_bytes())
+            }
+            File::Mounts => {
+                let mut out = String::with_capacity(256);
+                render_mounts(&mut out);
+                Ok(out.into_bytes())
+            }
+            File::NetArp => {
+                let mut out = String::with_capacity(512);
+                render_net_arp(&mut out);
+                Ok(out.into_bytes())
+            }
+            File::NetDev => {
+                let mut out = String::with_capacity(256);
+                render_net_dev(&mut out);
+                Ok(out.into_bytes())
+            }
+            File::Tasks => {
+                let mut out = String::with_capacity(1024);
+                render_tasks(&mut out);
+                Ok(out.into_bytes())
+            }
+            File::Uptime => {
+                let mut out = String::with_capacity(32);
+                render_uptime(&mut out);
+                Ok(out.into_bytes())
+            }
             File::Version => {
+                let mut out = String::with_capacity(64);
                 // The real crate version (`Cargo.toml` is the single source),
                 // machine tag and the constant build number.
                 let _ = writeln!(out, "pagh {} (riscv64) #1", env!("CARGO_PKG_VERSION"));
+                Ok(out.into_bytes())
             }
         }
-        out.into_bytes()
     }
 
-    /// Re-render and publish the new snapshot.
-    fn refresh(&self) {
-        let rendered = self.render();
+    /// Re-render and publish the new snapshot. An entry that disappeared between
+    /// `lookup` and this read is `NotFound` (`-ENOENT`), not an empty file.
+    fn refresh(&self) -> VfsResult<()> {
+        let rendered = self.render()?;
         *self.buf.lock() = Some(rendered);
+        Ok(())
     }
 
     /// Render only if this node has no snapshot yet (a `size()` before the
     /// first `read`, or a read that started past offset 0).
-    fn ensure_rendered(&self) {
+    fn ensure_rendered(&self) -> VfsResult<()> {
         let missing = self.buf.lock().is_none();
         if missing {
-            self.refresh();
+            self.refresh()?;
         }
+        Ok(())
     }
 }
 
 impl VfsNode for ProcFile {
     fn name(&self) -> &str {
-        self.name
+        file_name(self.file)
     }
 
     fn is_directory(&self) -> bool {
@@ -256,10 +511,11 @@ impl VfsNode for ProcFile {
     fn read(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
         if offset == 0 {
             // Start of a reading pass: show current state.
-            self.refresh();
+            self.refresh()?;
         } else {
-            // A continuation keeps the snapshot it started with.
-            self.ensure_rendered();
+            // A continuation keeps the snapshot it started with, and a missing
+            // one (a first read at a nonzero offset) is rendered now.
+            self.ensure_rendered()?;
         }
         let guard = self.buf.lock();
         let Some(data) = guard.as_ref() else {
@@ -275,7 +531,11 @@ impl VfsNode for ProcFile {
     }
 
     fn size(&self) -> u64 {
-        self.ensure_rendered();
+        // A gone entry has no length; the following `read` is what reports
+        // `-ENOENT`, so `fstat` seeing 0 here is the harmless half of the race.
+        if self.ensure_rendered().is_err() {
+            return 0;
+        }
         self.buf.lock().as_ref().map_or(0, |data| data.len() as u64)
     }
 
@@ -294,7 +554,259 @@ impl VfsNode for ProcFile {
     }
 }
 
-// ─── renderers ─────────────────────────────────────────────────────────────
+// ─── per-task renderers ────────────────────────────────────────────────────
+
+/// Everything a per-pid renderer needs from the process table, copied out in one
+/// `peek` so the table lock is never held while formatting.
+#[derive(Clone, Copy)]
+struct ProcessView {
+    name: RunName,
+    ppid: u64,
+    main_tid: u64,
+    satp: usize,
+    asid: usize,
+    cmdline: Cmdline,
+}
+
+/// A live process's view, or `None` for a zombie/missing pid.
+fn process_view(pid: u64) -> Option<ProcessView> {
+    process::peek(pid, |process| {
+        if !process.ready || process.threads == 0 {
+            return None;
+        }
+        Some(ProcessView {
+            name: process.name,
+            ppid: process.ppid,
+            main_tid: process.main_tid,
+            satp: process.satp,
+            asid: process.asid,
+            cmdline: process.cmdline,
+        })
+    })
+    .flatten()
+}
+
+/// Aggregate view of one process's live threads.
+#[derive(Clone, Copy)]
+struct Aggregate {
+    state_char: char,
+    state_word: &'static str,
+    switches: u64,
+    work: u64,
+    live_threads: usize,
+    /// The main thread's scheduler row, when it is still live (it can have
+    /// exited while `clone` children keep the process alive).
+    main: Option<TaskInfo>,
+}
+
+fn aggregate(pid: u64, main_tid: u64) -> Aggregate {
+    let mut ids = [0u64; scheduler::MAX_TASKS];
+    let count = scheduler::group_threads(pid, &mut ids);
+    let mut aggregate = Aggregate {
+        state_char: 'Z',
+        state_word: "zombie",
+        switches: 0,
+        work: 0,
+        live_threads: 0,
+        main: None,
+    };
+    let mut rank = 0u8;
+    for id in &ids[..count] {
+        let Some(info) = scheduler::task_info(*id) else {
+            continue;
+        };
+        aggregate.live_threads += 1;
+        aggregate.switches = aggregate.switches.saturating_add(info.switches);
+        aggregate.work = aggregate.work.saturating_add(info.counter);
+        let (state_rank, state_char, state_word) = match info.state {
+            State::Running => (4u8, 'R', "running"),
+            State::Ready => (3, 'R', "ready"),
+            State::Blocked => (2, 'S', "blocked"),
+            State::Stopped => (1, 'T', "stopped"),
+            State::Exited | State::Free => (0, 'Z', "zombie"),
+        };
+        if state_rank > rank {
+            rank = state_rank;
+            aggregate.state_char = state_char;
+            aggregate.state_word = state_word;
+        }
+        if info.id == main_tid {
+            aggregate.main = Some(info);
+        }
+    }
+    aggregate
+}
+
+fn state_char(state: State) -> char {
+    match state {
+        State::Running | State::Ready => 'R',
+        State::Blocked => 'S',
+        State::Stopped => 'T',
+        State::Exited | State::Free => 'Z',
+    }
+}
+
+fn state_word(state: State) -> &'static str {
+    match state {
+        State::Running => "running",
+        State::Ready => "ready",
+        State::Blocked => "blocked",
+        State::Stopped => "stopped",
+        State::Exited | State::Free => "zombie",
+    }
+}
+
+/// `pid (comm) ...` needs a comm without spaces or parentheses; everything else
+/// becomes `_` so one field cannot be mistaken for two.
+fn comm_text(name: &str) -> String {
+    name.chars()
+        .take(64)
+        .map(|character| {
+            if character.is_ascii_graphic() && character != '(' && character != ')' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// `/proc/<pid>/status` and `/proc/kthreads/<tid>/status`.
+///
+/// Key/value lines, Linux's spelling where the value is real. The process view
+/// aggregates the live threads: `State` is the most "awake" state any thread is
+/// in, `Threads` counts them, `Switches`/`Work` are sums, and `Tid` is the main
+/// thread's scheduler id (a process identity is `Pid`).
+fn render_status(out: &mut String, target: Target) -> VfsResult<()> {
+    match target {
+        Target::Process(pid) => {
+            let Some(view) = process_view(pid) else {
+                return Err(VfsError::NotFound);
+            };
+            let aggregate = aggregate(pid, view.main_tid);
+            let _ = writeln!(out, "Name:\t{}", view.name.as_str());
+            let _ = writeln!(
+                out,
+                "State:\t{} ({})",
+                aggregate.state_char, aggregate.state_word
+            );
+            let _ = writeln!(out, "Tid:\t{}", view.main_tid);
+            let _ = writeln!(out, "Pid:\t{pid}");
+            let _ = writeln!(out, "PPid:\t{}", view.ppid);
+            let _ = writeln!(out, "Threads:\t{}", aggregate.live_threads);
+            let _ = writeln!(out, "Switches:\t{}", aggregate.switches);
+            let _ = writeln!(out, "Work:\t{}", aggregate.work);
+            match aggregate.main {
+                Some(main) => stack_line(out, &main),
+                // The main thread exited while clone children keep the process
+                // alive: there is no single kernel stack to report.
+                None => {
+                    let _ = writeln!(out, "Stack:\t-");
+                }
+            }
+            let _ = writeln!(out, "Satp:\t{:#x} (ASID {})", view.satp, view.asid);
+        }
+        Target::Kthread(tid) => {
+            let Some(info) = scheduler::task_info(tid) else {
+                return Err(VfsError::NotFound);
+            };
+            let _ = writeln!(out, "Name:\t{}", info.name.as_str());
+            let _ = writeln!(
+                out,
+                "State:\t{} ({})",
+                state_char(info.state),
+                state_word(info.state)
+            );
+            let _ = writeln!(out, "Tid:\t{tid}");
+            let _ = writeln!(out, "Pid:\t0");
+            let _ = writeln!(out, "PPid:\t0");
+            let _ = writeln!(out, "Threads:\t1");
+            let _ = writeln!(out, "Switches:\t{}", info.switches);
+            let _ = writeln!(out, "Work:\t{}", info.counter);
+            stack_line(out, &info);
+            // A kernel thread runs on the kernel map; the field is printed
+            // rather than assumed so a future per-task `satp` shows up here.
+            let _ = writeln!(out, "Satp:\t{:#x} (kernel)", info.satp);
+        }
+    }
+    Ok(())
+}
+
+fn stack_line(out: &mut String, info: &TaskInfo) {
+    if info.stack_bytes() == 0 {
+        // The boot thread runs on the linker's stack, not on PMM frames.
+        let _ = writeln!(out, "Stack:\tboot");
+    } else {
+        let _ = writeln!(out, "Stack:\t{} KiB", info.stack_bytes() / 1024);
+    }
+}
+
+/// `/proc/<pid>/stat` and `/proc/kthreads/<tid>/stat`, one line.
+///
+/// The fields are: `id (comm) state ppid threads switches work stack_kib satp`.
+/// This is a documented native subset, not Linux's 52-field record: the kernel
+/// keeps no per-task CPU-time accounting, so `utime`/`stime`-style columns would
+/// be invented zeros. `id` is the pid for a process and the task id for a kernel
+/// thread (which has no pid). `stack_kib` is the main thread's kernel stack, `0`
+/// for the boot thread's linker stack.
+fn render_stat(out: &mut String, target: Target) -> VfsResult<()> {
+    match target {
+        Target::Process(pid) => {
+            let Some(view) = process_view(pid) else {
+                return Err(VfsError::NotFound);
+            };
+            let aggregate = aggregate(pid, view.main_tid);
+            let stack_kib = aggregate.main.map_or(0, |main| main.stack_bytes() / 1024);
+            let _ = writeln!(
+                out,
+                "{} ({}) {} {} {} {} {} {} {:#x}",
+                pid,
+                comm_text(view.name.as_str()),
+                aggregate.state_char,
+                view.ppid,
+                aggregate.live_threads,
+                aggregate.switches,
+                aggregate.work,
+                stack_kib,
+                view.satp
+            );
+        }
+        Target::Kthread(tid) => {
+            let Some(info) = scheduler::task_info(tid) else {
+                return Err(VfsError::NotFound);
+            };
+            let _ = writeln!(
+                out,
+                "{} ({}) {} 0 1 {} {} {} {:#x}",
+                tid,
+                comm_text(info.name.as_str()),
+                state_char(info.state),
+                info.switches,
+                info.counter,
+                info.stack_bytes() / 1024,
+                info.satp
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `/proc/<pid>/cmdline`: the bounded argv snapshot, NUL-separated with a
+/// trailing NUL (Linux's shape). A kernel thread has no argv, so its file is
+/// empty — the same answer Linux gives for a kernel thread.
+fn render_cmdline(target: Target) -> VfsResult<Vec<u8>> {
+    match target {
+        Target::Process(pid) => {
+            let Some(view) = process_view(pid) else {
+                return Err(VfsError::NotFound);
+            };
+            Ok(view.cmdline.as_bytes().to_vec())
+        }
+        Target::Kthread(_) => Ok(Vec::new()),
+    }
+}
+
+// ─── machine-wide renderers ────────────────────────────────────────────────
 //
 // Each renderer is a pure function of kernel state into text: no printing, no
 // locks of its own beyond what the state accessors take, and no allocation
@@ -416,14 +928,14 @@ fn render_net_arp(out: &mut String) {
 /// same snapshot). A pagh extension, not a Linux file: it lists kernel threads
 /// and user threads together, which is what the one table holds.
 fn render_tasks(out: &mut String) {
-    let mut infos = [crate::task::TaskInfo::zeroed(); crate::task::MAX_TASKS];
-    let count = crate::task::snapshot(&mut infos);
-    let stats = crate::task::stats();
+    let mut infos = [TaskInfo::zeroed(); scheduler::MAX_TASKS];
+    let count = scheduler::snapshot(&mut infos);
+    let stats = scheduler::stats();
     let _ = writeln!(
         out,
         "tasks: {}/{} live, {} ready, {} ticks, {} switches, {} reaps, {} clock",
         stats.live_tasks,
-        crate::task::MAX_TASKS,
+        scheduler::MAX_TASKS,
         stats.ready_tasks,
         stats.ticks,
         stats.switches,

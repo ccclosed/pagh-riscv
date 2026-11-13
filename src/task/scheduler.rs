@@ -496,6 +496,10 @@ pub struct TaskInfo {
     pub stack_base: usize,
     /// Stack top, `0` for the boot thread.
     pub stack_top: usize,
+    /// Process group tag (`0` for a kernel thread): the task's process id.
+    pub group: u64,
+    /// `satp` the hart runs with while this task executes (`0` = kernel map).
+    pub satp: usize,
 }
 
 impl TaskInfo {
@@ -511,6 +515,8 @@ impl TaskInfo {
             switches: 0,
             stack_base: 0,
             stack_top: 0,
+            group: 0,
+            satp: 0,
         }
     }
 
@@ -1582,26 +1588,90 @@ pub fn snapshot(out: &mut [TaskInfo]) -> usize {
         if count == out.len() {
             break;
         }
-        let t = task(slot);
-        // SAFETY: slot is in range and the scheduler lock is held; every field
-        // is plain data (the counter is atomic), copied out so the listing
-        // cannot observe a later change.
+        // SAFETY: slot is in range and the scheduler lock is held.
         unsafe {
-            if (*t).state == State::Free {
+            if (*task(slot)).state == State::Free {
                 continue;
             }
-            out[count] = TaskInfo {
-                slot,
-                id: (*t).id,
-                name: (*t).name,
-                state: (*t).state,
-                counter: (*t).counter.load(Ordering::Relaxed),
-                switches: (*t).switches,
-                stack_base: (*t).stack_base,
-                stack_top: (*t).stack_top,
-            };
+            out[count] = info_at(slot);
         }
         count += 1;
+    }
+    count
+}
+
+/// Copy one task's description out of the table.
+///
+/// # Safety
+///
+/// `slot < MAX_TASKS`; the caller holds the scheduler lock (or masks interrupts
+/// and accepts a snapshot of a task that cannot switch while the hart is here).
+unsafe fn info_at(slot: usize) -> TaskInfo {
+    let t = task(slot);
+    TaskInfo {
+        slot,
+        id: (*t).id,
+        name: (*t).name,
+        state: (*t).state,
+        counter: (*t).counter.load(Ordering::Relaxed),
+        switches: (*t).switches,
+        stack_base: (*t).stack_base,
+        stack_top: (*t).stack_top,
+        group: (*t).group,
+        satp: (*t).satp,
+    }
+}
+
+/// Description of the live thread with this id, or `None` when no such thread is
+/// running.
+///
+/// "Live" excludes `Exited`: an exited thread keeps its slot as evidence for the
+/// reaper but is no longer a program a reader could observe, which is exactly
+/// the `-ENOENT` `/proc` needs.
+pub fn task_info(id: u64) -> Option<TaskInfo> {
+    let _mask = InterruptsOff::new();
+    let _sched = SCHED.lock();
+    for slot in 0..MAX_TASKS {
+        // SAFETY: slot is in range and the scheduler lock is held.
+        unsafe {
+            let t = task(slot);
+            if (*t).id == id
+                && matches!(
+                    (*t).state,
+                    State::Ready | State::Running | State::Blocked | State::Stopped
+                )
+            {
+                return Some(info_at(slot));
+            }
+        }
+    }
+    None
+}
+
+/// Ids of the live kernel threads (tasks with no process tag), copied into
+/// `out`. Used by `/proc/kthreads`; user threads belong to a process and are
+/// listed through it.
+pub fn kthread_ids(out: &mut [u64]) -> usize {
+    let _mask = InterruptsOff::new();
+    let _sched = SCHED.lock();
+    let mut count = 0usize;
+    for slot in 0..MAX_TASKS {
+        if count == out.len() {
+            break;
+        }
+        // SAFETY: slot is in range and the scheduler lock is held.
+        unsafe {
+            let t = task(slot);
+            if (*t).group == 0
+                && matches!(
+                    (*t).state,
+                    State::Ready | State::Running | State::Blocked | State::Stopped
+                )
+            {
+                out[count] = (*t).id;
+                count += 1;
+            }
+        }
     }
     count
 }

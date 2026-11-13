@@ -15,7 +15,7 @@ checkout собирается **без** кросс-компилятора.
 | `exec.rs` / `exec-child.elf` | цель `execve`: проверяет, что ядро собрало `argv[1] = "exec-arg"` и `envp[0] = "PWD=/mnt"`, печатает `abi: exec ok argc=2 argv=exec-arg env=PWD=/mnt`, выходит 0 | замена образа/стека/регистров при `execve`, сохранение pid/ppid/fd, сброс обработчиков сигналов |
 | `stack.rs` / `stack.elf` | рекурсивная цепочка `descend`: 40 уровней по 4 KiB (160 KiB), в каждом уровне `sd` в дно кадра; печатает `stack: deep recursion ok` и выходит 0 | деманд-рост user-стека: первые ~96 KiB ниже начального окна обязаны быть домаплены ядром, иначе первый же store за `USER_STACK_BASE` убил бы программу |
 | `stack-over.rs` / `stack-over.elf` | та же цепочка на 300 уровней (1.2 MiB); если она **вернётся**, выходит 111 | потолок 1 MiB на процесс: рост обязан упереться в guard ниже `USER_STACK_FLOOR` и умереть `store page fault`, не съев PMM |
-| `proc.rs` / `proc.elf` | читает синтетический `/proc` обычными syscall'ами: `openat`+`getdents64` на `/proc` (семь записей с `d_type`, `net/` — каталог) и `/proc/net` (`arp`+`dev`), `fstat` (regular file 0o644, `size()` = числу прочитанных байт), чтение кусками по 7 B с `lseek(0)` и побайтовым сравнением (`version`), содержимое `meminfo` (`MemTotal`/`MemFree`, `free <= total`), `uptime`, `tasks`, `mounts`, `net/dev` (NIC есть или честно «no interface»), read-only-отказы (`mkdirat`/`unlinkat`/`write` → `-ENOTSUP`) и `-ENOENT` на неизвестные имена; печатает `proc: … ok` и выходит 0, любая ошибка — свой ненулевой код и строка `proc: FAIL` | userland-доступ к `/proc` через native ABI; снимок на проход чтения (`size`/`read` согласованы); read-only контракт синтетической ФС |
+| `proc.rs` / `proc.elf` | читает синтетический `/proc` обычными syscall'ами: `openat`+`getdents64` на `/proc` (девять статических записей с `d_type`, `self` — симлинк, `kthreads/` и `net/` — каталоги, плюс свой pid) и `/proc/net` (`arp`+`dev`), `fstat` (regular file 0o644, `size()` = числу прочитанных байт), чтение кусками по 7 B с `lseek(0)` и побайтовым сравнением (`version`), содержимое `meminfo` (`MemTotal`/`MemFree`, `free <= total`), `uptime`, `tasks`, `mounts`, `net/dev` (NIC есть или честно «no interface»), read-only-отказы (`mkdirat`/`unlinkat`/`write` → `-ENOTSUP`) и `-ENOENT` на неизвестные имена; **per-pid**: `readlink("/proc/self")` = `getpid()`, `/proc/self/{status,stat,cmdline}` совпадают с `/proc/<pid>/*`, `fork`-ребёнок читается по pid, пока жив, а после `wait4` его pid — `-ENOENT`, `/proc/kthreads/{0,1}` — shell/idle; печатает `proc: … ok` и выходит 0, любая ошибка — свой ненулевой код и строка `proc: FAIL` | userland-доступ к `/proc` через native ABI; снимок на проход чтения (`size`/`read` согласованы); read-only контракт синтетической ФС; per-pid namespace и `self` |
 | `stack-fork.rs` / `stack-fork.elf` | та же цепочка, но на 30-м уровне (когда ниже начального окна уже выросли ~14 страниц) вызывается `fork(1000)`; родитель ждёт `wait4`, ребёнок доходит до конца на своей копии и печатает `stack: fork child ok`, родитель — `stack: fork parent ok`, оба выходят 0 (при ошибке fork/wait — 9) | `fork` копирует именно `stack_low..USER_STACK_BASE`, а `wait4` возвращает выросшие кадры ребёнка в PMM; рост продолжается и в ребёнке |
 | `user.ld` | линковка: `_start` = `0x1_0000`, PT_LOAD-раскладка | совпадает с окном из `src/user/elf.rs` |
 
@@ -111,8 +111,35 @@ proc: net ok
 proc: directory ok
 proc: readonly ok
 proc: missing ok
+proc: self ok
+proc: pid ok
+proc: kthreads ok
+proc: fork ok
 proc: done
 run: proc exited with code 0
 pagh:rv64> cat /proc/version
-pagh 0.22.0 (riscv64) #1
+pagh 0.23.0 (riscv64) #1
+pagh:rv64> cat /proc/self/status
+Name:	shell
+State:	R (running)
+Tid:	0
+Pid:	0
+PPid:	0
+Threads:	1
+Switches:	0
+Work:	0
+Stack:	boot
+Satp:	0x8000000000080d1b (kernel)
+pagh:rv64> stat /proc/self
+  path:  /proc/self
+  name:  self
+  type:  symbolic link
+  mode:  0777
+  size:  10 bytes
+  inode: 0
+  links: 1
+  target: kthreads/0
+pagh:rv64> ls /proc/kthreads
+0/
+1/
 ```

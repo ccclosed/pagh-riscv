@@ -367,6 +367,62 @@ impl RunName {
     }
 }
 
+/// Longest command line kept in a [`Process`]: the NUL-separated entries and the
+/// terminating NUL together.
+pub(crate) const CMDLINE_CAPACITY: usize = 128;
+
+/// A bounded snapshot of the `argv` the kernel built the entry frame from.
+///
+/// `/proc/<pid>/cmdline` reads it. It is a *copy* taken at `run`/`execve`, not a
+/// live view of the user stack: a program that rewrites its own `argv` does not
+/// change this file, and the rest of the original argv lives only on the user
+/// stack (the kernel keeps no second copy). Entries are separated by NUL and the
+/// snapshot ends in NUL; a command line longer than [`CMDLINE_CAPACITY`] is cut
+/// and the last kept entry is still terminated, so the file never ends
+/// mid-string. Empty means "no argv snapshot" — a kernel thread, or a process
+/// that exec'd with an empty argv.
+#[derive(Clone, Copy)]
+pub(crate) struct Cmdline {
+    bytes: [u8; CMDLINE_CAPACITY],
+    len: u8,
+}
+
+impl Cmdline {
+    pub(crate) const fn empty() -> Self {
+        Cmdline {
+            bytes: [0; CMDLINE_CAPACITY],
+            len: 0,
+        }
+    }
+
+    /// Join `args` with NULs, terminate with one, and truncate to the cap.
+    pub(crate) fn from_args(args: &[&str]) -> Self {
+        let mut out = Cmdline::empty();
+        // One byte is always reserved for the terminating NUL.
+        let cap = CMDLINE_CAPACITY - 1;
+        for arg in args {
+            if out.len as usize >= cap {
+                break;
+            }
+            for &byte in arg.as_bytes() {
+                if out.len as usize >= cap {
+                    break;
+                }
+                out.bytes[out.len as usize] = byte;
+                out.len += 1;
+            }
+            out.bytes[out.len as usize] = 0;
+            out.len += 1;
+        }
+        out
+    }
+
+    /// The bytes `/proc/<pid>/cmdline` returns (already NUL-terminated).
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+}
+
 /// Next process id. Monotonic for the whole boot; it is also the futex/signal
 /// scope key and the scheduler group tag, so a stale entry from a killed process
 /// can never match a future one.
@@ -605,6 +661,7 @@ fn run_source<S: ImageSource + ?Sized>(
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
     let mut proc = Process::new(pid, 0, space.root, space.satp, space.asid);
     proc.name = RunName::new(argv0);
+    proc.cmdline = Cmdline::from_args(&argv_strings);
     proc.entry = loaded.entry;
     proc.sp = built.sp;
     proc.argc = built.argc;
@@ -1554,6 +1611,8 @@ struct ForkSnapshot {
     argc: usize,
     argv: usize,
     name: RunName,
+    /// Bounded argv snapshot; the child inherits its parent's command line.
+    cmdline: Cmdline,
     image_count: usize,
     heap_end: usize,
     heap_count: usize,
@@ -1575,6 +1634,7 @@ impl ForkSnapshot {
             argc: run.argc,
             argv: run.argv,
             name: run.name,
+            cmdline: run.cmdline,
             image_count,
             heap_end: run.heap_end,
             heap_count: run.heap_count,
@@ -1615,6 +1675,7 @@ fn build_fork_into(child_slot: usize, snapshot: &ForkSnapshot) -> Result<(), isi
         child.argc = snapshot.argc;
         child.argv = snapshot.argv;
         child.name = snapshot.name;
+        child.cmdline = snapshot.cmdline;
         child.heap_end = snapshot.heap_end;
         child.heap_count = snapshot.heap_count;
         child.mmap_regions = snapshot.mmap_regions;
@@ -1909,6 +1970,7 @@ pub(crate) fn execve(
         proc.argc = built.argc;
         proc.argv = built.argv;
         proc.name = RunName::new(argv_refs.first().copied().unwrap_or(path));
+        proc.cmdline = Cmdline::from_args(&argv_refs);
         proc.threads = 1;
         proc.main_tid = scheduler::current_id();
         proc.main_code = None;

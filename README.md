@@ -116,15 +116,36 @@ peer-адрес в `sockaddr_in`; ожидание опрашивает NIC до
 (TCP-сервер: `mke2fs -d` + QEMU `hostfwd`); транскрипты —
 `docs/live-sockets.txt`, `docs/live-udp.txt`, `docs/live-tcp-server.txt`.
 
+Версия **0.23.0** добавляет **per-pid `/proc`**: `/proc/<pid>/{status,stat,cmdline}`
+для каждого процесса, у которого есть живой поток, `/proc/self` — символическую
+ссылку на собственную запись читателя (`<pid>` для user-потока) и
+`/proc/kthreads/<tid>/{status,stat}` для kernel-потоков, у которых pid нет
+(шелл, idle, демо-потоки) — именно поэтому `cat /proc/self/status` работает и в
+шелле. `<pid>` — это id из `getpid()`, а не слот планировщика; `status` отдаёт
+агрегат по живым потокам (`State` — самое «проснувшееся» состояние, `Threads`,
+суммы `Switches`/`Work`, `Tid` главного потока, стек, `satp`/ASID), `stat` —
+документированную нативную строку `id (comm) state ppid threads switches work
+stack_kib satp` (без выдуманных utime/stime: учёта CPU-времени в ядре нет), а
+`cmdline` — argv, скопированный при `run`/`execve` с потолком 128 байт
+(NUL-разделители и завершающий NUL, как в Linux; это снимок, а не живая память
+программы, и `fork` его копирует ребёнку). Мёртвый/переиспользованный pid —
+`-ENOENT`, зомби в этом срезе не выставляются (его забирает `wait4`); прав/uid
+нет — читаются все живые записи. `ls /proc` показывает живые pid'ы, `ls
+/proc/kthreads` — kernel-потоки. Проверки: расширенная `SELFTEST user-proc-fs`
+(`/proc/self` → свой pid, живой ребёнок по pid, `/proc/kthreads/0` — shell,
+reaped child → `-ENOENT`) и serial-smoke (self status/stat/readlink, kthreads,
+`/proc/0` → not found). Транскрипт — `docs/live-proc-pid.txt`.
+
 Версия **0.22.0** добавляет **`/proc`** — синтетическую read-only файловую
 систему с живым состоянием ядра: `cat /proc/meminfo` (кадры PMM, куча, Sv39),
 `cat /proc/uptime`, `cat /proc/tasks` (таблица планировщика: kernel- и
 user-потоки), `cat /proc/mounts` (таблица монтирований), `cat /proc/version`,
 `cat /proc/cpuinfo`, `cat /proc/net/dev` и `cat /proc/net/arp` (интерфейс,
-DHCP-lease и живой ARP-кэш). Содержимое рендерится при чтении: `read` с
+DHCP-lease и живой ARP-кэш; в 0.23.0 — ещё per-pid `status`/`stat`/`cmdline`
+и `/proc/kthreads`). Содержимое рендерится при чтении: `read` с
 offset 0 — новый снимок, следующие offset'ы продолжают его, `size()` равен
 длине рендера. Запись, `mkdir`, `unlink` — `-ENOTSUP`, неизвестный путь —
-`-ENOENT`; per-pid дерева и `/proc/sys` в этом срезе нет. `/proc`
+`-ENOENT`. `/proc`
 монтируется из `vfs::init`, поэтому существует и без диска, и читается оттуда
 и шеллом (`ls`/`cat`/`stat` — обычные команды), и userland'ом обычными
 `openat`/`read`/`getdents64`: это доказывают встроенная фикстура `run proc`,
@@ -284,13 +305,13 @@ SELFTEST SUMMARY: 7/7 passed
 | Блочное устройство | готово | virtio-mmio (modern virtio 1.x, version 2), polled: окна транспорта находятся через DTB, read/write/flush, опрос завершения с ограничением и FAILED после таймаута; `-global virtio-mmio.force-legacy=false` обязателен (иначе QEMU даёт legacy-транспорт) | `src/drivers/block.rs`, `src/drivers/virtio_mmio.rs` |
 | Файловая система (ext2) | готово | чтение/запись файлов (direct + single/double indirect), truncate, каталоги, create/unlink/mkdir/rmdir/rename, симлинки; совместимо с образом хостового `mkfs.ext2 -t ext2`; форматируется только пустое устройство (MBR/GPT/чужие данные — отказ с причиной); журнала/WAL нет | `src/fs/ext2/`, `src/fs/format_policy.rs` |
 | VFS | готово | `VfsNode`, синтетический корень, монтирования `/proc` (из `vfs::init`) и `/mnt` (из boot-пути), два примитива разрешения путей (`lookup_path` без последней симлинки / `walk` с переходом и бюджетом), тип ФС у узла (`fs_type`) для `/proc/mounts` | `src/vfs/mod.rs` |
-| `/proc` (синтетический) | готово | read-only файлы живого состояния: `cpuinfo`, `meminfo`, `mounts`, `tasks`, `uptime`, `version`, `net/{dev,arp}`; контент рендерится при чтении (`read` с offset 0 — новый снимок, продолжение — тот же), `size()` = длина рендера; write/mkdir/unlink — `-ENOTSUP`, неизвестный путь — `-ENOENT`; работает без диска; читается шеллом (`ls`/`cat`/`stat`) и userland'ом (`openat`/`read`/`getdents64`) | `src/vfs/proc.rs` |
+| `/proc` (синтетический, 0.23.0 — per-pid) | готово | read-only файлы живого состояния: `cpuinfo`, `meminfo`, `mounts`, `tasks`, `uptime`, `version`, `net/{dev,arp}`; `kthreads/<tid>/{status,stat}` для kernel-потоков и `<pid>/{status,stat,cmdline}` для процессов (`<pid>` = `getpid()`, `self` — симлинк на свою запись, мёртвый id — `-ENOENT`); контент рендерится при чтении (`read` с offset 0 — новый снимок, продолжение — тот же), `size()` = длина рендера; write/mkdir/unlink — `-ENOTSUP`; работает без диска; читается шеллом (`ls`/`cat`/`stat`) и userland'ом (`openat`/`read`/`getdents64`) | `src/vfs/proc.rs` |
 | Планировщик, потоки ядра (M6a) | готово | контекстный switch (callee-saved ABI), до 16 слотов (14 user-потоков на процесс), round-robin, квант 8 тиков, стек 24 KiB (debug 96 KiB) + guard из PMM, состояния `Ready/Running/Blocked/Stopped/Exited`, `block_current`/`wake_task` с тиковым дедлайном, `stop_current`/`continue_task` для job control, `Task::satp` + `install_satp` перед switch, вытеснение тиком таймера из trap-контекста (включая вытеснение U-mode), `tasks`/`spawn`/`yield`; exit возвращает кадры | `src/arch/riscv64/switch.rs`, `src/task/` |
 | User mode, syscalls, ELF, native ABI (M6b) | готово | `sret` в U-mode (`SPP=0`, `SPIE=1`, `SUM=0`, `sscratch`-контракт); **user-стек растёт по требованию**: load/store page fault ниже текущего дна (`Process::stack_low`) мапит и обнуляет страницы до адреса fault'а и повторяет инструкцию, потолок 1 MiB на процесс (64 KiB начального окна + 960 KiB, дно `0x3ff0_0000`), ниже дна — настоящий guard, на котором рекурсия сверх лимита умирает `store page fault`; `fork` копирует выросшие страницы, `execve` сбрасывает границу, teardown возвращает кадры в PMM; нативные потоки `clone`/`gettid`/`set_tid_address`/`exit`/`exit_group`/`futex` (общие Process/root, fd-таблица, heap и mmap; своё ядро-стек и user-стек вызывающего), фьютексы `WAIT`/`WAKE`; процессы `fork`(1000)/`execve`(221)/`wait4`(260)/`getppid`(173): свой Sv39-root/ASID, глубокая копия страниц, наследование fd/pipe/обработчиков, замена образа и статус `wait`, очистка сирот раннером; вход `a0=argc`, `a1=argv`, SysV-кадр `argc/argv/envp` с `argv[0]` как набран и `PWD=<cwd>`; `ecall`-диспетчер: `read`/`write`/`openat`/`close`/`lseek`/`fstat`/`getdents64`/`brk`/`clock_gettime`/`nanosleep`/`uname`/`readlinkat`/`exit`/`sched_yield`/`getpid` + `mkdirat`/`unlinkat`/`symlinkat`/`linkat`/`renameat2`/`fchmodat`/`ftruncate` (мутации через `parent_and_leaf` + `walk(parent, true)`, per-process режим для `fstat`), `sepc+4`, таблица 16 fd на процесс, `copy_from_user`/`copy_to_user` с проверкой `U/R/W` и `SUM` вокруг копии, heap-окно 1 MiB с возвратом кадров; ELF64-загрузчик с откатом кадров и **потоковым чтением** `ImageSource` (сегменты кусками ≤ 512 B, без буфера размером с файл), `run <path> [args...]` до 1 MiB и фикстуры `demo`/`fault`/`spin`/`argv`/`abi`; BSD-сокеты `socket`/`bind`/`connect`/`sendto`/`recvfrom`/`setsockopt`/`getsockopt`/`shutdown` (один TCP-клиент + UDP-сокеты, IPv4-литералы) и маршрутизация `read`/`write`/`close`/`poll` на сокет; POSIX-подобные сигналы `kill`/`tgkill`/`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`/`sigaltstack` (обработчики на процесс: fork копирует, exec сбрасывает; pending/blocked/altstack на поток; user-кадр 736 B с полным `siginfo_t` и `ucontext_t`; `SA_SIGINFO`/`SA_ONSTACK`/`SA_NODEFER`/`SA_RESETHAND`/`SA_RESTART`; job control `SIGSTOP`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU` + `SIGCONT`); synchronous SIGSEGV/SIGILL/SIGBUS/SIGTRAP при установленном обработчике; fault из U без обработчика убивает процесс; таймер вытесняет U-mode | `src/user/`, `src/user/stack.rs`, `src/user/process.rs`, `src/user/signal.rs`, `src/memory/paging.rs`, `userland/` |
 | Сеть (M7) | готово | virtio-net (modern, polled) + свой стек: Ethernet/ARP/IPv4/ICMP/UDP/TCP, DHCP-клиент, DNS-резолвер, `net`/`dhcp`/`ping`/`dns`/`http`; TCP/IP свой, без smoltcp (TLS-клиент — vendored `embedded-tls`, см. `docs/tls.md`). Для userland — один active-open TCP-сокет (`AF_INET`/`SOCK_STREAM`, IPv4-литерал) и UDP-сокеты (`AF_INET`/`SOCK_DGRAM`, `bind`/per-port-очередь/`sendto`/`recvfrom`); syscall'ы сами опрашивают NIC; `read`/`write`/`poll` работают на сокете | `src/net/`, `src/drivers/virtio_net.rs`, `src/user/syscall.rs` |
 | Пакеты (`pkg`) | MVP | нативный установщик (не apt): плоский `index` и `.ppkg` с репозитория по **plain HTTP** (`http://IP:port/`, в QEMU хост — `10.0.2.2`), потоковая загрузка в `/mnt/pkg` кусками 4 KiB, шлюз «размер + SHA-256 из индекса» **до** разбора `PPKG0001`; `kind=app` → `/mnt/bin/<name>`, `applet-bundle` → `/mnt/bin/paghbox` + симлинки; манифест в `/mnt/pkg/<name>.manifest`; TLS-транспорта, OpenPGP и apt у `pkg` по-прежнему нет | `src/pkg/` |
 | apt / OpenPGP | **нет** | apt намеренно не подключён, пока нет проверки подписей Debian (OpenPGP); `pkg` — отдельный нативный путь для портов. TLS 1.3-клиент есть с 0.19.0 (шелл `https`; 0.21.0 — userland-сессии 1100–1103), но `pkg` его не использует | — |
-| Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 4 блока/указателя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 15 user-mode (включая `user-tls-abi` — `getrandom` и fail-closed матрица 1100–1103; `user-proc-fs` — `userland/proc.elf` читает `/proc` через `openat`/`read`/`getdents64`, включая read-only-отказы и `-ENOENT`; ABI-фикстуры `argv`/`abi` с секциями потоков/фьютексов, сигналов и TCP-сервера: bind/listen/nonblocking accept/EAGAIN/dup-ENOTSUP; `user-stack-grows` — цепочка 160 KiB возвращается через `stack: deep recursion ok`, `user-stack-cap` — цепочка 1.2 MiB умирает `store page fault` на guard-странице, `user-stack-fork` — fork на выросшем стеке, обе стороны доходят до конца, `wait4` возвращает pid; 15/15 с диском, 13/15 + 2 SKIP без `/mnt`) + 12 сети (идемпотентность по ledger'у, `net-tls-session-gate`), QEMU-smoke в шести режимах (serial, ramfb, диск-fresh, диск-existing, net, keyboard), установка пакета проверяется отдельным тестом `pkg`, живые сокетные прогоны — `tools/test_sockets.py` (TCP-клиент), `tools/test_udp.py` (UDP), `tools/test_tcp_server.py` (TCP-сервер: `mke2fs -d` + QEMU `hostfwd`) и `tools/test_tls.py` (живой TLS 1.3 + userland `https_get`; libpagh-фикстуры, не в CI); проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/net/selftest.rs`, `src/pkg/`, `.github/smoke.py`, `tools/` |
+| Тесты | готово | host-тестов нет; in-QEMU `selftest` — 7 памяти + 4 блока/указателя + 11 ext2/VFS + 4 прерываний/таймера + 5 планировщика + 15 user-mode (включая `user-tls-abi` — `getrandom` и fail-closed матрица 1100–1103; `user-proc-fs` — `userland/proc.elf` читает `/proc` через `openat`/`read`/`getdents64`, включая read-only-отказы, `-ENOENT`, `/proc/self`/свой pid, живой ребёнок по pid и reaped child → `-ENOENT`; ABI-фикстуры `argv`/`abi` с секциями потоков/фьютексов, сигналов и TCP-сервера: bind/listen/nonblocking accept/EAGAIN/dup-ENOTSUP; `user-stack-grows` — цепочка 160 KiB возвращается через `stack: deep recursion ok`, `user-stack-cap` — цепочка 1.2 MiB умирает `store page fault` на guard-странице, `user-stack-fork` — fork на выросшем стеке, обе стороны доходят до конца, `wait4` возвращает pid; 15/15 с диском, 13/15 + 2 SKIP без `/mnt`) + 12 сети (идемпотентность по ledger'у, `net-tls-session-gate`), QEMU-smoke в шести режимах (serial, ramfb, диск-fresh, диск-existing, net, keyboard), установка пакета проверяется отдельным тестом `pkg`, живые сокетные прогоны — `tools/test_sockets.py` (TCP-клиент), `tools/test_udp.py` (UDP), `tools/test_tcp_server.py` (TCP-сервер: `mke2fs -d` + QEMU `hostfwd`) и `tools/test_tls.py` (живой TLS 1.3 + userland `https_get`; libpagh-фикстуры, не в CI); проверка пикселей `tools/font_check.py` | `src/*/selftest.rs`, `src/net/selftest.rs`, `src/pkg/`, `.github/smoke.py`, `tools/` |
 | CI | готово | `fmt`, debug/release build, QEMU-smoke в шести режимах: serial, ramfb, диск-fresh (формат/монтирование/запись), диск-existing (повторная загрузка читает файл), net (DHCP + ping шлюза), keyboard (virtio-keyboard печатает `help`/`halt` через монитор QEMU); во всех приложен virtio-tablet, в keyboard — ещё и virtio-keyboard | `.github/workflows/ci.yml` |
 
 ---
@@ -582,7 +603,7 @@ backspace работает, всё остальное — команды:
 |---|---|
 | `help` | список команд |
 | `mem` | память из device tree **и** статистика PMM и кучи (свободно/всего кадров, диапазон пула, байты кучи) |
-| `selftest` | in-QEMU self-tests: 7 памяти, 4 блока/указателя, 11 ext2/VFS, 4 таймера/PLIC, 5 планировщика, 15 user-mode (включая мутационную половину ABI-фикстуры, сокетную секцию и секцию потоков: `clone`/`gettid`/futex/`exit`/`exit_group`; `user-stack-grows`/`user-stack-cap`/`user-stack-fork` — рост до 1 MiB, guard ниже `USER_STACK_FLOOR` и fork на выросшем стеке; `user-tls-abi` — `getrandom` и fail-closed матрица TLS-вызовов, без сервера; `user-proc-fs` — `userland/proc.elf` читает `/proc` через syscall'ы; с живым сервером на `10.0.2.2:8000` — connect/send/recv/shutdown/EOF, без него — `SKIP`; без `/mnt` два SKIP — `user-run-large-file` и `user-abi-syscalls`, итог 13/15), 12 сети (включая `net-tls-session-gate`); печатает ledger свободных кадров до и после каждого блока |
+| `selftest` | in-QEMU self-tests: 7 памяти, 4 блока/указателя, 11 ext2/VFS, 4 таймера/PLIC, 5 планировщика, 15 user-mode (включая мутационную половину ABI-фикстуры, сокетную секцию и секцию потоков: `clone`/`gettid`/futex/`exit`/`exit_group`; `user-stack-grows`/`user-stack-cap`/`user-stack-fork` — рост до 1 MiB, guard ниже `USER_STACK_FLOOR` и fork на выросшем стеке; `user-tls-abi` — `getrandom` и fail-closed матрица TLS-вызовов, без сервера; `user-proc-fs` — `userland/proc.elf` читает `/proc` через syscall'ы, включая per-pid/self/kthreads и reaped-child `-ENOENT`; с живым сервером на `10.0.2.2:8000` — connect/send/recv/shutdown/EOF, без него — `SKIP`; без `/mnt` два SKIP — `user-run-large-file` и `user-abi-syscalls`, итог 13/15), 12 сети (включая `net-tls-session-gate`); печатает ledger свободных кадров до и после каждого блока |
 | `disk` | блочное устройство: имя, ёмкость, живая проверка чтения сектора 0 |
 | `ls [path]` | листинг каталога (каталоги с `/`) |
 | `cat <path>` | содержимое файла (в том числе синтетические `/proc/*`) |
@@ -617,9 +638,12 @@ backspace работает, всё остальное — команды:
 | `halt` | выключение машины через SBI SRST |
 
 Виртуальный `/proc` — обычные пути для `ls`/`cat`/`stat` и для userland:
-`ls /proc`, `cat /proc/meminfo`, `cat /proc/tasks`, `cat /proc/net/arp`;
-`write`/`mkdir`/`rm` в него отказывают `operation not supported`. Это снимок
-живого состояния на момент чтения, а не файл на диске.
+`ls /proc`, `cat /proc/meminfo`, `cat /proc/tasks`, `cat /proc/net/arp`,
+`ls /proc/kthreads`, `cat /proc/self/status`, `cat /proc/self/stat`,
+`stat /proc/self`. `self` — симлинк: в шелле он ведёт в `kthreads/0` (шелл —
+kernel-поток, pid у него нет), в userland-программе — в её `<pid>`;
+`write`/`mkdir`/`rm` отказывают `operation not supported`. Это снимок живого
+состояния на момент чтения, а не файл на диске.
 
 Истории, автодополнения и стрелок нет — это следующий уровень шелла, а не
 забытая деталь.
@@ -776,12 +800,18 @@ IPv4, ICMP и UDP, а `dhcp`/`dns`/`tcp` — маленькие клиенты. 
   `PROT_NONE` не выражается. `read(0)` неблокирующий (`-EAGAIN`), `getdents64`
   отдаёт снимок каталога на момент `openat`, `openat(... O_CREAT)` игнорирует
   `mode` (в VFS нет `set_mode`).
-* **`/proc` — фиксированный read-only срез.** Семь файлов верхнего уровня
-  (плюс каталог `net/` с `dev` и `arp`) с состоянием, которое ядро уже ведёт;
-  per-pid дерева (`/proc/<pid>`), `/proc/sys`, `/proc/stat` и записи в `/proc`
-  нет. `/proc/uptime` отдаёт `0.00` вторым полем: idle-время ядро не считает.
-  Отдельного `statfs` нет — свободное место показывает `fs`, а `/proc/mounts`
-  перечисляет только монтирования.
+* **`/proc` — фиксированный read-only срез, per-pid только на уровне
+  процесса.** Есть `cpuinfo`, `meminfo`, `mounts`, `tasks`, `uptime`, `version`,
+  `net/{dev,arp}`, `kthreads/<tid>/{status,stat}` и `<pid>/{status,stat,cmdline}`;
+  `/proc/<pid>/task/<tid>`, `/proc/sys`, `/proc/stat` и запись в `/proc`
+  отсутствуют. `cmdline` — снимок argv при `run`/`execve` с потолком 128 байт,
+  а не живая память программы (переписанный программой argv там не виден);
+  `stat` — нативная строка без utime/stime, потому что учёта CPU-времени нет;
+  прав/uid нет — читаются все живые записи; зомби не выставляются (pid мертв
+  для `/proc`, пока `wait4` не забрал статус). `/proc/uptime` отдаёт `0.00`
+  вторым полем: idle-время ядро не считает. Отдельного `statfs` нет —
+  свободное место показывает `fs`, а `/proc/mounts` перечисляет только
+  монтирования.
 * **ELF только статический, без интерпретатора.** Загрузчик понимает
   `ET_EXEC`/`ET_DYN` без `PT_INTERP`; userland — голые `ecall`. `run <path>`
   читает файл *ядром* потоково, частями не больше 512 B, и грузит его в root
@@ -874,7 +904,7 @@ src/net/{dhcp,dns,tcp}.rs      DHCP-клиент, DNS-резолвер, мини
 src/net/selftest.rs            in-QEMU self-tests сети (12 проверок)
 src/net/README.md              дизайн стека: опрос, wire, DHCP/DNS/TCP, чего нет
 src/vfs/mod.rs                 `VfsNode`, синтетический корень, монтирования, lookup_path/walk
-src/vfs/proc.rs                синтетический /proc: рендер живого состояния при чтении (read-only)
+src/vfs/proc.rs                синтетический /proc: живые файлы, per-pid/kthreads, self (read-only)
 userland/{hello,fault,spin,argv,abi,proc}.rs статические RV64-фикстуры + user.ld + build.sh
 userland/README.md             как пересобрать и что доказывает каждая фикстура
 src/memory/README.md           дизайн памяти: кадры, куча, чего нет
@@ -893,6 +923,7 @@ docs/shell.png                 снимок экрана из работающе
 docs/user.png                  снимок run demo / run fault / run spin
 docs/net.png                   снимок net / ping / dns через собственный стек
 docs/live-proc.txt            транскрипт: cat /proc/* и run proc из-под QEMU
+docs/live-proc-pid.txt        транскрипт: /proc/self, kthreads и per-pid /proc
 assets/font8x18.bin            шрифт покрытия 8×18 (8 бит на пиксель)
 tools/run.py                   запуск + screendump + проверка шрифта
 tools/gen_font.py              офлайн-растеризация шрифта в ассет
@@ -933,7 +964,9 @@ network и
 баннер (UART очищает FIFO при инициализации, поэтому команды, отправленные
 раньше, теряются), шлёт `mem`, `hart`, `time`, `echo`, неизвестную команду,
 `run demo`, `cat /proc/version`, `ls /proc`, `cat /proc/meminfo`,
-`cat /proc/tasks`, `stat /proc/meminfo`, `run proc`, `help` и `halt`, и требует,
+`cat /proc/tasks`, `stat /proc/meminfo`, `cat /proc/self/status`,
+`cat /proc/self/stat`, `stat /proc/self`, `ls /proc/kthreads`,
+`cat /proc/0/status`, `run proc`, `help` и `halt`, и требует,
 чтобы после `halt` QEMU завершился с кодом 0. Сетевой режим шлёт `net`,
 `ping 10.0.2.2`, `cat /proc/net/arp` и `halt` и требует `ping: reply from
 10.0.2.2` и ARP-строку `10.0.2.2 … virtio-net0`; дисковый режим fresh

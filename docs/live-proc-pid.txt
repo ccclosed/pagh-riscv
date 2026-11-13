@@ -1,0 +1,129 @@
+# Live per-pid /proc acceptance for pagh-riscv 0.23.0
+# kernel: target/riscv64gc-unknown-none-elf/debug/pagh (debug build, RV64, OpenSBI, QEMU virt)
+#
+# Two boots: serial-only (no disk, no NIC) for the shell namespace view and
+# the `run proc` userland fixture; and a disk boot for the same fixture under
+# `selftest` (where it also forks a peer and reaps it) plus the suite summary.
+# Each line below is real serial output, not edited.
+
+== serial boot: /proc/self, /proc/kthreads, /proc/<pid> ==
+
+$ printf 'ls /proc\nls /proc/kthreads\ncat /proc/self/status\ncat /proc/self/stat\nstat /proc/self\ncat /proc/0/status\nrun proc\n'
+
+   pagh OS — RISC-V (RV64)
+========================================
+boot hart   0
+device tree 0x8fe00000
+memory      0x80000000..0x90000000 (256 MiB)
+timebase    10000000 Hz
+console     NS16550 @ 0x10000000
+pmm         62170/65536 frames free (256 MiB tracked), heap 0 KiB in 0 chunk(s)
+sv39        on, satp=0x8000000000080d24, identity 0x80000000..0x90000000 (RWX below 0x80d24000, RW above), 65549 pages, 13 device
+rtc         goldfish @ 0x101000 - 2026-11-12 21:24:47 UTC
+rtc         raw 0x0712b8c8 0x18e7693d 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
+entropy     32 bytes from /chosen/rng-seed - TLS session keys available
+timer       10 ms ticks (100 Hz, timebase 10000000 Hz)
+plic        0xc000000 context 1, uart irq 10 (rx interrupt on)
+task        16 slots, 96 KiB stack + 4 KiB guard, quantum 8 ticks, timer clock
+virtio-blk: no device
+virtio-input: tablet at 0x10008000, abs X 0..32767, Y 0..32767
+fs          no block device (/mnt not mounted)
+virtio-net: no device
+net         no network device
+
+Type 'help' for the command list.
+
+pagh:rv64> ls /proc
+cpuinfo
+kthreads/
+meminfo
+mounts
+net/
+self
+tasks
+uptime
+version
+pagh:rv64> ls /proc/kthreads
+0/
+1/
+pagh:rv64> cat /proc/self/status
+Name:	shell
+State:	R (running)
+Tid:	0
+Pid:	0
+PPid:	0
+Threads:	1
+Switches:	0
+Work:	0
+Stack:	boot
+Satp:	0x8000000000080d24 (kernel)
+pagh:rv64> cat /proc/self/stat
+0 (shell) R 0 1 0 0 0 0x8000000000080d24
+pagh:rv64> stat /proc/self
+  path:  /proc/self
+  name:  self
+  type:  symbolic link
+  mode:  0777
+  size:  10 bytes
+  inode: 0
+  links: 1
+  target: kthreads/0
+pagh:rv64> cat /proc/0/status
+cat: /proc/0/status: not found
+pagh:rv64> run proc
+proc: version ok
+proc: meminfo ok
+proc: uptime ok
+proc: tasks ok
+proc: mounts ok
+proc: net ok
+proc: directory ok
+proc: readonly ok
+proc: missing ok
+proc: self ok
+proc: pid ok
+proc: kthreads ok
+proc: fork ok
+proc: done
+run: proc exited with code 0
+pagh:rv64> halt
+halt: powering off
+
+== disk boot: the same fixture under selftest, then the suite summary ==
+
+$ printf 'run proc\ncat /proc/self/status\nselftest\n'
+
+pagh:rv64> run proc
+proc: version ok
+proc: meminfo ok
+proc: uptime ok
+proc: tasks ok
+proc: mounts ok
+proc: net ok
+proc: directory ok
+proc: readonly ok
+proc: missing ok
+proc: self ok
+proc: pid ok
+proc: kthreads ok
+proc: fork ok
+proc: done
+run: proc exited with code 0
+pagh:rv64> cat /proc/self/status
+Name:	shell
+State:	R (running)
+Tid:	0
+Pid:	0
+PPid:	0
+Threads:	1
+Switches:	5
+Work:	0
+Stack:	boot
+Satp:	0x8000000000080d24 (kernel)
+
+SELFTEST user-tls-abi PASS
+SELFTEST user-proc-fs PASS
+SELFTEST SUMMARY (user): 15/15 passed
+[selftest] user PMM hygiene: free frames 61994 -> 61994
+SELFTEST SUMMARY (net): 12/12 passed
+halt: powering off

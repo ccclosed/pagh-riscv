@@ -1314,6 +1314,13 @@ fn user_proc_fs(_buf: &mut Vec<u8>) -> Outcome {
         &b"proc: directory ok\n"[..],
         &b"proc: readonly ok\n"[..],
         &b"proc: missing ok\n"[..],
+        // The per-pid half: /proc/self resolves to this process, a live peer is
+        // addressable by pid, kernel threads live under /proc/kthreads, and a
+        // reaped child's pid is -ENOENT again.
+        &b"proc: self ok\n"[..],
+        &b"proc: pid ok\n"[..],
+        &b"proc: kthreads ok\n"[..],
+        &b"proc: fork ok\n"[..],
         &b"proc: done\n"[..],
     ] {
         if !captured_contains(&captured, marker) {

@@ -24,7 +24,7 @@
 
 use crate::sync::Spinlock;
 use crate::user::elf::Loaded;
-use crate::user::{Exit, MmapRegion, RunName, MAX_MMAP_REGIONS, USER_HEAP_PAGES};
+use crate::user::{Cmdline, Exit, MmapRegion, RunName, MAX_MMAP_REGIONS, USER_HEAP_PAGES};
 
 /// Most processes one boot may have live at once.
 ///
@@ -49,6 +49,9 @@ pub(crate) struct Process {
     pub asid: usize,
     /// Display/debug name (`argv[0]`, truncated to 32 bytes).
     pub name: RunName,
+    /// Bounded snapshot of the argv the kernel built the entry frame from
+    /// (`/proc/<pid>/cmdline`); see [`Cmdline`].
+    pub cmdline: Cmdline,
     /// User entry point and initial stack frame, used by `user_task`.
     pub entry: usize,
     pub sp: usize,
@@ -104,6 +107,7 @@ impl Process {
             satp,
             asid,
             name: RunName::empty(),
+            cmdline: Cmdline::empty(),
             entry: 0,
             sp: 0,
             argc: 0,
@@ -308,6 +312,31 @@ pub(crate) fn ready_pids(out: &mut [u64]) -> usize {
         }
         count
     })
+}
+
+/// Pids of processes that still have at least one live thread, in table order.
+///
+/// `/proc` lists these; a zombie (no live thread, waiting for `wait4`) is not a
+/// running program and is not exposed as a `/proc/<pid>` directory.
+pub(crate) fn live_pids(out: &mut [u64]) -> usize {
+    with_table(|table| {
+        let mut count = 0usize;
+        for process in table.iter().flatten() {
+            if count == out.len() {
+                break;
+            }
+            if process.ready && process.threads > 0 {
+                out[count] = process.pid;
+                count += 1;
+            }
+        }
+        count
+    })
+}
+
+/// True when `pid` names a process with at least one live thread.
+pub(crate) fn is_live(pid: u64) -> bool {
+    peek(pid, |process| process.ready && process.threads > 0).unwrap_or(false)
 }
 
 /// Force a process to a zombie after its threads were retired by

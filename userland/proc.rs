@@ -93,6 +93,13 @@ const SYS_LSEEK: usize = 62;
 const SYS_FSTAT: usize = 80;
 const SYS_MKDIRAT: usize = 34;
 const SYS_UNLINKAT: usize = 35;
+const SYS_READLINKAT: usize = 78;
+const SYS_NANOSLEEP: usize = 101;
+const SYS_GETPID: usize = 172;
+const SYS_GETTID: usize = 178;
+const SYS_FORK: usize = 1000;
+const SYS_WAIT4: usize = 260;
+const SYS_EXIT: usize = 93;
 
 const O_RDONLY: usize = 0;
 const O_WRONLY: usize = 1;
@@ -112,6 +119,14 @@ struct Stat {
 
 const KIND_FILE: u32 = 0;
 const KIND_DIR: u32 = 1;
+const KIND_SYMLINK: u32 = 2;
+
+/// `nanosleep(101)`'s `Timespec` (16 bytes: seconds, nanoseconds).
+#[repr(C)]
+struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
 
 /// Exit codes are the verdict: each failing check has its own.
 mod code {
@@ -126,6 +141,10 @@ mod code {
     pub const READONLY: i32 = 18;
     pub const MISSING: i32 = 19;
     pub const OUTPUT: i32 = 20;
+    pub const SELF: i32 = 21;
+    pub const PID: i32 = 22;
+    pub const KTHREADS: i32 = 23;
+    pub const FORK: i32 = 24;
 }
 
 // ─── output ────────────────────────────────────────────────────────────────
@@ -250,6 +269,91 @@ fn parse_after(haystack: &[u8], key: &[u8]) -> Option<u64> {
         index += 1;
     }
     None
+}
+
+// ─── id paths and field matching ─────────────────────────────────────────
+
+/// Write `prefix + decimal(id) + suffix + NUL` into `out`, returning the length
+/// **including** the NUL, or `None` when it does not fit.
+fn id_path(out: &mut [u8], prefix: &[u8], id: u64, suffix: &[u8]) -> Option<usize> {
+    let mut len = 0usize;
+    for &byte in prefix {
+        if len >= out.len() {
+            return None;
+        }
+        out[len] = byte;
+        len += 1;
+    }
+    let mut digits = [0u8; 20];
+    let count = decimal_digits(id, &mut digits);
+    for &digit in &digits[..count] {
+        if len >= out.len() {
+            return None;
+        }
+        out[len] = digit;
+        len += 1;
+    }
+    for &byte in suffix {
+        if len >= out.len() {
+            return None;
+        }
+        out[len] = byte;
+        len += 1;
+    }
+    if len >= out.len() {
+        return None;
+    }
+    out[len] = 0;
+    Some(len + 1)
+}
+
+/// Decimal digits of `value`, no NUL; returns the count.
+fn decimal_digits(mut value: u64, out: &mut [u8; 20]) -> usize {
+    if value == 0 {
+        out[0] = b'0';
+        return 1;
+    }
+    let mut reversed = [0u8; 20];
+    let mut count = 0usize;
+    while value > 0 && count < reversed.len() {
+        reversed[count] = b'0' + (value % 10) as u8;
+        count += 1;
+        value /= 10;
+    }
+    for index in 0..count {
+        out[index] = reversed[count - 1 - index];
+    }
+    count
+}
+
+/// True when `text` contains `<key><decimal(id)>\n` — a status field value.
+fn has_field_with_id(text: &[u8], key: &[u8], id: u64) -> bool {
+    let mut needle = [0u8; 64];
+    let mut len = 0usize;
+    for &byte in key {
+        need_byte(&mut needle, &mut len, byte);
+    }
+    let mut digits = [0u8; 20];
+    let count = decimal_digits(id, &mut digits);
+    for &digit in &digits[..count] {
+        need_byte(&mut needle, &mut len, digit);
+    }
+    need_byte(&mut needle, &mut len, b'\n');
+    contains(text, &needle[..len])
+}
+
+fn need_byte(buffer: &mut [u8; 64], len: &mut usize, byte: u8) {
+    if *len < buffer.len() {
+        buffer[*len] = byte;
+        *len += 1;
+    }
+}
+
+/// True when `text` starts with `<decimal(id)> ` (the `/proc/<id>/stat` prefix).
+fn starts_with_id(text: &[u8], id: u64) -> bool {
+    let mut digits = [0u8; 20];
+    let count = decimal_digits(id, &mut digits);
+    text.len() > count && &text[..count] == &digits[..count] && text[count] == b' '
 }
 
 // ─── checks ────────────────────────────────────────────────────────────────
@@ -419,9 +523,22 @@ fn check_net(scratch: &mut [u8]) -> Result<(), i32> {
 /// `getdents64` on `/proc` and `/proc/net`: the seven root entries with their
 /// kinds, the two net entries, and record framing (`% 8 == 0`, names in bounds).
 fn check_directory(scratch: &mut [u8]) -> Result<(), i32> {
-    const ROOT_NAMES: [&[u8]; 7] = [
-        b"cpuinfo", b"meminfo", b"mounts", b"net", b"tasks", b"uptime", b"version",
+    const ROOT_NAMES: [&[u8]; 9] = [
+        b"cpuinfo",
+        b"kthreads",
+        b"meminfo",
+        b"mounts",
+        b"net",
+        b"self",
+        b"tasks",
+        b"uptime",
+        b"version",
     ];
+    let own_pid = syscall1(SYS_GETPID, 0);
+    if own_pid <= 0 {
+        return Err(fail(b"getpid", code::DIR));
+    }
+    let own_pid = own_pid as u64;
     let fd = open(b"/proc\0", O_RDONLY);
     if fd < 0 {
         return Err(fail(b"openat /proc", code::DIR));
@@ -442,8 +559,11 @@ fn check_directory(scratch: &mut [u8]) -> Result<(), i32> {
         return Err(fail(b"getdents64 /proc framing", code::DIR));
     }
 
-    let mut seen = [false; 7];
+    let mut seen = [false; 9];
     let mut net_is_dir = false;
+    let mut kthreads_is_dir = false;
+    let mut self_is_link = false;
+    let mut own_pid_is_dir = false;
     let mut cursor = 0usize;
     while cursor < entries {
         if cursor + 12 > entries {
@@ -467,9 +587,25 @@ fn check_directory(scratch: &mut [u8]) -> Result<(), i32> {
         if name == b"net" && kind == KIND_DIR as u8 {
             net_is_dir = true;
         }
+        if name == b"kthreads" && kind == KIND_DIR as u8 {
+            kthreads_is_dir = true;
+        }
+        if name == b"self" && kind == KIND_SYMLINK as u8 {
+            self_is_link = true;
+        }
+        let mut digits = [0u8; 20];
+        let count = decimal_digits(own_pid, &mut digits);
+        if name == &digits[..count] && kind == KIND_DIR as u8 {
+            own_pid_is_dir = true;
+        }
         cursor += rec_len;
     }
-    if !seen.iter().all(|found| *found) || !net_is_dir {
+    if !seen.iter().all(|found| *found)
+        || !net_is_dir
+        || !kthreads_is_dir
+        || !self_is_link
+        || !own_pid_is_dir
+    {
         return Err(fail(b"/proc entries", code::DIR));
     }
 
@@ -554,6 +690,274 @@ fn check_missing() -> Result<(), i32> {
     Ok(())
 }
 
+/// `/proc/self` and the files behind it resolve to *this* process.
+fn check_self(scratch: &mut [u8]) -> Result<(), i32> {
+    let pid = syscall1(SYS_GETPID, 0);
+    let tid = syscall1(SYS_GETTID, 0);
+    if pid <= 0 || tid <= 0 {
+        return Err(fail(b"getpid/gettid", code::SELF));
+    }
+    let pid = pid as u64;
+    let tid = tid as u64;
+
+    // `/proc/self` is a symlink to this process's entry: `<pid>` for a user
+    // thread. The target is computed from the reader's context.
+    let mut target = [0u8; 32];
+    let length = syscall4(
+        SYS_READLINKAT,
+        0,
+        b"/proc/self\0".as_ptr() as usize,
+        target.as_mut_ptr() as usize,
+        target.len(),
+    );
+    if length <= 0 {
+        return Err(fail(b"readlink /proc/self", code::SELF));
+    }
+    let mut expected = [0u8; 20];
+    let count = decimal_digits(pid, &mut expected);
+    if &target[..length as usize] != &expected[..count] {
+        return Err(fail(b"/proc/self target", code::SELF));
+    }
+
+    // Status through the symlink: the ordinary VFS walk expands it.
+    let total = match read_file(b"/proc/self/status\0", scratch) {
+        Ok(total) => total,
+        Err(_) => return Err(fail(b"read /proc/self/status", code::SELF)),
+    };
+    let status = &scratch[..total];
+    if !has_field_with_id(status, b"Pid:\t", pid)
+        || !has_field_with_id(status, b"Tid:\t", tid)
+        || !contains(status, b"Name:\t")
+        || !contains(status, b"Threads:\t")
+        || !contains(status, b"State:\t")
+    {
+        return Err(fail(b"/proc/self/status fields", code::SELF));
+    }
+
+    // stat: `<pid> (comm) ...` with this process's pid in field zero.
+    let total = match read_file(b"/proc/self/stat\0", scratch) {
+        Ok(total) => total,
+        Err(_) => return Err(fail(b"read /proc/self/stat", code::SELF)),
+    };
+    if !starts_with_id(&scratch[..total], pid) || !contains(&scratch[..total], b"(proc") {
+        return Err(fail(b"/proc/self/stat line", code::SELF));
+    }
+
+    // cmdline: NUL-separated, trailing NUL, contains the argv[0] the selftest or
+    // the shell handed the fixture.
+    let total = match read_file(b"/proc/self/cmdline\0", scratch) {
+        Ok(total) => total,
+        Err(_) => return Err(fail(b"read /proc/self/cmdline", code::SELF)),
+    };
+    if total == 0 || scratch[total - 1] != 0 || !contains(&scratch[..total], b"proc") {
+        return Err(fail(b"/proc/self/cmdline bytes", code::SELF));
+    }
+    Ok(())
+}
+
+/// `/proc/<pid>` is addressable by the id `getpid()` returns, and an id that
+/// names no live process is `-ENOENT`.
+fn check_pid(scratch: &mut [u8]) -> Result<(), i32> {
+    let pid = syscall1(SYS_GETPID, 0);
+    if pid <= 0 {
+        return Err(fail(b"getpid", code::PID));
+    }
+    let pid = pid as u64;
+
+    let mut path = [0u8; 64];
+    let Some(length) = id_path(&mut path, b"/proc/", pid, b"/status") else {
+        return Err(fail(b"pid path", code::PID));
+    };
+    let total = match read_file(&path[..length], scratch) {
+        Ok(total) => total,
+        Err(_) => return Err(fail(b"read /proc/<pid>/status", code::PID)),
+    };
+    if !has_field_with_id(&scratch[..total], b"Pid:\t", pid)
+        || !has_field_with_id(&scratch[..total], b"Threads:\t", 1)
+    {
+        return Err(fail(b"/proc/<pid>/status fields", code::PID));
+    }
+
+    // The same process reached by id and through `/proc/self` is the same file.
+    let direct = total;
+    let total = match read_file(b"/proc/self/status\0", scratch) {
+        Ok(total) => total,
+        Err(_) => return Err(fail(b"reread /proc/self/status", code::PID)),
+    };
+    let _ = direct;
+    if !has_field_with_id(&scratch[..total], b"Pid:\t", pid) {
+        return Err(fail(b"/proc/self is /proc/<pid>", code::PID));
+    }
+
+    // A pid that never existed: -ENOENT, not an empty file.
+    let missing = open(b"/proc/999999/status\0", O_RDONLY);
+    if missing != ENOENT {
+        if missing >= 0 {
+            close(missing as usize);
+        }
+        return Err(fail(b"/proc/999999/status", code::PID));
+    }
+    Ok(())
+}
+
+/// Kernel threads have no pid; `/proc/kthreads` is where the shell's own entry
+/// lives, which is what makes `/proc/self` work outside a process.
+fn check_kthreads(scratch: &mut [u8]) -> Result<(), i32> {
+    let fd = open(b"/proc/kthreads\0", O_RDONLY);
+    if fd < 0 {
+        return Err(fail(b"openat /proc/kthreads", code::KTHREADS));
+    }
+    let fd = fd as usize;
+    let entries = syscall3(
+        SYS_GETDENTS64,
+        fd,
+        scratch.as_mut_ptr() as usize,
+        scratch.len(),
+    );
+    close(fd);
+    if entries <= 0 {
+        return Err(fail(b"getdents64 /proc/kthreads", code::KTHREADS));
+    }
+    let entries = entries as usize;
+    let mut shell_dir = false;
+    let mut idle_dir = false;
+    let mut cursor = 0usize;
+    while cursor < entries {
+        let name_len = scratch[cursor + 9] as usize;
+        let kind = scratch[cursor + 8];
+        let rec_len = (12 + name_len + 7) & !7;
+        if cursor + rec_len > entries {
+            return Err(fail(b"getdents64 /proc/kthreads record", code::KTHREADS));
+        }
+        let name = &scratch[cursor + 12..cursor + 12 + name_len];
+        if name == b"0" && kind == KIND_DIR as u8 {
+            shell_dir = true;
+        }
+        if name == b"1" && kind == KIND_DIR as u8 {
+            idle_dir = true;
+        }
+        cursor += rec_len;
+    }
+    if !shell_dir || !idle_dir {
+        return Err(fail(b"/proc/kthreads entries", code::KTHREADS));
+    }
+
+    let total = match read_file(b"/proc/kthreads/0/status\0", scratch) {
+        Ok(total) => total,
+        Err(_) => return Err(fail(b"read /proc/kthreads/0/status", code::KTHREADS)),
+    };
+    let status = &scratch[..total];
+    if !contains(status, b"Name:\tshell\n")
+        || !has_field_with_id(status, b"Pid:\t", 0)
+        || !has_field_with_id(status, b"Tid:\t", 0)
+        || !contains(status, b"Stack:\tboot\n")
+    {
+        return Err(fail(b"/proc/kthreads/0/status fields", code::KTHREADS));
+    }
+
+    let total = match read_file(b"/proc/kthreads/0/stat\0", scratch) {
+        Ok(total) => total,
+        Err(_) => return Err(fail(b"read /proc/kthreads/0/stat", code::KTHREADS)),
+    };
+    if !starts_with_id(&scratch[..total], 0) || !contains(&scratch[..total], b"(shell) R ") {
+        return Err(fail(b"/proc/kthreads/0/stat line", code::KTHREADS));
+    }
+
+    // A kernel task id that does not exist is -ENOENT in that namespace too.
+    let missing = open(b"/proc/kthreads/999999/status\0", O_RDONLY);
+    if missing != ENOENT {
+        if missing >= 0 {
+            close(missing as usize);
+        }
+        return Err(fail(b"/proc/kthreads/999999", code::KTHREADS));
+    }
+    Ok(())
+}
+
+/// A live *other* process is readable by pid; once it is reaped, the same path
+/// is `-ENOENT`. This is the part of the contract the shell cannot exercise on
+/// its own (a foreground `run` owns the console), so the fixture forks.
+fn check_fork(scratch: &mut [u8]) -> Result<(), i32> {
+    let parent = syscall1(SYS_GETPID, 0);
+    if parent <= 0 {
+        return Err(fail(b"getpid", code::FORK));
+    }
+    let parent = parent as u64;
+    let child = syscall1(SYS_FORK, 0);
+    if child == 0 {
+        // Child: stay alive long enough for the parent's two reads, then exit 0.
+        let mut delay = Timespec {
+            tv_sec: 0,
+            tv_nsec: 200_000_000,
+        };
+        let _ = syscall3(
+            SYS_NANOSLEEP,
+            &mut delay as *mut Timespec as usize,
+            0,
+            0,
+        );
+        let _ = syscall1(SYS_EXIT, 0);
+        loop {}
+    }
+    if child < 0 {
+        return Err(fail(b"fork", code::FORK));
+    }
+    let child = child as u64;
+
+    let mut path = [0u8; 64];
+    let Some(length) = id_path(&mut path, b"/proc/", child, b"/status") else {
+        return Err(fail(b"child path", code::FORK));
+    };
+    let total = match read_file(&path[..length], scratch) {
+        Ok(total) => total,
+        Err(_) => return Err(fail(b"read child status", code::FORK)),
+    };
+    let status = &scratch[..total];
+    if !has_field_with_id(status, b"Pid:\t", child)
+        || !has_field_with_id(status, b"PPid:\t", parent)
+        || !contains(status, b"Name:\tproc")
+    {
+        return Err(fail(b"child status fields", code::FORK));
+    }
+
+    // fork copies the argv snapshot: the child's cmdline is the parent's.
+    let Some(length) = id_path(&mut path, b"/proc/", child, b"/cmdline") else {
+        return Err(fail(b"child cmdline path", code::FORK));
+    };
+    let total = match read_file(&path[..length], scratch) {
+        Ok(total) => total,
+        Err(_) => return Err(fail(b"read child cmdline", code::FORK)),
+    };
+    if total == 0 || scratch[total - 1] != 0 || !contains(&scratch[..total], b"proc") {
+        return Err(fail(b"child cmdline bytes", code::FORK));
+    }
+
+    let mut wait_status: i32 = -1;
+    let waited = syscall4(
+        SYS_WAIT4,
+        child as usize,
+        &mut wait_status as *mut i32 as usize,
+        0,
+        0,
+    );
+    if waited != child as isize || wait_status != 0 {
+        return Err(fail(b"wait4 child", code::FORK));
+    }
+
+    // The child is gone and reaped: its pid is no longer a directory.
+    let Some(length) = id_path(&mut path, b"/proc/", child, b"/status") else {
+        return Err(fail(b"dead child path", code::FORK));
+    };
+    let gone = open(&path[..length], O_RDONLY);
+    if gone != ENOENT {
+        if gone >= 0 {
+            close(gone as usize);
+        }
+        return Err(fail(b"/proc/<dead pid> exists", code::FORK));
+    }
+    Ok(())
+}
+
 // ─── entry ─────────────────────────────────────────────────────────────────
 
 /// One keeper for the output-failure flag; a fixture that cannot print is a
@@ -614,6 +1018,26 @@ pub extern "C" fn proc_main() -> i32 {
         return code;
     }
     progress(b"missing");
+
+    if let Err(code) = check_self(&mut scratch) {
+        return code;
+    }
+    progress(b"self");
+
+    if let Err(code) = check_pid(&mut scratch) {
+        return code;
+    }
+    progress(b"pid");
+
+    if let Err(code) = check_kthreads(&mut scratch) {
+        return code;
+    }
+    progress(b"kthreads");
+
+    if let Err(code) = check_fork(&mut scratch) {
+        return code;
+    }
+    progress(b"fork");
 
     if OUTPUT_OK.load(Ordering::Relaxed) == 0 {
         return code::OUTPUT;
