@@ -1,17 +1,20 @@
 name: release
 
-# Tag-driven GitHub releases.
+# Tag-driven GitHub releases. New tags always carry the `v` prefix:
 #
-#   stable tag      vX.Y.Z       must be reachable from `main`  -> full release
-#   pre-release tag vX.Y.Z-rc.N  must be reachable from `dev`   -> GitHub pre-release
+#   stable      vX.Y.Z       must be reachable from `main`  -> Release
+#   pre-release vX.Y.Z-rc.N  must be reachable from `dev` AND not from `main`
+#                            -> Pre-release (release-candidate lane only)
 #
-# Bare numeric tags (`0.24.1`), which this repository has historically used, are
-# accepted too; anything with a `-` suffix (for example `-rc.1`, `-pre.3`) is
-# published as a pre-release. `release.yml` refuses a tag cut from the wrong
-# branch, so a stable release can never point at unmerged `dev` work by accident.
+# Anything else (`-pre.N`, arbitrary suffixes, new bare-numeric tags) is
+# refused. The base version `X.Y.Z` must equal the repository's version source
+# (`Cargo.toml [package].version`, see `VERSION_FILE`): the tag is not allowed to
+# disagree with the kernel the build reports. Every release gets the built RV64
+# kernel (`pagh-<tag>.elf`), a source archive, and a `.sha256` next to each file.
 #
-# Every release (stable or pre-release) also builds the RV64 kernel with the
-# toolchain pinned in `rust-toolchain.toml` and attaches the ELF to the release.
+# Old bare-numeric tags (`0.24.1`, …) remain valid history, but they are never
+# re-created: new tags always carry the `v` prefix, and the validation below
+# refuses anything that is not exactly `vX.Y.Z` or `vX.Y.Z-rc.N`.
 
 on:
   push:
@@ -22,28 +25,44 @@ on:
 permissions:
   contents: write
 
+env:
+  VERSION_FILE: Cargo.toml
+
 jobs:
   release:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Check the tag source branch
+      - name: Validate tag branch and version
         shell: bash
         run: |
+          set -euo pipefail
           git fetch --no-tags origin main dev
-          tag="$GITHUB_REF_NAME"
-          case "$tag" in
-            *-*) branch=dev ;;
-            *)   branch=main ;;
-          esac
-          echo "tag=$tag expected-branch=$branch"
-          git merge-base --is-ancestor "$GITHUB_SHA" "origin/$branch" || {
-            echo "::error::tag $tag must point to a commit reachable from $branch"
-            exit 1
-          }
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "::error::new tags must be vX.Y.Z or vX.Y.Z-rc.N (got $tag)"; exit 1
+          fi
+          base="${tag%-rc.*}"
+          base="${base#v}"
+          if [[ "$tag" =~ -rc\.[0-9]+$ ]]; then
+            git merge-base --is-ancestor "$GITHUB_SHA" origin/dev || {
+              echo "::error::pre-release $tag must be reachable from dev"; exit 1; }
+            if git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "::error::pre-release $tag must not point at a commit already on main"; exit 1
+            fi
+          else
+            git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+              echo "::error::stable release $tag must be reachable from main"; exit 1; }
+          fi
+          version="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' "$VERSION_FILE" | head -n1)"
+          if [ -z "$version" ] || [ "$version" != "$base" ]; then
+            echo "::error::tag base $base does not match version source $VERSION_FILE ($version)"; exit 1
+          fi
+          echo "tag=$tag version=$version" >> "$GITHUB_STEP_SUMMARY"
 
       # Same recipe as `.github/workflows/ci.yml`: the pin lives only in
       # rust-toolchain.toml, so bumping the nightly is still a one-line change.
@@ -59,9 +78,32 @@ jobs:
       - name: Build the release kernel
         run: cargo build --release --locked
 
+      - name: Name the release kernel and write its checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          elf="pagh-${GITHUB_REF_NAME}.elf"
+          cp target/riscv64gc-unknown-none-elf/release/pagh "$elf"
+          sha256sum "$elf" > "$elf.sha256"
+          file "$elf" || true
+          echo "KERNEL=$elf" >> "$GITHUB_ENV"
+
+      - name: Create source archive and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="$(basename "$GITHUB_REPOSITORY")-${GITHUB_REF_NAME}.tar.gz"
+          git archive --format=tar.gz --prefix="${GITHUB_REF_NAME}/" -o "$name" "$GITHUB_SHA"
+          sha256sum "$name" > "$name.sha256"
+          echo "ARCHIVE=$name" >> "$GITHUB_ENV"
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(github.ref_name, '-rc.') }}
           generate_release_notes: true
-          files: target/riscv64gc-unknown-none-elf/release/pagh
+          files: |
+            ${{ env.KERNEL }}
+            ${{ env.KERNEL }}.sha256
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256

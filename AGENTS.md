@@ -467,8 +467,14 @@ seconds. Verify locally with `cargo build --locked` after any version change.
   that ships the feature, not later.
 - **PATCH** — fixes, diagnostics, docs, tooling, with no behavior change. Docs-only
   commits do not bump.
-- **Tags** — tag the release commit with the bare version string (`0.5.0`) and push
-  it. Tags must never run ahead of `Cargo.toml`. Note: `0.2.0` was tagged on a commit
+- **Tags** — new tags carry the `v` prefix: a stable `vX.Y.Z` is cut from `main`,
+  and the only pre-release channel is the release candidate `vX.Y.Z-rc.N` cut from
+  `dev` (which must not already be on `main`); there is no `-pre.N` channel. A
+  hotfix goes **straight to stable**: a PATCH tag from `main`, no RC, then `main`
+  is merged back into `dev` with `--no-ff`. The tag base (`X.Y.Z`) must equal
+  `Cargo.toml [package].version`, so tags never run ahead of it. Old bare-numeric
+  tags (`0.5.0`, `0.24.1`, …) remain history and are not re-created; new tags
+  always use `v`. See `BRANCHING.md` and `RELEASING.md`. Note: `0.2.0` was tagged on a commit
   whose manifest still said `0.1.0` (the drift this rule exists to prevent); it is
   left as history, and `0.4.0` is the first tag that matches its manifest (M3/M5/M6a landed after `0.3.0` was written but before it was tagged). `0.5.0` ships M6b; `0.6.0` ships M7 (the network: virtio-net + own stack, DHCP,
   DNS, ICMP, a TCP client); `0.7.0` ships M8 (virtio-input pointer and the
