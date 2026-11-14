@@ -1,0 +1,189 @@
+# Live acceptance for pagh-riscv 0.24.3 (round-3 hotfix: F-r3-rv-2, F-r3-rv-1)
+# kernel under test: target/riscv64gc-unknown-none-elf/debug/pagh
+#   sha256 7b6cec8f720029e50b96c394cf1594bc911a65c189f8e80532c8f58c77931d21
+# stock baseline:   0.24.2 debug kernel built at HEAD 7f0287c
+#   sha256 fbc761e10c1b4e05c5df301c13e8a47f6229819f31921a5ab3ee907de6ab0ca5   (the round-3 report's fbc761e1… build)
+# rig: a copy of attack/r3/riscv at /tmp/pagh-r3/riscv-stand (QEMU virt +
+#   OpenSBI, 64 MiB host mke2fs ext2 base.img, serial shell). The copy adds a
+#   boot proof the round-3 rig did not have: `cat /proc/version` is sent as the
+#   first shell command and run.sh greps the expected line out of the serial
+#   log, so a log below cannot come from the other kernel by accident.
+# PoCs:
+#   attack/r3/riscv/poc/dirent_bomb.elf  — 1200 U-mode creates then openat(/mnt)
+#   attack/r3/riscv/poc/sigframe_link.rs — forged SignalFrame.prev_frame
+#   /tmp/pagh-r3/riscv-stand/poc/sigframe_link_fixed.rs — same forgery, but the
+#     handler asks rt_sigreturn for its answer, records the errno, repairs the
+#     word and unwinds normally. The original PoC only leaves the forged value
+#     installed, so on a fixed kernel its handler would spin after -EINVAL and
+#     never print the result; this variant makes the -EINVAL observable.
+# Reproduction (paths are the throwaway stand copy):
+#   cd /tmp/pagh-r3/riscv-stand
+#   PAGH_BIOS=/usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin \
+#       ./run.sh poc/dirent_bomb.elf
+#   ... BASE=img/hostile.img CMD='ls /mnt' ./run.sh
+#   ... ./run.sh poc/sigframe_link_fixed.elf
+#   stock: KERNEL=/tmp/pagh-r3/pagh-0.24.2-debug.elf \
+#       BOOT_PROOF='pagh 0.24.2 (riscv64) #1' ./run.sh ...
+#
+# Fixed checks (all exit 0, clean `halt: powering off`):
+#   F-r3-rv-2 U-mode: 1200 creates, openat("/mnt") = -E2BIG (-7), shell alive.
+#   F-r3-rv-2 image:  `ls /mnt` on the 1100-dirent hostile.img prints
+#                     "ls: /mnt: directory listing too big", no panic.
+#   F-r3-rv-1:        both forged rt_sigreturn calls answer -EINVAL (-22); the
+#                     frame stays armed, the handler repairs it and unwinds,
+#                     the program exits 0 with the hart alive.
+# Stock baseline (exit 1 / parked hart, expected):
+#   F-r3-rv-2 U-mode: [PANIC] memory allocation of 65536 bytes failed.
+#   F-r3-rv-2 image:  the same panic from the shell's own `ls /mnt`.
+#   F-r3-rv-1:        1st sigreturn accepts usize::MAX (handler never returns,
+#                     main prints 0); the 2nd delivery panics in arm():
+#                     "attempt to add with overflow" at src/user/signal.rs:1470.
+# Each section below starts where the evidence starts: the three fixed runs keep
+# the guest serial from the kernel banner (the OpenSBI preamble is elided), the
+# three stock sections keep the two shell commands and the panic; the text in
+# between is verbatim serial output.
+
+==== fixed 0.24.3 — F-r3-rv-2(a): 1200 U-mode creates, then openat("/mnt") ====
+========================================
+   pagh OS — RISC-V (RV64)
+========================================
+boot hart   0
+device tree 0x8fe00000
+memory      0x80000000..0x90000000 (256 MiB)
+timebase    10000000 Hz
+console     NS16550 @ 0x10000000
+pmm         62151/65536 frames free (256 MiB tracked), heap 0 KiB in 0 chunk(s)
+sv39        on, satp=0x8000000000080d37, identity 0x80000000..0x90000000 (RWX below 0x80d37000, RW above), 65549 pages, 13 device
+rtc         goldfish @ 0x101000 - 2026-11-14 05:59:42 UTC
+rtc         raw 0xf5b55a18 0x18e7d3ea 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
+entropy     32 bytes from /chosen/rng-seed - TLS session keys available
+timer       10 ms ticks (100 Hz, timebase 10000000 Hz)
+plic        0xc000000 context 1, uart irq 10 (rx interrupt on)
+task        16 slots, 96 KiB stack + 4 KiB guard, quantum 8 ticks, timer clock
+virtio-blk: virtio-blk0 at 0x10007000: 131072 sectors (64 MiB)
+virtio-input: tablet at 0x10008000, abs X 0..32767, Y 0..32767
+fs          virtio-blk0 (131072 sectors, 65536 KiB)
+fs          ext2 on /mnt, 1024 B blocks, 62730/65536 blocks free, 16371/16384 inodes free
+virtio-net: no device
+net         no network device
+
+Type 'help' for the command list.
+
+pagh:rv64> cat /proc/version
+pagh 0.24.3 (riscv64) #1
+pagh:rv64> run /mnt/dirent_bomb.elf
+F-r3-rv-2: dirent Vec bomb (open /mnt after 1200 creates)
+A: created files = 1200
+A: openat(/mnt) -> read_dir_entries
+A: openat(/mnt) = -7
+A: survived (no panic)
+run: /mnt/dirent_bomb.elf exited with code 0
+pagh:rv64> halt
+halt: powering off
+
+==== fixed 0.24.3 — F-r3-rv-2(b): shell `ls /mnt` on img/hostile.img ====
+========================================
+   pagh OS — RISC-V (RV64)
+========================================
+boot hart   0
+device tree 0x8fe00000
+memory      0x80000000..0x90000000 (256 MiB)
+timebase    10000000 Hz
+console     NS16550 @ 0x10000000
+pmm         62151/65536 frames free (256 MiB tracked), heap 0 KiB in 0 chunk(s)
+sv39        on, satp=0x8000000000080d37, identity 0x80000000..0x90000000 (RWX below 0x80d37000, RW above), 65549 pages, 13 device
+rtc         goldfish @ 0x101000 - 2026-11-14 06:00:12 UTC
+rtc         raw 0xf3904368 0x18e7d3f1 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
+entropy     32 bytes from /chosen/rng-seed - TLS session keys available
+timer       10 ms ticks (100 Hz, timebase 10000000 Hz)
+plic        0xc000000 context 1, uart irq 10 (rx interrupt on)
+task        16 slots, 96 KiB stack + 4 KiB guard, quantum 8 ticks, timer clock
+virtio-blk: virtio-blk0 at 0x10007000: 131072 sectors (64 MiB)
+virtio-input: tablet at 0x10008000, abs X 0..32767, Y 0..32767
+fs          virtio-blk0 (131072 sectors, 65536 KiB)
+fs          ext2 on /mnt, 1024 B blocks, 63434/65536 blocks free, 15273/16384 inodes free
+virtio-net: no device
+net         no network device
+
+Type 'help' for the command list.
+
+pagh:rv64> cat /proc/version
+pagh 0.24.3 (riscv64) #1
+pagh:rv64> ls /mnt
+ls: /mnt: directory listing too big
+pagh:rv64> halt
+halt: powering off
+
+==== fixed 0.24.3 — F-r3-rv-1: forged prev_frame, twice ====
+========================================
+   pagh OS — RISC-V (RV64)
+========================================
+boot hart   0
+device tree 0x8fe00000
+memory      0x80000000..0x90000000 (256 MiB)
+timebase    10000000 Hz
+console     NS16550 @ 0x10000000
+pmm         62151/65536 frames free (256 MiB tracked), heap 0 KiB in 0 chunk(s)
+sv39        on, satp=0x8000000000080d37, identity 0x80000000..0x90000000 (RWX below 0x80d37000, RW above), 65549 pages, 13 device
+rtc         goldfish @ 0x101000 - 2026-11-14 06:00:13 UTC
+rtc         raw 0x2e1e0e20 0x18e7d3f2 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
+entropy     32 bytes from /chosen/rng-seed - TLS session keys available
+timer       10 ms ticks (100 Hz, timebase 10000000 Hz)
+plic        0xc000000 context 1, uart irq 10 (rx interrupt on)
+task        16 slots, 96 KiB stack + 4 KiB guard, quantum 8 ticks, timer clock
+virtio-blk: virtio-blk0 at 0x10007000: 131072 sectors (64 MiB)
+virtio-input: tablet at 0x10008000, abs X 0..32767, Y 0..32767
+fs          virtio-blk0 (131072 sectors, 65536 KiB)
+fs          ext2 on /mnt, 1024 B blocks, 62730/65536 blocks free, 16371/16384 inodes free
+virtio-net: no device
+net         no network device
+
+Type 'help' for the command list.
+
+pagh:rv64> cat /proc/version
+pagh 0.24.3 (riscv64) #1
+pagh:rv64> run /mnt/sigframe_link_fixed.elf
+F-r3-rv-1 fixed: forged prev_frame must be -EINVAL, frame stays armed
+A: first kill -> handler forges prev_frame=MAX, rt_sigreturn
+A: first rt_sigreturn(forged) = -22
+A: second kill -> arm() (stock overflow point)
+A: second rt_sigreturn(forged) = -22
+A: survived, hart alive
+run: /mnt/sigframe_link_fixed.elf exited with code 0
+pagh:rv64> halt
+halt: powering off
+
+==== stock 0.24.2 — F-r3-rv-2(a): same PoC ====
+pagh:rv64> cat /proc/version
+pagh 0.24.2 (riscv64) #1
+pagh:rv64> run /mnt/dirent_bomb.elf
+F-r3-rv-2: dirent Vec bomb (open /mnt after 1200 creates)
+A: created files = 1200
+A: openat(/mnt) -> read_dir_entries
+
+[PANIC] panicked at /rustc/be8e82435eb04fbe75ed5286b52735366e160bed/library/alloc/src/alloc.rs:573:9:
+memory allocation of 65536 bytes failed
+[PANIC] at /rustc/be8e82435eb04fbe75ed5286b52735366e160bed/library/alloc/src/alloc.rs:573
+
+==== stock 0.24.2 — F-r3-rv-2(b): shell `ls /mnt` on img/hostile.img ====
+pagh:rv64> cat /proc/version
+pagh 0.24.2 (riscv64) #1
+pagh:rv64> ls /mnt
+
+[PANIC] panicked at /rustc/be8e82435eb04fbe75ed5286b52735366e160bed/library/alloc/src/alloc.rs:573:9:
+memory allocation of 65536 bytes failed
+[PANIC] at /rustc/be8e82435eb04fbe75ed5286b52735366e160bed/library/alloc/src/alloc.rs:573
+
+==== stock 0.24.2 — F-r3-rv-1: same forged-frame run ====
+pagh:rv64> cat /proc/version
+pagh 0.24.2 (riscv64) #1
+pagh:rv64> run /mnt/sigframe_link_fixed.elf
+F-r3-rv-1 fixed: forged prev_frame must be -EINVAL, frame stays armed
+A: first kill -> handler forges prev_frame=MAX, rt_sigreturn
+A: first rt_sigreturn(forged) = 0
+A: second kill -> arm() (stock overflow point)
+
+[PANIC] panicked at src/user/signal.rs:1470:9:
+attempt to add with overflow
+[PANIC] at src/user/signal.rs:1470
+

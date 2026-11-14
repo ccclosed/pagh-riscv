@@ -79,6 +79,12 @@ pub enum VfsError {
     Corrupt,
     /// A directory entry name exceeded ext2's 255-byte limit.
     NameTooLong,
+    /// A directory listing exceeded the kernel's bounded snapshot size. The
+    /// listing is materialised (openat snapshots the directory for
+    /// `getdents64`), so a directory with arbitrarily many entries from a
+    /// hostile image or an unprivileged writer is refused instead of growing a
+    /// `Vec` until the allocator panics.
+    ListingTooBig,
 }
 
 impl VfsError {
@@ -96,6 +102,7 @@ impl VfsError {
             VfsError::NoSpace => "no space left",
             VfsError::Corrupt => "filesystem is corrupt",
             VfsError::NameTooLong => "name too long",
+            VfsError::ListingTooBig => "directory listing too big",
         }
     }
 }
