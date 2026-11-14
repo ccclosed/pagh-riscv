@@ -20,9 +20,14 @@
 ## Branching and releases
 
 `main` is the stable branch; `dev` is the experimental integration branch. Feature
-and fix PRs target `dev`; stable releases are tagged from `main`, release
-candidates/pre-releases from `dev` (`vX.Y.Z-rc.N`). The release workflow refuses a
-tag cut from the wrong branch. See [BRANCHING.md](BRANCHING.md).
+and fix PRs target `dev`. Stable releases are tagged `vX.Y.Z` from `main`; the only
+pre-release channel is the release candidate `vX.Y.Z-rc.N` cut from `dev` (there is
+no `-pre.N` suffix). The tag-driven release workflow refuses a tag cut from the
+wrong branch, checks the tag base against `Cargo.toml`, and attaches the release
+kernel (`pagh-<tag>`) plus a source archive, each with a `.sha256`. Hotfixes for a
+released version go straight to `main` as a PATCH release (no RC) and are merged
+back into `dev`. See [BRANCHING.md](BRANCHING.md) and the operational runbook
+[RELEASING.md](RELEASING.md).
 
 ## C и dynamic linking
 
