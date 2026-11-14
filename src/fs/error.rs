@@ -39,6 +39,12 @@ pub enum FsError {
     /// A malformed request (bad name, renaming a directory into its own tree,
     /// type mismatch in `rename`, ...).
     InvalidArgument,
+    /// A directory holds more live entries than the kernel will materialise in
+    /// one listing. This is a *limit*, not corruption: a foreign image (or a
+    /// program that created the files) may legitimately have a huge directory,
+    /// and the kernel must answer with an error instead of growing a `Vec` past
+    /// the heap's per-allocation ceiling.
+    DirectoryTooBig,
 }
 
 impl FsError {
@@ -57,6 +63,7 @@ impl FsError {
             FsError::IsDirectory => "is a directory",
             FsError::NotDirectory => "not a directory",
             FsError::InvalidArgument => "invalid argument",
+            FsError::DirectoryTooBig => "directory listing too big",
         }
     }
 }
