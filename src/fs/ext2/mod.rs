@@ -86,6 +86,32 @@ const MIN_INODES: u32 = 32;
 /// an allocation panic.
 const MAX_GROUPS: usize = 1024;
 
+// ─── directory-listing bounds ──────────────────────────────────────────────
+
+/// Most live entries one directory snapshot may hold.
+///
+/// [`Ext2Fs::read_dir_entries`] materialises a whole directory before the VFS
+/// hands any of it to `getdents64`, so its size is chosen by the medium, not by
+/// the caller: an unpacked image or an unprivileged `openat(O_CREAT)` loop can
+/// put an arbitrary number of entries in one directory. The kernel heap refuses
+/// any single allocation above one 64 KiB chunk (`memory::heap::CHUNK_SIZE`) and
+/// the alloc-error hook panics (`panic = "abort"` parks the hart), so the old
+/// unbounded `Vec<(String, u32)>` died on the 1024→2048 growth (32 B/element =
+/// 65536 B). 512 entries cap the vector at 16 KiB; with [`MAX_DIR_NAME_BYTES`]
+/// the snapshot stays well inside one chunk, and a larger directory is
+/// `FsError::DirectoryTooBig` → `VfsError::ListingTooBig` → `-E2BIG`, not a
+/// machine kill (F-r3-rv-2).
+const MAX_DIR_ENTRIES: usize = 512;
+
+/// Most bytes of entry names one directory snapshot may hold.
+///
+/// The entry-count bound alone would still let a crafted image spend
+/// 512 × 255 B on names; this second bound keeps both the `String` payloads and
+/// the `Arc<dyn VfsNode>` children the VFS builds from them bounded. A real
+/// directory this large (an abandoned package tree, say) still opens; only one
+/// that cannot be listed in a single heap-sized snapshot is refused.
+const MAX_DIR_NAME_BYTES: usize = 32 * 1024;
+
 // ─── geometry helpers ──────────────────────────────────────────────────────
 
 /// `ceil(a / b)` for `b != 0`.
@@ -515,6 +541,13 @@ impl Ext2Fs {
 
     /// Enumerate a directory's live entries as `(name, inode)` (free slots
     /// excluded; `.`/`..` included).
+    ///
+    /// The listing is bounded by [`MAX_DIR_ENTRIES`] and [`MAX_DIR_NAME_BYTES`]:
+    /// it is materialised in the heap before any caller sees it, and a directory
+    /// size comes from the medium (or from an unprivileged writer), so "more
+    /// entries than one snapshot" is an ordinary error, not a reason to exceed
+    /// the allocator's per-allocation ceiling and panic. See the constants for
+    /// the arithmetic; the caller gets `DirectoryTooBig`, never a dead hart.
     pub fn read_dir_entries(&self, dir_ino: u32) -> Result<Vec<(String, u32)>, FsError> {
         let inode = self.read_inode(dir_ino)?;
         if !inode.is_dir() {
@@ -522,14 +555,26 @@ impl Ext2Fs {
         }
         let nblocks = blocks_for_size(inode.i_size, self.block_size);
         let mut out = Vec::new();
+        let mut name_bytes = 0usize;
         for lbn in 0..nblocks {
             if let Some(blk) = inode::block_for_offset(self, &inode, lbn * self.block_size as u64)?
             {
                 let buf = self.read_fs_block(blk as u64)?;
                 for e in dir::iter_entries(&buf)? {
-                    if e.inode != 0 {
-                        out.push((e.name, e.inode));
+                    if e.inode == 0 {
+                        continue;
                     }
+                    // Check before pushing: the vector must never grow past the
+                    // bound, because the growth allocation itself is what used
+                    // to fail. `.`/`..` count too — the bound is about the
+                    // snapshot, not about what the caller filters.
+                    if out.len() >= MAX_DIR_ENTRIES
+                        || name_bytes + e.name.len() > MAX_DIR_NAME_BYTES
+                    {
+                        return Err(FsError::DirectoryTooBig);
+                    }
+                    name_bytes += e.name.len();
+                    out.push((e.name, e.inode));
                 }
             }
         }
@@ -1978,6 +2023,7 @@ fn fs_to_vfs(e: FsError) -> VfsError {
         FsError::IoError => VfsError::IoError,
         FsError::Corrupt | FsError::BadSuperBlock => VfsError::Corrupt,
         FsError::FileTooBig | FsError::InvalidArgument => VfsError::InvalidArgument,
+        FsError::DirectoryTooBig => VfsError::ListingTooBig,
     }
 }
 

@@ -453,7 +453,7 @@ fuzzing. That is a gap, not a policy — the rule stands:
 
 ## Versioning
 
-Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.24.2`,
+Semver `MAJOR.MINOR.PATCH` in `Cargo.toml [package].version` — currently `0.24.3`,
 which `Cargo.lock` mirrors. **The two move together in one commit**: CI builds with
 `--locked`, and cargo refuses to rewrite the lock (`cannot update the lock file …
 because --locked was passed`), so a `Cargo.toml`-only bump fails the build job in
@@ -575,7 +575,23 @@ seconds. Verify locally with `cargo build --locked` after any version change.
   kernel identity mapping, a range across `USER_TOP`, plus positive controls) and
   `mmu.rs`/`elf.rs` pin the rules with compile-time asserts; the round-2 PoC is
   `userland/noncanon.elf`, and on the fixed kernel it gets `-EFAULT` with the
-  shell alive (`tools/test_noncanon.py`, transcript `docs/live-noncanon.txt`).
+  shell alive (`tools/test_noncanon.py`, transcript `docs/live-noncanon.txt`);
+  `0.24.3` is the round-3 hotfix: `read_dir_entries` is bounded to
+  `MAX_DIR_ENTRIES = 512` live entries and `MAX_DIR_NAME_BYTES = 32 KiB` before
+  the snapshot `Vec` can grow into the heap's 64 KiB per-allocation ceiling —
+  a directory listed by a crafted image or filled by an unprivileged create
+  loop is `FsError::DirectoryTooBig` → `VfsError::ListingTooBig` → `-E2BIG` on
+  `openat`/`getdents64`, not an alloc-panic and a parked hart (F-r3-rv-2,
+  release-valid; the `ext2-corruption` check crafts the 512/513-entry
+  boundary), and `rt_sigreturn` validates the frame's user-written
+  `prev_frame` (zero or a complete 16-byte-aligned signal frame inside the
+  caller's mapped range; otherwise `-EINVAL` leaves the armed frame untouched)
+  while `arm()` computes the back-chain link with `checked_add`, so a forged
+  chain pointer can no longer overflow a debug kernel into `park_forever`
+  (F-r3-rv-1; the `abi.elf` signal section forges `usize::MAX` in a real frame
+  and requires `-EINVAL` plus a clean unwind). Live PoCs are the round-3
+  `dirent_bomb`/`sigframe_link` fixtures on the r3 stand, transcript
+  `docs/live-r3-riscv.txt`.
   The same rule
   applies
   to both: the tag equals the manifest and the `Cargo.lock` entry, and the

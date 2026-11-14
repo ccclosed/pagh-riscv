@@ -62,12 +62,44 @@ abi_bad_sigreturn:
     ecall
     mv      sp, t0
     ret
+
+    /* F-r3-rv-1 regression: forge this frame's back-chain pointer.
+       `prev_frame` lives at offset 416 of the kernel's 736-byte SignalFrame
+       (siginfo is 288+128; `const _` asserts pin both in src/user/signal.rs).
+       Writing usize::MAX and asking `rt_sigreturn` used to install it
+       unchecked, and the next delivery's `prev_frame + offset_of!(ucontext)`
+       overflowed a debug kernel into `park_forever`. A fixed kernel answers
+       -EINVAL and leaves this still-armed frame untouched, so record the
+       error, repair the word and unwind through the ordinary restorer. */
+    .align  2
+    .globl  abi_forged_prev_frame
+abi_forged_prev_frame:
+    mv      s0, sp
+    li      t0, 416
+    add     t0, s0, t0
+    li      t1, -1
+    sd      t1, 0(t0)
+    li      a7, 139
+    ecall
+    la      t1, abi_forged_prev_result
+    sd      a0, 0(t1)
+    li      t0, 416
+    add     t0, s0, t0
+    sd      zero, 0(t0)
+    mv      sp, s0
+    ret
 "#
 );
+
+/// What the first `rt_sigreturn` in [`abi_forged_prev_frame`] returned:
+/// `-EINVAL` on a fixed kernel (the frame was left untouched).
+#[no_mangle]
+static mut abi_forged_prev_result: isize = 0;
 
 extern "C" {
     fn abi_sigrestorer();
     fn abi_bad_sigreturn(pointer: usize) -> isize;
+    fn abi_forged_prev_frame();
 }
 
 // ─── syscall wrapper ───────────────────────────────────────────────────────
@@ -1353,6 +1385,46 @@ fn signal_section(stack: usize) {
         unsafe { abi_bad_sigreturn(0xdead_0000) } == EFAULT,
         256,
         "sigreturn bad frame pointer",
+    );
+
+    // ── a forged back-chain pointer inside a real frame (F-r3-rv-1) ──
+    // `prev_frame` is the one frame word a handler can rewrite before
+    // `rt_sigreturn`; installing it unchecked made the next delivery overflow
+    // `prev_frame + offset_of!(ucontext)` and park a debug kernel. The
+    // assembly handler patches the armed frame, asks `rt_sigreturn` (it must
+    // answer -EINVAL and leave the frame alone), repairs the word and unwinds
+    // through the normal restorer, so reaching the print below proves the
+    // machine and the frame chain survived.
+    let forged = SigAction {
+        handler: abi_forged_prev_frame as *const () as usize,
+        flags: SA_RESTORER,
+        mask: 0,
+        restorer: abi_sigrestorer as *const () as usize,
+    };
+    check(
+        rt_sigaction(SIGUSR1, &forged, core::ptr::null_mut()) == 0,
+        280,
+        "install forged-prev_frame handler",
+    );
+    unsafe { abi_forged_prev_result = 0 };
+    let hits_before = SIGUSR1_HITS.load(Ordering::SeqCst);
+    check(kill(pid, SIGUSR1) == 0, 281, "kill with forged prev_frame");
+    check(
+        unsafe { abi_forged_prev_result } == EINVAL,
+        282,
+        "sigreturn rejected forged prev_frame",
+    );
+    check(
+        SIGUSR1_HITS.load(Ordering::SeqCst) == hits_before,
+        283,
+        "forged-prev_frame handler did not run the Rust handler",
+    );
+    // Put the ordinary handler back (its local copy lost SA_RESTORER above).
+    action.flags = SA_RESTORER;
+    check(
+        rt_sigaction(SIGUSR1, &action, core::ptr::null_mut()) == 0,
+        284,
+        "restore the SIGUSR1 handler",
     );
 
     // Leave SIGUSR1 at SIG_DFL: the run's handler table is torn down with the

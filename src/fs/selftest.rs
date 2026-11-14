@@ -856,6 +856,139 @@ fn corrupt_input() -> bool {
             "[fs selftest] VFS readdir of a corrupt directory did not fail cleanly"
         );
     }
+
+    // 6. A directory with more live entries than one listing snapshot may hold.
+    //    `read_dir_entries` materialises every entry before the VFS sees any of
+    //    them, so the directory's size comes from the medium: the old unbounded
+    //    `Vec<(String, u32)>` asked the 64 KiB heap for 65536 B at the
+    //    1024→2048 growth and the alloc-error handler parked the hart
+    //    (F-r3-rv-2, release-valid). The crafted directory has 513 live
+    //    records: exactly `MAX_DIR_ENTRIES` is still listable, one more is a
+    //    clean `DirectoryTooBig`. Each record is the 8-byte minimum (inode set,
+    //    `rec_len = 8`, empty name), which `iter_entries` accepts and tiles
+    //    exactly; the two data blocks are the root's and lost+found's own, so
+    //    the test needs no allocator bookkeeping — the image is thrown away.
+    {
+        // A fresh image: the checks above deliberately corrupt the shared one.
+        let dev = ram_device();
+        if Ext2Fs::format(Arc::clone(&dev)).is_err() {
+            return false;
+        }
+        let fs = match Ext2Fs::mount_fs(Arc::clone(&dev)) {
+            Ok(fs) => fs,
+            Err(_) => return false,
+        };
+        let bs = fs.block_size();
+        let sectors = fs.sectors_per_block() as u64;
+        let root_inode = match fs.read_inode(EXT2_ROOT_INO) {
+            Ok(inode) => inode,
+            Err(_) => return false,
+        };
+        let lost_ino = match fs.lookup_entry(EXT2_ROOT_INO, "lost+found") {
+            Ok(ino) => ino,
+            Err(_) => return false,
+        };
+        let lost_inode = match fs.read_inode(lost_ino) {
+            Ok(inode) => inode,
+            Err(_) => return false,
+        };
+        let root_blk = root_inode.i_block[0] as u64;
+        let lost_blk = lost_inode.i_block[0] as u64;
+
+        // A full block of 512 minimum-length live records.
+        let mut many = vec![0u8; bs];
+        for slot in 0..(bs / 8) {
+            let record = &mut many[slot * 8..slot * 8 + 8];
+            record[0..4].copy_from_slice(&12u32.to_le_bytes()); // inode != 0
+            record[4..6].copy_from_slice(&8u16.to_le_bytes()); // rec_len
+        }
+        // A second block with one live record and one free record tiling the rest.
+        let mut one_more = vec![0u8; bs];
+        one_more[0..4].copy_from_slice(&12u32.to_le_bytes());
+        one_more[4..6].copy_from_slice(&8u16.to_le_bytes());
+        let rest = &mut one_more[8..];
+        rest[4..6].copy_from_slice(&((bs - 8) as u16).to_le_bytes()); // rec_len; inode stays 0
+
+        let write_block = |blk: u64, data: &[u8]| -> bool {
+            for sector in 0..sectors {
+                let offset = sector as usize * 512;
+                if dev
+                    .write_block(blk * sectors + sector, &data[offset..offset + 512])
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+            true
+        };
+        let mut wrote = write_block(root_blk, &many) && write_block(lost_blk, &one_more);
+
+        // Point the root inode at both crafted blocks, first at one block/size
+        // (512 entries: the boundary is allowed), then at both (513: refused).
+        let (inode_block, inode_offset) = match fs.inode_disk_location(EXT2_ROOT_INO) {
+            Ok(location) => location,
+            Err(_) => return false,
+        };
+        let mut raw = vec![0u8; bs];
+        for sector in 0..sectors {
+            let slot = &mut raw[sector as usize * 512..][..512];
+            wrote &= dev.read_block(inode_block * sectors + sector, slot).is_ok();
+        }
+        raw[inode_offset + 4..inode_offset + 8].copy_from_slice(&(bs as u32).to_le_bytes());
+        raw[inode_offset + 28..inode_offset + 32]
+            .copy_from_slice(&(2 * sectors as u32).to_le_bytes());
+        raw[inode_offset + 40..inode_offset + 44].copy_from_slice(&(root_blk as u32).to_le_bytes());
+        raw[inode_offset + 44..inode_offset + 48].copy_from_slice(&(lost_blk as u32).to_le_bytes());
+        let write_inode_block = |data: &[u8]| -> bool {
+            for sector in 0..sectors {
+                let offset = sector as usize * 512;
+                if dev
+                    .write_block(inode_block * sectors + sector, &data[offset..offset + 512])
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+            true
+        };
+        wrote &= write_inode_block(&raw);
+        check!(
+            ok,
+            wrote,
+            "[fs selftest] could not craft the large directory"
+        );
+
+        // Exactly the cap: 512 entries are a valid snapshot.
+        check!(
+            ok,
+            matches!(fs.read_dir_entries(EXT2_ROOT_INO), Ok(ref entries) if entries.len() == 512),
+            "[fs selftest] a directory at the entry cap was not listed"
+        );
+
+        // One more: the whole listing is refused, no heap growth past the bound.
+        raw[inode_offset + 4..inode_offset + 8].copy_from_slice(&((2 * bs) as u32).to_le_bytes());
+        wrote &= write_inode_block(&raw);
+        check!(
+            ok,
+            wrote,
+            "[fs selftest] could not grow the crafted directory"
+        );
+        check!(
+            ok,
+            matches!(
+                fs.read_dir_entries(EXT2_ROOT_INO),
+                Err(FsError::DirectoryTooBig)
+            ),
+            "[fs selftest] a directory over the entry cap was not DirectoryTooBig"
+        );
+        // And the VFS maps that to E2BIG's `ListingTooBig`, not corruption.
+        let root = fs.root_node();
+        check!(
+            ok,
+            matches!(root.readdir(), Err(vfs::VfsError::ListingTooBig)),
+            "[fs selftest] VFS readdir over the entry cap did not fail cleanly"
+        );
+    }
     ok
 }
 

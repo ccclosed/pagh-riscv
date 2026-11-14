@@ -774,6 +774,31 @@ fn user_executable(address: usize) -> bool {
         .unwrap_or(false)
 }
 
+/// True when `frame` is a usable saved frame base for the signal back-chain:
+/// either `0` ("no previous frame") or a whole [`SIGFRAME_SIZE`] signal frame
+/// inside the caller's mapped user range, sixteen-byte aligned the way [`arm`]
+/// writes it.
+///
+/// `prev_frame` is the one signal-frame field a handler can rewrite before
+/// `rt_sigreturn`, and it used to cross from user memory into the thread's
+/// signal state unchecked. The next delivery then computed
+/// `prev_frame + offset_of!(SignalFrame, ucontext)` with an ordinary `+`: a
+/// forged `usize::MAX` overflowed, the debug kernel panicked, and the hart was
+/// parked (F-r3-rv-1). Both the install (`sigreturn`) and the use (`arm`) go
+/// through this predicate; a forged chain is `-EINVAL`, never a machine kill.
+fn valid_saved_frame(frame: usize) -> bool {
+    if frame == 0 {
+        return true;
+    }
+    if frame & 0xf != 0 {
+        return false;
+    }
+    match frame.checked_add(SIGFRAME_SIZE) {
+        Some(end) => crate::user::syscall::user_range_valid(frame, end, false),
+        None => false,
+    }
+}
+
 /// Decode the 32-byte `struct sigaction`.
 fn decode_action(raw: &[u8; SIGACTION_SIZE]) -> Action {
     Action {
@@ -1464,10 +1489,23 @@ fn arm(frame: &mut TrapFrame, run: u64, signal: usize, action: Action, source: S
         used_alt = false;
     }
 
+    // `prev_frame` is kernel-written state, but `rt_sigreturn` is its only
+    // user-reachable writer and installs only a frame [`valid_saved_frame`]
+    // accepts. Re-check anyway, because the chain link is informational: an
+    // impossible value starts a fresh chain instead of overflowing the
+    // addition below (F-r3-rv-1).
+    let prev_frame = if valid_saved_frame(prev_frame) {
+        prev_frame
+    } else {
+        0
+    };
     let link = if prev_frame == 0 {
         0
     } else {
-        (prev_frame + core::mem::offset_of!(SignalFrame, ucontext)) as u64
+        match prev_frame.checked_add(core::mem::offset_of!(SignalFrame, ucontext)) {
+            Some(link) => link as u64,
+            None => 0,
+        }
     };
     let siginfo = make_siginfo(signal, source);
     let signal_frame = SignalFrame {
@@ -1735,6 +1773,14 @@ pub(crate) fn sigreturn(frame: &mut TrapFrame) -> Result<(), isize> {
 
     let restored_mask = signal.mask & VALID_MASK & !UNBLOCKABLE_MASK;
     let prev_frame = signal.prev_frame as usize;
+    // The one user-writable pointer in the frame: a handler can rewrite it
+    // before `rt_sigreturn`, and the next delivery adds an offset to it, so an
+    // unchecked value was a debug-build overflow panic (F-r3-rv-1). Accept only
+    // "no previous frame" or a complete frame the caller can still read;
+    // anything else leaves the thread's state untouched and answers `-EINVAL`.
+    if !valid_saved_frame(prev_frame) {
+        return Err(EINVAL);
+    }
     let used_alt = signal.flags & SIGFRAME_USED_ALTSTACK != 0;
     let restored = signal.saved;
 

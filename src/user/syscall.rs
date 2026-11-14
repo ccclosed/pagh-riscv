@@ -164,6 +164,7 @@ const SYS_TLS_CLOSE: usize = 1103;
 const ENOENT: isize = -2;
 const EINTR: isize = -4;
 const EIO: isize = -5;
+const E2BIG: isize = -7;
 const EBADF: isize = -9;
 const EAGAIN: isize = -11;
 const ENOMEM: isize = -12;
@@ -5002,5 +5003,6 @@ fn errno(error: VfsError) -> isize {
         VfsError::NotADirectory => ENOTDIR,
         VfsError::NoSpace => ENOSPC,
         VfsError::NameTooLong => ENAMETOOLONG,
+        VfsError::ListingTooBig => E2BIG,
     }
 }
