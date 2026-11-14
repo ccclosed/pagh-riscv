@@ -24,7 +24,7 @@ and fix PRs target `dev`. Stable releases are tagged `vX.Y.Z` from `main`; the o
 pre-release channel is the release candidate `vX.Y.Z-rc.N` cut from `dev` (there is
 no `-pre.N` suffix). The tag-driven release workflow refuses a tag cut from the
 wrong branch, checks the tag base against `Cargo.toml`, and attaches the release
-kernel (`pagh-<tag>`) plus a source archive, each with a `.sha256`. Hotfixes for a
+kernel (`pagh-<tag>.elf`) plus a source archive, each with a `.sha256`. Hotfixes for a
 released version go straight to `main` as a PATCH release (no RC) and are merged
 back into `dev`. See [BRANCHING.md](BRANCHING.md) and the operational runbook
 [RELEASING.md](RELEASING.md).

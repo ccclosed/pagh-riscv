@@ -9,8 +9,8 @@ name: release
 # Anything else (`-pre.N`, arbitrary suffixes) is refused. The base version
 # `X.Y.Z` must equal the repository's version source (`Cargo.toml [package].version`,
 # see `VERSION_FILE`): the tag is not allowed to disagree with the kernel the
-# build reports. Every release gets the built RV64 kernel (`pagh-<tag>`), a source
-# archive, and a `.sha256` next to each file.
+# build reports. Every release gets the built RV64 kernel (`pagh-<tag>.elf`), a
+# source archive, and a `.sha256` next to each file.
 #
 # Old bare-numeric tags remain valid history (the workflow still accepts them on
 # push); only newly created tags must use the `v` prefix.
@@ -88,7 +88,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          elf="pagh-${GITHUB_REF_NAME}"
+          elf="pagh-${GITHUB_REF_NAME}.elf"
           cp target/riscv64gc-unknown-none-elf/release/pagh "$elf"
           sha256sum "$elf" > "$elf.sha256"
           file "$elf" || true

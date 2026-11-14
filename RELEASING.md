@@ -50,12 +50,12 @@ updated only when a stable release lands.
 4. Watch the `release` workflow: it refuses the tag unless it is reachable from
    `dev` **and not** from `main`, checks the base version, builds the release
    kernel (`cargo build --release --locked` with the nightly from
-   `rust-toolchain.toml`), names the ELF `pagh-<tag>`, writes `.sha256` for the
+   `rust-toolchain.toml`), names the ELF `pagh-<tag>.elf`, writes `.sha256` for the
    kernel and the source archive, and publishes a GitHub **Pre-release**.
    A rejected tag stays in the repository but produces **no** release entry:
    delete it (`git push origin :refs/tags/<tag>`) before retrying.
-5. Test the pre-release artifact: boot `pagh-vX.Y.Z-rc.N` in QEMU (OpenSBI
-   `virt`) and check the `sha256sum -c pagh-vX.Y.Z-rc.N.sha256` digest. Bugs:
+5. Test the pre-release artifact: boot `pagh-vX.Y.Z-rc.N.elf` in QEMU (OpenSBI
+   `virt`) and check the `sha256sum -c pagh-vX.Y.Z-rc.N.elf.sha256` digest. Bugs:
    fix on `dev`, tag `-rc.2` (never move the `-rc.1` tag).
 
 ## Stable release — from `main`
@@ -70,7 +70,7 @@ updated only when a stable release lands.
 3. Tag and push `vX.Y.Z` on the merge commit; the workflow checks that the
    commit is reachable from `main` and that the version source matches.
 4. Verify in **Releases**: the new entry is a full release with the versioned
-   kernel (`pagh-vX.Y.Z`), its `.sha256`, the source archive
+   kernel (`pagh-vX.Y.Z.elf`), its `.sha256`, the source archive
    (`pagh-riscv-vX.Y.Z.tar.gz`) and its `.sha256`. GitHub marks the newest
    stable as **Latest**.
 5. `dev` continues with the next version (first change bumps it).
@@ -136,6 +136,6 @@ backfilling already-released versions, create tags in ascending version order
 - [ ] CI green on the exact commit (fmt, debug/release build, six-mode QEMU smoke)
 - [ ] Live evidence run and linked (smoke + `tools/test_security.py` + `selftest`)
 - [ ] Freeze respected (no feature merges after `-rc.1`)
-- [ ] `pagh-<tag>` ELF + `.sha256` downloaded and smoke-checked
+- [ ] `pagh-<tag>.elf` + `.sha256` downloaded and smoke-checked
 - [ ] `main`/`dev` synchronized per the flow above
 - [ ] Release entry has the right type (Pre-release vs Release)

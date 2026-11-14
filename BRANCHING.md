@@ -26,7 +26,7 @@ maintainer actions.
    commit or fast-forward, no code changes beyond release metadata).
 4. **Stable release**: tag the merge commit `vX.Y.Z` on `main`; the release
    workflow publishes a full GitHub release with generated notes and the
-   release kernel (`pagh-vX.Y.Z`, built by `cargo build --release --locked` with
+   release kernel (`pagh-vX.Y.Z.elf`, built by `cargo build --release --locked` with
    the nightly pinned in `rust-toolchain.toml`).
 5. **Hotfix**: branch from `main`, PR to `main` with full CI plus a targeted
    regression test, tag a PATCH version **straight to stable** (no RC), then
